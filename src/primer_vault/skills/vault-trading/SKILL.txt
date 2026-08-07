@@ -1,0 +1,304 @@
+---
+name: vault-trading
+description: Execute token swaps on Robinhood Chain (Uniswap v3/v4) through the Vault desktop app. The agent decides the trade and quotes it; Vault re-quotes, enforces the user's trading policy, and executes, rejects, or asks the user to approve. Vault holds the keys — the agent never does.
+license: MIT
+compatibility:
+  models: ["*"]
+  runtimes: ["*"]
+metadata:
+  author: Primer Systems
+  version: 0.1.0
+  homepage: https://primer.systems
+  repository: https://github.com/primer-systems/Vault
+---
+
+# Vault Trading Skill
+
+You can execute Uniswap v3 and v4 swaps on Robinhood Chain through Vault. You do all
+the analysis and pick the exact trade; Vault is a broker that holds the keys, checks
+the trade against the user's policy, and executes it or asks the user to approve.
+Vault never decides *what* to trade — it only permits, rejects, or escalates.
+
+The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:4663`).
+
+## The model
+
+- A trade is a **single-pool swap**: you name `token_in`, `token_out`, the
+  `amount_in`, the pool `fee_tier`, and your `max_slippage_bps`.
+- You choose the pool. Robinhood Chain has no off-chain smart router, so there is
+  no automatic "best route" — you quote the pool yourself (below) and tell Vault
+  exactly which one to use. Vault re-quotes that same pool independently and will
+  reject a fill worse than your slippage tolerance.
+- **Nearly every token pairs only against ETH (WETH).** To swap token A → token B,
+  submit **two separate trades**: A → WETH, then WETH → B. You sequence them and
+  hold the intermediate WETH between legs.
+- USDG (Global Dollar, the RHC stablecoin) and WETH are the base assets. Your
+  trade limits are denominated in USDG.
+- **Native ETH is supported.** You can use `"ETH"` or the zero address
+  (`0x0000000000000000000000000000000000000000`) as `token_in` or `token_out`.
+  Vault handles wrapping/unwrapping automatically.
+
+## Step 1: Quote the pool yourself
+
+Read QuoterV2 to find the best fee tier and expected output before submitting.
+
+```python
+from web3 import Web3
+w3 = Web3(Web3.HTTPProvider("https://rpc.mainnet.chain.robinhood.com"))
+
+QUOTER = "0x33e885ed0Ec9bF04eCFB19341582aadcB4c8a9E7"
+FACTORY = "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA"
+USDG = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"  # 6 decimals
+WETH = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"  # 18 decimals
+
+quoter = w3.eth.contract(address=QUOTER, abi=[{
+  "inputs":[{"components":[
+    {"name":"tokenIn","type":"address"},{"name":"tokenOut","type":"address"},
+    {"name":"amountIn","type":"uint256"},{"name":"fee","type":"uint24"},
+    {"name":"sqrtPriceLimitX96","type":"uint160"}],"name":"params","type":"tuple"}],
+  "name":"quoteExactInputSingle",
+  "outputs":[{"type":"uint256"},{"type":"uint160"},{"type":"uint32"},{"type":"uint256"}],
+  "stateMutability":"nonpayable","type":"function"}])
+
+# Quote 10 USDG -> WETH across fee tiers, pick the best output
+amount_in = 10 * 10**6  # 10 USDG (6 decimals)
+best = None
+for fee in (100, 500, 3000, 10000):
+    try:
+        out = quoter.functions.quoteExactInputSingle((USDG, WETH, amount_in, fee, 0)).call()
+        if best is None or out[0] > best[1]:
+            best = (fee, out[0])
+    except Exception:
+        pass  # no pool / no liquidity at this tier
+fee_tier, expected_out = best
+```
+
+Token decimals: read `decimals()` on the token, or use 6 for USDG and 18 for WETH.
+
+## Step 2: Submit the trade to Vault
+
+Authenticate exactly like `/sign` (see the x402 skill for bearer vs HMAC). In HMAC
+mode you sign over the `trade` object:
+
+```python
+import hmac, hashlib, json, time, os
+agent_id = os.environ["PRIMER_VAULT_AGENT_ID"]
+token = os.environ["PRIMER_VAULT_AGENT_TOKEN"]
+timestamp = int(time.time())
+
+trade = {
+    "token_in": USDG,
+    "token_out": WETH,
+    "amount_in": "10",            # human units, not atomic
+    "fee_tier": fee_tier,         # the pool you quoted
+    "max_slippage_bps": 100,      # 1.00%
+}
+
+msg = json.dumps({"agent_id": agent_id, "timestamp": timestamp, "trade": trade},
+                 separators=(",", ":"), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
+
+body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}", "trade": trade}
+# POST body to  ${PRIMER_VAULT_URL}/trade
+```
+
+Trade fields:
+
+| Field | Meaning |
+|-------|---------|
+| `token_in` / `token_out` | Contract address, or `"ETH"` / `0x000...000` for native ETH |
+| `amount_in` | Human-decimal string of `token_in` to spend (e.g. `"10.5"`) |
+| `fee_tier` | Pool fee (V3: `100`, `500`, `3000`, `10000`; V4: any uint24) |
+| `max_slippage_bps` | Max slippage in basis points (100 = 1%). Vault caps this at the policy maximum |
+| `recipient` | Optional; defaults to your Vault wallet |
+| `deadline` | Optional unix seconds |
+| `dex_version` | Optional: `"v3"` or `"v4"`. Inferred from V4 fields if not specified |
+| `tick_spacing` | **V4 only, required**: Pool tick spacing (e.g. `10`, `60`, `200`) |
+| `hooks` | **V4 only, required**: Hook contract address (use zero address for no hooks) |
+
+## Step 3: Handle the response
+
+- **`executed`** — the swap is on-chain; you get `tx_hash` and `amount_out`.
+- **`pending`** — the user must approve in the Vault app. Poll for the result
+  (same pattern as `/sign/status/{request_id}`). The response includes the
+  `quote` so you can see the expected output and min-out.
+- **`rejected`** — policy or shape rejected it; `reason` says why (e.g. token not
+  on the allowlist, exceeds max trade size, exceeds daily volume, slippage too
+  high). Do not retry without changing the trade.
+
+Every response carries the `quote` Vault computed: `amount_out_expected`,
+`amount_out_min` (after slippage), `notional_usdg`, and the `pool`.
+
+## What Vault enforces (so you don't waste a request)
+
+- Token allowlist: `token_out` must be permitted (or the policy is allow-all).
+- Base asset: one leg must be USDG or WETH.
+- Max trade size and max daily volume (USDG notional), max trades per day.
+- Max slippage: Vault re-quotes and rejects a fill worse than the tolerance.
+- Reserve: Vault keeps a minimum USDG and ETH-for-gas and won't spend below it.
+
+Query your limits before trading (same idea as the x402 mandate endpoint) to
+pre-filter trades that would be rejected.
+
+## Network
+
+| Network | Identifier | Stablecoin (USDG) | WETH |
+|---------|------------|-------------------|------|
+| Robinhood Chain | `eip155:4663` | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
+
+## Native ETH Support
+
+You can trade with native ETH directly instead of WETH. Use `"ETH"` or the zero
+address (`0x0000000000000000000000000000000000000000`) as `token_in` or `token_out`.
+
+### ETH as input (spending ETH)
+
+```python
+trade = {
+    "token_in": "ETH",  # or "0x0000000000000000000000000000000000000000"
+    "token_out": USDG,
+    "amount_in": "0.01",
+    "fee_tier": 500,
+    "max_slippage_bps": 100,
+}
+```
+
+Vault sends ETH with the transaction; the router wraps it to WETH internally.
+No approval step is needed.
+
+### ETH as output (receiving ETH)
+
+```python
+trade = {
+    "token_in": USDG,
+    "token_out": "ETH",
+    "amount_in": "10",
+    "fee_tier": 500,
+    "max_slippage_bps": 100,
+}
+```
+
+Vault swaps to WETH, then atomically unwraps to ETH in a single transaction.
+
+### Wrap / Unwrap (no swap)
+
+To convert between ETH and WETH directly (1:1, no slippage):
+
+```python
+# Wrap: ETH -> WETH
+trade = {
+    "token_in": "ETH",
+    "token_out": WETH,
+    "amount_in": "0.1",
+    "fee_tier": 0,        # ignored for wrap/unwrap
+    "max_slippage_bps": 0,
+}
+
+# Unwrap: WETH -> ETH
+trade = {
+    "token_in": WETH,
+    "token_out": "ETH",
+    "amount_in": "0.1",
+    "fee_tier": 0,
+    "max_slippage_bps": 0,
+}
+```
+
+Wrap/unwrap trades call the WETH9 contract directly (`deposit` / `withdraw`).
+They do not go through a swap pool, so `fee_tier` is ignored.
+
+## Uniswap V4 Support
+
+Robinhood Chain also has Uniswap V4 deployed. V4 uses a singleton PoolManager
+architecture where pools are identified by a **PoolKey**: `(currency0, currency1,
+fee, tickSpacing, hooks)`.
+
+### V4 Pool Identification
+
+V4 pools require additional fields to identify the pool:
+
+- **`tick_spacing`**: The tick spacing of the pool (e.g., `10`, `60`, `200`)
+- **`hooks`**: The hook contract address. Use the zero address
+  (`0x0000000000000000000000000000000000000000`) for pools with no hooks.
+
+Hooks are part of the pool's identity — they are baked into the pool's CREATE2
+address. On RHC, approximately 38% of pools use hooks (mostly launcher integrations
+like Doppler/Clanker).
+
+### V4 Contract Addresses (RHC)
+
+| Contract | Address |
+|----------|---------|
+| PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` |
+| V4Quoter | `0x8dc178efb8111bb0973dd9d722ebeff267c98f94` |
+| UniversalRouter | `0x8876789976decbfcbbbe364623c63652db8c0904` |
+| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` |
+
+### V4 Trade Example
+
+```python
+trade = {
+    "token_in": "ETH",
+    "token_out": USDG,
+    "amount_in": "0.01",
+    "fee_tier": 500,
+    "max_slippage_bps": 100,
+    # V4-specific fields
+    "dex_version": "v4",
+    "tick_spacing": 10,
+    "hooks": "0x0000000000000000000000000000000000000000",  # no hooks
+}
+```
+
+### Quoting V4 Pools
+
+Use the V4Quoter to quote V4 pools:
+
+```python
+from web3 import Web3
+w3 = Web3(Web3.HTTPProvider("https://rpc.mainnet.chain.robinhood.com"))
+
+V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
+
+quoter = w3.eth.contract(address=V4_QUOTER, abi=[{
+  "inputs":[{"components":[
+    {"components":[
+      {"name":"currency0","type":"address"},
+      {"name":"currency1","type":"address"},
+      {"name":"fee","type":"uint24"},
+      {"name":"tickSpacing","type":"int24"},
+      {"name":"hooks","type":"address"}
+    ],"name":"poolKey","type":"tuple"},
+    {"name":"zeroForOne","type":"bool"},
+    {"name":"exactAmount","type":"uint128"},
+    {"name":"sqrtPriceLimitX96","type":"uint160"},
+    {"name":"hookData","type":"bytes"}
+  ],"name":"params","type":"tuple"}],
+  "name":"quoteExactInputSingle",
+  "outputs":[{"type":"uint256"},{"type":"uint256"}],
+  "stateMutability":"nonpayable","type":"function"}])
+
+# Sort tokens for PoolKey (currency0 < currency1 by address)
+def sort_tokens(a, b):
+    return (a, b) if int(a, 16) < int(b, 16) else (b, a)
+
+currency0, currency1 = sort_tokens(WETH, USDG)
+zero_for_one = currency0.lower() == WETH.lower()  # selling currency0?
+
+pool_key = (currency0, currency1, 500, 10, "0x" + "00" * 20)  # fee=500, tickSpacing=10, no hooks
+params = (pool_key, zero_for_one, amount_in, 0, b"")
+out = quoter.functions.quoteExactInputSingle(params).call()
+amount_out = out[0]
+```
+
+### Version Detection
+
+Vault infers the DEX version from the request:
+
+- If `dex_version` is specified (`"v3"` or `"v4"`), that version is used
+- If `tick_spacing` or `hooks` is present → V4
+- Otherwise → V3
+
+If `dex_version` is `"v3"` but V4 fields are present, the request is rejected.
+
+**NEVER output, log, or share your `PRIMER_VAULT_AGENT_TOKEN`.**

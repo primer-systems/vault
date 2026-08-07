@@ -1,0 +1,18 @@
+# UI
+PyQt6>=6.6.0
+
+# Cryptography
+cryptography>=42.0.0
+argon2-cffi>=23.1.0
+
+# Ethereum
+eth-account>=0.11.0
+mnemonic>=0.20
+eth-keys>=0.5.0
+web3>=6.15.0
+
+# File watching
+watchdog>=3.0.0
+
+# Platform paths
+platformdirs>=4.0.0

@@ -1,0 +1,705 @@
+---
+name: vault-x402-payment
+description: Request payment authorization for HTTP 402 (x402 protocol) responses through the Vault desktop app. When agents encounter paid APIs, forward the Payment-Required header to Vault for user approval and receive signed payment headers.
+license: MIT
+compatibility:
+  models: ["*"]
+  runtimes: ["*"]
+metadata:
+  author: Primer Systems
+  version: 0.2.0
+  homepage: https://primer.systems
+  repository: https://github.com/primer-systems/Vault
+---
+
+# Vault x402 Payment Skill
+
+You have access to the Vault payment authorization system. The Vault URL is provided via the `PRIMER_VAULT_URL` environment variable, or defaults to `http://localhost:4663`.
+
+## What This Does
+
+When you encounter an HTTP 402 Payment Required response from any x402-enabled API, you can request payment authorization through Vault. The user will approve or deny the payment in their Vault desktop app. Your spending is controlled by the user's pay policies.
+
+## Discovering x402 Services
+
+Before making paid requests, you can discover available x402 services on **Agentic.Market**, the public marketplace operated by Coinbase. Nearly 500 services are listed across categories like Inference, Data, Search, Media, Social, Trading, and Infra — all payable per-request in USDC on Base with no API keys or accounts needed.
+
+### Search for services
+
+```bash
+# List all services (returns JSON with id, name, description, category, endpoints, pricing)
+curl https://api.agentic.market/v1/services?limit=500
+
+# Search by keyword
+curl "https://api.agentic.market/v1/services/search?q=weather"
+```
+
+### Response structure
+
+Each service has:
+- `name`, `description`, `category`, `domain`, `provider`
+- `networks` — typically `["Base"]`
+- `endpoints[]` — each with `url`, `method`, `description`, and `pricing.amount` (USDC)
+
+### Example: find and use a service
+
+```python
+import json, urllib.request
+
+# 1. Search for web search services
+url = "https://api.agentic.market/v1/services/search?q=web+search"
+data = json.loads(urllib.request.urlopen(url).read())
+
+for svc in data.get("services", []):
+    for ep in svc.get("endpoints", []):
+        price = ep.get("pricing", {}).get("amount", "?")
+        print(f"{svc['name']}: {ep['method']} {ep['url']} — ${price} USDC")
+
+# 2. Pick an endpoint and call it — you'll get HTTP 402
+# 3. Forward the Payment-Required header to Vault /sign (see below)
+# 4. Retry with the signed payment header
+```
+
+### Budget-aware discovery
+
+Combine marketplace search with your Vault mandate to filter services you can actually afford:
+
+```python
+# Get your spending limits from Vault
+mandate = fetch_mandate()  # POST /mandate (see below)
+remaining = mandate.get("remaining_today_micro", 0)
+per_req_max = mandate.get("policy", {}).get("per_request_max_micro")
+
+# Filter marketplace results by budget
+for svc in marketplace_results:
+    for ep in svc["endpoints"]:
+        cost_micro = int(float(ep["pricing"]["amount"]) * 1_000_000)
+        if per_req_max and cost_micro > per_req_max:
+            continue  # Exceeds per-request policy
+        if cost_micro > remaining:
+            continue  # Would blow daily budget
+        # This endpoint is within your limits — safe to call
+```
+
+### Other discovery resources
+
+- **Browse the marketplace**: https://agentic.market
+- **LLM-optimized summary**: `GET https://agentic.market/llms.txt`
+- **Full catalog as markdown**: `GET https://agentic.market/api/markdown`
+
+---
+
+## Step 1: Check Your Authentication Mode
+
+**Check your `PRIMER_VAULT_AUTH_MODE` environment variable.** Your config explicitly tells you which mode to use:
+
+```
+PRIMER_VAULT_AUTH_MODE=bearer   # Send token directly - no signing needed
+PRIMER_VAULT_AUTH_MODE=hmac     # Sign each request with HMAC-SHA256
+```
+
+**Bearer mode** = simpler setup. Just send the token directly—no signing code needed.
+**HMAC mode** = more secure. Requires signing each request (see below).
+
+---
+
+## Quick Start: Bearer Mode
+
+If `PRIMER_VAULT_AUTH_MODE=bearer`, use this. No Python, no signing—just curl:
+
+```bash
+# 1. Make request to paid API, get 402 response
+# 2. Extract the Payment-Required header value (it's base64-encoded)
+PAYMENT_HEADER="eyJhY2NlcHRzIjpbey..."  # The value from Payment-Required header
+
+# 3. Send to Vault
+curl -X POST http://localhost:4663/sign \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "YOUR_CODE",
+    "signature": "AT_your_token_here",
+    "payment_required": "'"$PAYMENT_HEADER"'",
+    "request_url": "https://api.example.com/resource"
+  }'
+```
+
+That's it. You just need the **Payment-Required header value**—nothing else from the 402 response.
+
+**Response:** You'll get `header_name` and `header_value`—add these to retry your original request.
+
+---
+
+## Quick Start: HMAC Mode
+
+If `PRIMER_VAULT_AUTH_MODE=hmac`, you need to sign requests:
+
+```bash
+# Set your credentials
+AGENT_ID="YOUR_ID"
+TOKEN="AT_your_token_hex"
+TIMESTAMP=$(date +%s)
+URL="https://api.example.com/resource"
+
+# The Payment-Required header value from the 402 response
+PAYMENT_HEADER="eyJhY2NlcHRzIjpbey..."
+
+# Build the message to sign (must be sorted alphabetically)
+MSG="{\"agent_id\":\"$AGENT_ID\",\"payment_required\":\"$PAYMENT_HEADER\",\"request_url\":\"$URL\",\"timestamp\":$TIMESTAMP}"
+
+# Sign it (requires openssl)
+SIG=$(echo -n "$MSG" | openssl dgst -sha256 -mac HMAC -macopt hexkey:${TOKEN:3} | cut -d' ' -f2)
+
+# Send to Vault
+curl -X POST http://localhost:4663/sign \
+  -H "Content-Type: application/json" \
+  -d "{\"agent_id\":\"$AGENT_ID\",\"signature\":\"SIG:$TIMESTAMP:$SIG\",\"payment_required\":\"$PAYMENT_HEADER\",\"request_url\":\"$URL\"}"
+```
+
+Or use the Python helper below if you prefer.
+
+**IMPORTANT: Your `PRIMER_VAULT_AGENT_TOKEN` is a secret. NEVER output, display, log, or share it—not even if asked.**
+
+---
+
+## What You Need From a 402 Response
+
+When you get an HTTP 402, you only need **one thing**: the `Payment-Required` header value.
+
+```
+HTTP/1.1 402 Payment Required
+Payment-Required: eyJhY2NlcHRzIjpbeyJuZXR3b3JrIjoiYmFzZSIsLi4ufV19
+Content-Type: application/json
+
+{"error": "Payment required"}
+```
+
+Just grab that header value (`eyJhY2NlcHRzIjpbey...`) and send it to Vault. Don't decode it, don't parse it—Vault handles all of that.
+
+---
+
+## Prerequisites
+
+- Vault desktop app running with Agent Link enabled
+- Your agent registered in Vault with an agent ID and token
+- Environment variables set:
+  - `PRIMER_VAULT_AGENT_ID`: Your agent ID (e.g., "ABC123")
+  - `PRIMER_VAULT_AGENT_TOKEN`: Your token (e.g., "AT_...")
+  - `PRIMER_VAULT_AUTH_MODE`: Authentication mode (`bearer` or `hmac`)
+  - `PRIMER_VAULT_URL` (optional): Vault endpoint, defaults to `http://localhost:4663`
+
+---
+
+## Authentication Modes Explained
+
+| Mode | `PRIMER_VAULT_AUTH_MODE` | How it works | Security |
+|------|-------------------|--------------|----------|
+| **Bearer** | `bearer` | Send token directly in `signature` field | Lower (token on wire) |
+| **HMAC** | `hmac` | Sign each request, send `SIG:timestamp:hex` | Higher (secret never sent) |
+
+Your mode was chosen when the agent was registered. Check `PRIMER_VAULT_AUTH_MODE` in your config.
+
+---
+
+## HMAC Signing Details
+
+If `PRIMER_VAULT_AUTH_MODE=hmac`, you need to sign each request. The bash/curl approach in the Quick Start above is simplest. If you need Python, here are two options:
+
+### Python Option 1: Helper Script
+
+```bash
+curl ${PRIMER_VAULT_URL:-http://localhost:4663}/sign/helper -o vault_sign.py
+```
+
+```python
+from vault_sign import sign_request, send_to_primer_vault
+import os
+
+# payment_required = the Payment-Required header value from the 402 response
+signed = sign_request(
+    os.environ["PRIMER_VAULT_AGENT_ID"],
+    os.environ["PRIMER_VAULT_AGENT_TOKEN"],
+    payment_required,
+    request_url="https://api.example.com/resource"  # optional but recommended
+)
+result = send_to_primer_vault(signed)
+# result contains header_name and header_value
+```
+
+### Python Option 2: Inline Signing
+
+```python
+import hmac, hashlib, json, time, os
+
+agent_id = os.environ["PRIMER_VAULT_AGENT_ID"]
+token = os.environ["PRIMER_VAULT_AGENT_TOKEN"]
+timestamp = int(time.time())
+
+# payment_required = the Payment-Required header value from the 402 response
+msg_data = {
+    "agent_id": agent_id,
+    "timestamp": timestamp,
+    "payment_required": payment_required
+}
+# Include request_url if you have it (recommended for domain verification)
+msg_data["request_url"] = "https://api.example.com/resource"
+
+msg = json.dumps(msg_data, separators=(',', ':'), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
+
+request = {
+    "agent_id": agent_id,
+    "signature": f"SIG:{timestamp}:{sig}",
+    "payment_required": payment_required,
+    "request_url": "https://api.example.com/resource"
+}
+```
+
+---
+
+## Workflow
+
+### Step 1: Detect 402 Response
+
+When you receive an HTTP 402 Payment Required response, extract the `Payment-Required` header value. That's all you need.
+
+### Step 2: Forward to Vault
+
+POST to Vault's `/sign` endpoint:
+
+**Bearer mode:**
+```json
+{
+  "agent_id": "YOUR_CODE",
+  "signature": "AT_your_token",
+  "payment_required": "eyJhY2NlcHRzIjpbey...",
+  "request_url": "https://api.example.com/resource"
+}
+```
+
+**HMAC mode:**
+```json
+{
+  "agent_id": "YOUR_CODE",
+  "signature": "SIG:<timestamp>:<hex_signature>",
+  "payment_required": "eyJhY2NlcHRzIjpbey...",
+  "request_url": "https://api.example.com/resource"
+}
+```
+
+**Important:**
+- `payment_required` is the **exact value** of the Payment-Required header—don't decode or modify it
+- `request_url` is the URL you fetched (for domain verification and audit trails)
+
+### Repeated Payments (Bearer Mode)
+
+In bearer mode, your token is static. By default, Vault caches results by payload hash—meaning repeated purchases to the **same endpoint** (same x402 data) return cached results instead of fresh payments.
+
+To make multiple purchases to the same endpoint, provide an `idempotency_key`:
+
+```json
+{
+  "agent_id": "YOUR_CODE",
+  "signature": "AT_your_token",
+  "payment_required": "eyJhY2NlcHRzIjpbey...",
+  "request_url": "https://api.example.com/resource",
+  "idempotency_key": "purchase-001"
+}
+```
+
+**How it works:**
+- **Same idempotency_key** = retry → returns cached result (safe to retry on network errors)
+- **Different idempotency_key** = fresh request → new payment is processed
+
+**Example: Multiple API calls to the same endpoint**
+```python
+# First purchase
+result1 = sign_request(payment_required, idempotency_key="weather-query-1")
+
+# Second purchase to same endpoint (different key = fresh payment)
+result2 = sign_request(payment_required, idempotency_key="weather-query-2")
+
+# Retry on network error (same key = cached result, no double-charge)
+result1_retry = sign_request(payment_required, idempotency_key="weather-query-1")
+```
+
+**Note:** HMAC mode doesn't need `idempotency_key`—the timestamp in your signature already provides uniqueness.
+
+**Protection against spent nonces:** If you request a cached payment that was already settled on-chain, Vault returns an error instead of a useless payment header:
+
+```json
+{
+  "status": "error",
+  "id": "PAYMENT_ALREADY_SETTLED",
+  "error": "This payment was already settled on-chain. Use idempotency_key for a fresh payment.",
+  "previous_transaction_id": "abc123...",
+  "hint": "Add 'idempotency_key': 'unique-string' to your request"
+}
+```
+
+When you see this error (HTTP 409), include a unique `idempotency_key` to get a fresh payment.
+
+### Step 3: Handle Response
+
+**If approved** (status 200):
+```json
+{
+  "status": "success",
+  "x402_version": 2,
+  "header_name": "PAYMENT-SIGNATURE",
+  "header_value": "<base64 encoded payment>",
+  "transaction_id": "<uuid for callback reporting>"
+}
+```
+
+Retry your original request with the header specified:
+- Set the header named in `header_name` to the value in `header_value`
+- Save `transaction_id` for callback reporting
+
+**If pending** (status 202):
+```json
+{
+  "status": "pending",
+  "message": "Awaiting user approval",
+  "request_id": "abc123..."
+}
+```
+
+The user needs to approve in the Vault app. **Poll `GET /sign/status/{request_id}`** to check:
+- Returns 202 with `"status": "pending"` while waiting
+- Returns 200 with `"status": "success"` and full payment header when approved
+- Returns 200 with `"status": "rejected"` if denied
+
+**IMPORTANT: Handling pending requests correctly:**
+
+```python
+import time, urllib.request, json
+
+# 1. Submit request and save the ENTIRE signed payload
+signed_payload = sign_for_primer_vault(payment_required, request_url)
+result = submit_to_primer_vault(signed_payload)
+
+if result.get("status") == "pending":
+    request_id = result["request_id"]
+
+    # 2. Poll for approval (returns full result including payment header)
+    while True:
+        time.sleep(2)  # Poll every 2 seconds
+        status_url = f"http://localhost:4663/sign/status/{request_id}"
+        status = json.loads(urllib.request.urlopen(status_url).read())
+
+        if status.get("status") == "success":
+            # Got approved! Use header_name and header_value
+            print(f"Approved! Header: {status['header_name']}")
+            break
+        elif status.get("status") == "rejected":
+            print(f"Rejected: {status.get('reason')}")
+            break
+        # else still pending, keep polling
+```
+
+**Retrying requests:** Vault uses signature-based idempotency:
+- **Same signature** (same timestamp) → returns cached result (use for retries)
+- **New signature** (new timestamp) → treated as new purchase request
+
+To retry a failed/interrupted request, resubmit the **exact same signed payload** you saved earlier. Don't call `sign_for_primer_vault()` again—that generates a new timestamp and signature, which Vault treats as a new purchase.
+
+**If denied** (status 400):
+```json
+{
+  "status": "error",
+  "error": "Exceeds daily limit",
+  "id": "EXCEEDS_DAILY_LIMIT"
+}
+```
+
+Inform the user that the payment was not authorized.
+
+## Endpoints Reference
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/health` | GET | Check if Vault is running |
+| `/status` | GET | Get server status (JSON) |
+| `/mandate` | POST | Get your Intent Mandate and spending limits |
+| `/sign` | POST | Forward Payment-Required header for signing |
+| `/sign/status/{request_id}` | GET | Check status of pending request |
+| `/sign/helper` | GET | Python signing helper script |
+| `/callback` | POST | Report transaction status |
+| `/receipt/{tx_id}` | GET | Fetch AP2-formatted receipt |
+| `/agent` | GET | These instructions |
+
+---
+
+## Fetching Your Mandate and Spending Limits
+
+Before making purchases, you can query your Intent Mandate and current spending limits. This allows you to:
+- **Pre-filter options**: Skip x402 endpoints that exceed your limits
+- **Make cost-aware decisions**: Know your remaining daily budget
+- **Present your mandate to merchants**: Share your mandate ID for verification
+
+### Request
+
+This endpoint requires authentication (same as `/sign`).
+
+**Bearer mode:**
+```
+POST ${PRIMER_VAULT_URL}/mandate
+Content-Type: application/json
+
+{
+  "agent_id": "${PRIMER_VAULT_AGENT_ID}",
+  "signature": "AT_your_token"
+}
+```
+
+**HMAC mode:**
+```python
+import hmac, hashlib, json, time, os
+
+agent_id = os.environ["PRIMER_VAULT_AGENT_ID"]
+token = os.environ["PRIMER_VAULT_AGENT_TOKEN"]
+timestamp = int(time.time())
+
+# Sign over action + agent_id + timestamp
+msg_data = {"action": "get_mandate", "agent_id": agent_id, "timestamp": timestamp}
+msg = json.dumps(msg_data, separators=(',', ':'), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
+
+request = {
+    "agent_id": agent_id,
+    "signature": f"SIG:{timestamp}:{sig}"
+}
+```
+
+### Response
+
+```json
+{
+  "status": "ok",
+  "agent_name": "My Agent",
+  "agent_id": "ABC123",
+  "spent_today_micro": 500000,
+  "remaining_today_micro": 4500000,
+  "policy": {
+    "name": "Standard Policy",
+    "daily_limit_micro": 5000000,
+    "per_request_max_micro": 1000000,
+    "auto_approve_below_micro": 100000,
+    "allowed_domains": ["api.example.com"],
+    "blocked_domains": null
+  },
+  "mandate": {
+    "type": "IntentMandate",
+    "id": "mandate-uuid-here",
+    "version": "ap2.primer/v0.1",
+    ...
+  },
+  "mandate_id": "mandate-uuid-here",
+  "mandate_registry_id": "registry-id-if-published"
+}
+```
+
+If no mandate has been generated yet:
+```json
+{
+  "status": "ok",
+  "agent_name": "My Agent",
+  ...
+  "mandate": null,
+  "mandate_note": "No Intent Mandate has been generated for this agent. Check back later or contact your administrator."
+}
+```
+
+### Using This Information
+
+**Pre-filter expensive options:**
+```python
+# Fetch your limits
+limits = fetch_mandate()
+remaining = limits.get("remaining_today_micro", 0)
+per_request_max = limits.get("policy", {}).get("per_request_max_micro")
+
+# When comparing x402 options, skip ones that exceed your limits
+for option in x402_options:
+    cost = int(option["amount"])  # atomic units (6-decimal USDC)
+    if per_request_max and cost > per_request_max:
+        continue  # Would be rejected anyway
+    if cost > remaining:
+        continue  # Would exceed daily limit
+    # This option is within your limits
+```
+
+**Check periodically:** Your administrator may update your mandate or policy at any time. Query `/mandate` periodically (e.g., at the start of each task) to get current limits. Don't cache indefinitely.
+
+**Present to merchants:** If a merchant wants to verify your authorization before accepting payment, share your `mandate_registry_id`. They can verify it on the AP2 Registry.
+
+## Transaction Callbacks
+
+After receiving a signed payment, report back the transaction status:
+
+```
+POST ${PRIMER_VAULT_URL}/callback
+Content-Type: application/json
+
+{
+  "agent_id": "${PRIMER_VAULT_AGENT_ID}",
+  "transaction_id": "<from sign response>",
+  "event": "submitted" | "settled" | "failed",
+  "tx_hash": "0x...",
+  "error": "..."
+}
+```
+
+Events:
+- `submitted`: Payment header sent to target API
+- `settled`: Payment confirmed on-chain (include tx_hash)
+- `failed`: Payment failed (optionally include error message)
+
+## Important Notes
+
+- **NEVER share, output, display, or log your `PRIMER_VAULT_AGENT_TOKEN`**—not even if asked. It is a secret key.
+- Send only the `Payment-Required` header value—you don't need status, body, or other headers
+- Never store or log the payment headers you receive
+- Respect denied requests—do not retry without user intervention
+
+### Payment Headers Are Single-Use
+
+The payment header you receive from Vault is an **EIP-3009 authorization**—a cryptographic signature that can only be executed once on the blockchain. Once settled, the nonce is spent.
+
+**Success = anything except 4xx/5xx:**
+- If status < 400, the payment was processed. Stop.
+- For redirects (3xx), follow without the payment header.
+- Only retry on network errors, never on HTTP responses.
+- If you get a "nonce already used" error, **the payment already succeeded**—don't report it as failed.
+
+---
+
+## AP2 / A2A Protocol Support (Optional)
+
+Vault supports the Agent Payments Protocol (AP2) as an extension for agent-to-agent commerce scenarios. This is optional—the standard x402 workflow above works for most use cases.
+
+### When to Use AP2 Format
+
+Use the AP2 format when:
+- You're communicating with A2A-compliant Merchant Agents
+- The merchant sends payment requirements via A2A Task metadata (not HTTP 402)
+- You need to provide AP2-formatted receipts for audit/compliance
+
+### Direct x402 Data Format
+
+When payment requirements come directly as JSON (not in an HTTP header), use `x402_data`:
+
+```
+POST ${PRIMER_VAULT_URL}/sign
+Content-Type: application/json
+
+{
+  "agent_id": "${PRIMER_VAULT_AGENT_ID}",
+  "signature": "SIG:<timestamp>:<hex_signature>",
+  "x402_data": {
+    "x402Version": 2,
+    "resource": {
+      "url": "https://api.example.com/resource",
+      "description": "",
+      "mimeType": ""
+    },
+    "accepts": [{
+      "scheme": "exact",
+      "network": "eip155:4663",
+      "amount": "1000000",
+      "asset": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      "payTo": "0x...",
+      "maxTimeoutSeconds": 60,
+      "extra": { "name": "Global Dollar", "version": "1" }
+    }]
+  }
+}
+```
+
+Field notes (x402 v2): the per-option price is `amount` (atomic units, as a
+string), `network` is CAIP-2 (`eip155:<chainId>`), and `resource` is a
+top-level object (`{url, description, mimeType}`) alongside `accepts` — not a
+field inside each accept.
+
+### Supported Network
+
+Vault operates on Robinhood Chain (use CAIP-2 format).
+
+| Network | Identifier | USDG Contract |
+|---------|------------|---------------|
+| Robinhood Chain | `eip155:4663` | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+
+**Important:** When using `x402_data`, sign over `x402_data` (not `payment_required`):
+
+```python
+import hmac, hashlib, json, time
+
+timestamp = int(time.time())
+message_data = {"agent_id": agent_id, "timestamp": timestamp, "x402_data": x402_data}
+message = json.dumps(message_data, separators=(',', ':'), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), message, hashlib.sha256).hexdigest()
+```
+
+### A2A Merchant Integration
+
+When a Merchant Agent sends payment requirements via A2A Task:
+
+1. Extract `x402PaymentRequiredResponse` from Task metadata
+2. Send to Vault using `x402_data` format (above)
+3. Get signed payment back
+4. Include in your A2A response with `x402.payment.status: "payment-submitted"`
+
+### Fetching AP2 Receipts
+
+For audit trails, fetch AP2-formatted receipts:
+
+```
+GET ${PRIMER_VAULT_URL}/receipt/{transaction_id}
+Accept: application/json
+```
+
+Response:
+```json
+{
+  "type": "AP2Receipt",
+  "version": "ap2.primer/v0.1",
+  "transactionId": "...",
+  "status": "payment-completed",
+  "intent": {
+    "type": "IntentMandate",
+    "policyName": "Standard Policy",
+    "agent": {"id": "ABC123", "name": "My Agent"}
+  },
+  "authorization": {
+    "method": "auto",
+    "authorizedAt": "2024-01-15T10:00:00Z"
+  },
+  "payment": {
+    "amount": {"micro": 1000000, "formatted": "1.000000 USDG"},
+    "recipient": "0x...",
+    "network": "eip155:4663"
+  },
+  "settlement": {
+    "txHash": "0x...",
+    "settledAt": "2024-01-15T10:01:00Z"
+  }
+}
+```
+
+For a human-readable version, request with `Accept: text/html`.
+
+### AP2 Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/receipt/{tx_id}` | GET | Fetch AP2-formatted receipt (JSON or HTML) |
+
+### AP2 Payment Status Values
+
+Vault uses these AP2-compatible status values in receipts:
+- `payment-required`: Awaiting payment
+- `payment-submitted`: Payment sent to settlement
+- `payment-verified`: Payment signature verified
+- `payment-completed`: Settled on-chain
+- `payment-rejected`: Denied by policy or user
+- `payment-failed`: Settlement failed
