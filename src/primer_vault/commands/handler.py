@@ -65,7 +65,7 @@ class CommandHandler:
             try:
                 return self._resume_command(inputs)
             except Exception as e:
-                return CommandResult.fail(f"Error: {e}")
+                return CommandResult.fail(str(e))
 
         # Parse command
         try:
@@ -89,7 +89,10 @@ class CommandHandler:
             try:
                 return handler(args)
             except Exception as e:
-                return CommandResult.fail(f"Error: {e}")
+                # No "Error:" prefix here - the CLI and the console each add
+                # their own when they print, and a prefix baked into the
+                # message shows the user "Error: Error:".
+                return CommandResult.fail(str(e))
         else:
             return CommandResult.fail(f"Unknown command: {cmd}")
 

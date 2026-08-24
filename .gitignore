@@ -39,6 +39,7 @@ data/
 
 # Private development files (internal docs, notes, etc.)
 private/
+DELETEME_*
 
 # Environment variables
 .env

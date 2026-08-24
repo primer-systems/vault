@@ -81,7 +81,7 @@ def append_log(message: str, retention_days: int = 0) -> None:
                 date_str = datetime.now().strftime('%Y-%m-%d')
                 message = f"[{date_str} {message[1:]}"
             f.write(message + '\n')
-    except Exception as e:
+    except Exception:
         # Silently fail - don't crash app for logging issues
         pass
 

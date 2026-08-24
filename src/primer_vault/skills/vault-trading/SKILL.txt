@@ -7,7 +7,7 @@ compatibility:
   runtimes: ["*"]
 metadata:
   author: Primer Systems
-  version: 0.1.0
+  version: 0.2.0
   homepage: https://primer.systems
   repository: https://github.com/primer-systems/Vault
 ---
@@ -20,6 +20,50 @@ the trade against the user's policy, and executes it or asks the user to approve
 Vault never decides *what* to trade — it only permits, rejects, or escalates.
 
 The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:4663`).
+
+## Know your limits before you trade
+
+`POST /mandate` returns the limits you are held to, authenticated exactly like
+`/sign` and `/trade`. Check it at the start of a task rather than discovering a
+ceiling by hitting it.
+
+```json
+"policy": {
+  "trading": {
+    "enabled": true,
+    "per_trade_max_usd": 1.0,
+    "daily_volume_limit_usd": 5.0,
+    "auto_approve_below_usd": 0.10,
+    "max_slippage_percent": 3.0,
+    "max_price_impact_percent": 5.0,
+    "min_reserve_eth": 0.0001,
+    "volume_today_usd": 1.75,
+    "remaining_today_usd": 3.25
+  }
+}
+```
+
+What to do with each:
+
+- `per_trade_max_usd` — a trade valued above this is **rejected**. Split it.
+- `remaining_today_usd` — what is left today, counting trades still awaiting
+  approval. Pace against this, not `daily_volume_limit_usd`.
+- `auto_approve_below_usd` — below this a trade runs without prompting. Above it,
+  expect `pending` and poll. Absent means every trade needs approval.
+- `max_slippage_percent` — the ceiling on the `max_slippage_bps` you may ask for.
+  Requesting more is rejected.
+- `max_price_impact_percent` — how far below the pool's own rate your fill may
+  land, fee included. **This is why the pool you pick matters**: a pool too thin
+  for your size will quote a bad fill and Vault will stop and ask the user. Quote
+  the fee tiers and take the best one.
+- `min_reserve_eth` — trading halts while the wallet's ETH is under this, so gas
+  remains. If a trade is refused for it, the wallet needs ETH, not a smaller trade.
+
+`"enabled": false` means this policy does not permit trading at all; do not submit
+trades.
+
+The user sets all of these. You cannot change them, and nothing you send in a
+trade request overrides them.
 
 ## The model
 
@@ -110,35 +154,67 @@ Trade fields:
 | `amount_in` | Human-decimal string of `token_in` to spend (e.g. `"10.5"`) |
 | `fee_tier` | Pool fee (V3: `100`, `500`, `3000`, `10000`; V4: any uint24) |
 | `max_slippage_bps` | Max slippage in basis points (100 = 1%). Vault caps this at the policy maximum |
-| `recipient` | Optional; defaults to your Vault wallet |
 | `deadline` | Optional unix seconds |
 | `dex_version` | Optional: `"v3"` or `"v4"`. Inferred from V4 fields if not specified |
 | `tick_spacing` | **V4 only, required**: Pool tick spacing (e.g. `10`, `60`, `200`) |
 | `hooks` | **V4 only, required**: Hook contract address (use zero address for no hooks) |
 
+Trades always execute from the address your agent was commissioned for. There is
+no field to choose one: `agent_id`, `wallet_address` and `recipient` are refused
+if present, because Vault takes both from the credentials you authenticated with.
+
 ## Step 3: Handle the response
 
 - **`executed`** — the swap is on-chain; you get `tx_hash` and `amount_out`.
-- **`pending`** — the user must approve in the Vault app. Poll for the result
-  (same pattern as `/sign/status/{request_id}`). The response includes the
+- **`pending`** — the user must approve in the Vault app. Poll
+  **`GET /trade/status/{request_id}`** for the result. Note this is a different
+  endpoint from `/sign/status/{request_id}`, which only knows about payments and
+  will return `REQUEST_NOT_FOUND` for a trade id. The response includes the
   `quote` so you can see the expected output and min-out.
-- **`rejected`** — policy or shape rejected it; `reason` says why (e.g. token not
-  on the allowlist, exceeds max trade size, exceeds daily volume, slippage too
-  high). Do not retry without changing the trade.
+- **`rejected`** — policy or shape rejected it; `reason` says why (e.g. trading
+  disabled for this policy, exceeds max trade size, exceeds daily volume, slippage
+  above the policy ceiling, ETH balance below the policy minimum, no pool or no
+  liquidity).
+  Do not retry without changing the trade.
 
 Every response carries the `quote` Vault computed: `amount_out_expected`,
 `amount_out_min` (after slippage), `notional_usdg`, and the `pool`.
 
+Error responses carry a machine-readable `code`. The HTTP status tells you what
+to do: **400** fix the request, **403** refused by policy — retrying unchanged
+cannot succeed, **409** stale — re-quote and resubmit, **429** wait for a limit
+to clear, **5xx** Vault-side problem — the trade was fine, retrying is safe.
+Codes where the right move isn't obvious:
+
+| Code | What to do |
+|------|-----------|
+| `WALLET_LOCKED` (503) | The user must unlock the wallet in the Vault app. Tell them, then retry; don't hammer |
+| `PRICE_MOVED` (409) | The market moved past your slippage tolerance while awaiting approval. Re-quote and resubmit |
+| `REQUEST_EXPIRED` (409) | The approval window closed before the user acted. Resubmit if the trade is still worth doing |
+| `TOO_MANY_PENDING` (429) | Trades already await the user's approval. Wait for those; don't submit more |
+| `EXCEEDS_DAILY_LIMIT` (429) | Daily volume used up; resets at the start of the calendar day |
+| `FIELD_NOT_PERMITTED` (400) | You sent `agent_id`, `wallet_address`, or `recipient` inside the trade. Remove it |
+| `EXECUTION_ERROR` (500) | The trade failed on-chain after acceptance. Resubmitting unchanged is reasonable |
+| `AUTH_FAILED` (401) | Check the token, the exact signed-message shape, and clock skew |
+
 ## What Vault enforces (so you don't waste a request)
 
-- Token allowlist: `token_out` must be permitted (or the policy is allow-all).
-- Base asset: one leg must be USDG or WETH.
-- Max trade size and max daily volume (USDG notional), max trades per day.
-- Max slippage: Vault re-quotes and rejects a fill worse than the tolerance.
-- Reserve: Vault keeps a minimum USDG and ETH-for-gas and won't spend below it.
+These checks **reject** a trade:
 
-Query your limits before trading (same idea as the x402 mandate endpoint) to
-pre-filter trades that would be rejected.
+- Trading enabled: the policy must have trading switched on.
+- Max trade size: USD notional must not exceed the per-trade maximum.
+- Max daily volume: the day's running USD total must stay under the daily cap,
+  which resets at the start of each calendar day.
+- Max slippage: `max_slippage_bps` must be within the policy ceiling. Vault
+  re-quotes the pool itself and rejects a fill worse than that tolerance.
+- Minimum ETH balance: the wallet's ETH balance must be at or above the policy
+  minimum. Trading halts while it is below.
+
+These send a trade to the **user for approval**:
+
+- Trades at or above the auto-approve threshold. Below it they execute immediately.
+- Trades Vault cannot value. It prices a trade from whichever leg is USDG or WETH;
+  trades with neither, and wrap/unwrap, always go to the user.
 
 ## Network
 
@@ -221,9 +297,9 @@ V4 pools require additional fields to identify the pool:
 - **`hooks`**: The hook contract address. Use the zero address
   (`0x0000000000000000000000000000000000000000`) for pools with no hooks.
 
-Hooks are part of the pool's identity — they are baked into the pool's CREATE2
-address. On RHC, approximately 38% of pools use hooks (mostly launcher integrations
-like Doppler/Clanker).
+Hooks are part of the pool's identity — a pool with hooks and a pool without them
+are different pools even with the same tokens, fee and tick spacing. Get the hook
+address wrong and you will be told no pool exists.
 
 ### V4 Contract Addresses (RHC)
 
@@ -271,7 +347,6 @@ quoter = w3.eth.contract(address=V4_QUOTER, abi=[{
     ],"name":"poolKey","type":"tuple"},
     {"name":"zeroForOne","type":"bool"},
     {"name":"exactAmount","type":"uint128"},
-    {"name":"sqrtPriceLimitX96","type":"uint160"},
     {"name":"hookData","type":"bytes"}
   ],"name":"params","type":"tuple"}],
   "name":"quoteExactInputSingle",
@@ -286,7 +361,7 @@ currency0, currency1 = sort_tokens(WETH, USDG)
 zero_for_one = currency0.lower() == WETH.lower()  # selling currency0?
 
 pool_key = (currency0, currency1, 500, 10, "0x" + "00" * 20)  # fee=500, tickSpacing=10, no hooks
-params = (pool_key, zero_for_one, amount_in, 0, b"")
+params = (pool_key, zero_for_one, amount_in, b"")   # no sqrtPriceLimit on the v4 quoter
 out = quoter.functions.quoteExactInputSingle(params).call()
 amount_out = out[0]
 ```

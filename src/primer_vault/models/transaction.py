@@ -19,7 +19,7 @@ Status lifecycle:
 
 import uuid
 from datetime import datetime, timezone
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Optional
 
 
@@ -59,18 +59,32 @@ class Transaction:
     reject_reason: Optional[str] = None  # Reason for rejection
     x402_data: Optional[dict] = None  # Full x402 payload for detail view
     mandate_id: Optional[str] = None  # AP2 IntentMandate ID
+    # Idempotency key of the request that produced this payment. Persisted so a
+    # duplicate request after a restart is recognised from disk, not only from
+    # the in-memory signature cache, and is not signed a second time.
+    cache_key: Optional[str] = None
     signed_at: Optional[str] = None   # When we signed it
     submitted_at: Optional[str] = None  # When agent submitted to target API
     settled_at: Optional[str] = None  # When settled on-chain
-    verification_status: Optional[str] = None  # None, "verified", "failed", "not_found", "pending"
+    # None, "pending", "verified", "failed", "not_found", "unavailable".
+    # "failed" means the chain reported a revert; "unavailable" means Vault could
+    # not reach a node, which says nothing about the payment either way.
+    verification_status: Optional[str] = None
     verification_block: Optional[int] = None   # Block number if verified
+    verification_detail: Optional[str] = None  # Why, when it is not a plain yes
     # Trade-specific fields
     token_in: Optional[str] = None    # Input token address (trade)
     token_out: Optional[str] = None   # Output token address (trade)
     symbol_in: Optional[str] = None   # Input token symbol (trade)
     symbol_out: Optional[str] = None  # Output token symbol (trade)
     amount_in: Optional[str] = None   # Amount of input token (trade, raw string)
-    amount_out: Optional[str] = None  # Amount of output token received (trade)
+    # Both sides of a trade's output are kept. amount_out is the fill, read from
+    # the receipt; amount_out_quoted is what the quote predicted before it ran.
+    # The pair is what makes the difference visible - recording only the quote,
+    # labelled as received, is what this replaced. A fill of None means it could
+    # not be read from the receipt, which is not the same as zero.
+    amount_out: Optional[str] = None  # Output token actually received (trade)
+    amount_out_quoted: Optional[str] = None  # Output the quote predicted (trade)
     fee_tier: Optional[int] = None    # Uniswap fee tier in bps (trade)
     slippage_bps: Optional[int] = None  # Slippage tolerance in bps (trade)
     pool: Optional[str] = None        # Pool address used (trade)
@@ -436,7 +450,8 @@ class Transaction:
                 "settledAt": self.settled_at,
                 "verification": {
                     "status": self.verification_status or "unverified",
-                    "block": self.verification_block
+                    "block": self.verification_block,
+                    "detail": self.verification_detail,
                 } if self.verification_status else None
             }
 

@@ -8,9 +8,7 @@ import html as _html
 import re
 from typing import Callable, TYPE_CHECKING
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QTextEdit, QLineEdit, QHBoxLayout, QLabel
-)
+from PyQt6.QtWidgets import QWidget, QTextEdit, QLineEdit, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QTextCursor, QKeyEvent
 
@@ -80,6 +78,20 @@ class CommandInput(QLineEdit):
         )
         if not enabled:
             self.setPlaceholderText("")
+
+    def clear_history(self):
+        """Drop the command-history buffer and any in-progress text.
+
+        Called when the wallet locks. A typed line can itself carry a secret -
+        `seed import "<phrase>"`, `address import <key>`, `wallet open <name>
+        --password <pw>` - and it is kept here to power Up-arrow recall. Blanking
+        the output pane does not reach this second copy, so lock() would
+        otherwise leave the phrase or key redisplayable with one keystroke.
+        """
+        self._history.clear()
+        self._history_index = -1
+        self._current_input = ""
+        self.clear()
 
     def _submit(self):
         text = self.text()
@@ -189,6 +201,20 @@ class ConsoleWindow(FramelessDialog):
         self.core.event_bus.subscribe(EventType.ACTIVITY, on_event)
         self.core.event_bus.subscribe(EventType.APPROVAL_NEEDED, on_event)
         self.core.event_bus.subscribe(EventType.TRANSACTION_CREATED, on_event)
+        # Clear the pane when the wallet locks: `seed create` / `address export`
+        # print the phrase or key here, and lock() must leave nothing readable
+        # on screen or in this widget's buffer. Synchronous, not deferred, so it
+        # is gone the instant the wallet locks - the walk-away case auto-lock
+        # exists for. Every other key-revealing surface scrubs the same way.
+        self.core.event_bus.subscribe(EventType.WALLET_LOCKED,
+                                      self._on_wallet_locked)
+
+    def _on_wallet_locked(self, event=None):
+        """Blank the output pane and its buffer, and drop the input command
+        history, when the wallet locks. Both hold copies of what was typed, and
+        a typed line can carry a seed phrase, a private key or the password."""
+        self.output.setHtml(CONSOLE_BANNER)
+        self.input.clear_history()
 
     def _show_event(self, event):
         """Display an event in the console."""
@@ -204,12 +230,20 @@ class ConsoleWindow(FramelessDialog):
             amount = event.data.get("amount_micro", 0) / 1_000_000
             self._append(f"[approval needed] {agent} requests ${amount:.6f}", CONSOLE["approval"])
 
-    def _append(self, text: str, color: str = None):
-        """Append text to output."""
+    def _append(self, text: str, color: str = None, *, markup: bool = False):
+        """Append a line to the output.
+
+        The output is a rich-text document, so `text` is escaped unless the
+        caller says it has already built markup. Most of what lands here is not
+        ours - agent names, a merchant's resource description, command output -
+        and inserting that as markup let it garble or forge log lines in an audit
+        trail. Only the help-text highlighter passes markup=True.
+        """
         color = color or CONSOLE["text"]
+        body = text if markup else _html.escape(text)
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(f'<span style="color: {color};">{text}</span><br>')
+        cursor.insertHtml(f'<span style="color: {color};">{body}</span><br>')
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
 
@@ -224,7 +258,7 @@ class ConsoleWindow(FramelessDialog):
         """
         stripped = line.strip()
         if stripped and _HEADER_RE.match(stripped):
-            self._append(f"<b>{_html.escape(line)}</b>", Theme.RUST)
+            self._append(f"<b>{_html.escape(line)}</b>", Theme.RUST, markup=True)
             return
 
         # Split "command  - description" so the description renders dim grey.
@@ -243,7 +277,7 @@ class ConsoleWindow(FramelessDialog):
 
         if desc:
             cmd_html += f'<span style="color: {CONSOLE["muted"]};">{_html.escape(desc)}</span>'
-        self._append(cmd_html, base_color)
+        self._append(cmd_html, base_color, markup=True)
 
     def _append_lines(self, lines: list[tuple[str, str]]):
         """Append multiple lines. Each tuple is (text, color)."""
@@ -307,7 +341,7 @@ class ConsoleWindow(FramelessDialog):
             for line in result.output.split("\n"):
                 self._append_output(line, color)
         if result.error:
-            self._append(_html.escape(result.error), CONSOLE["error"])
+            self._append(result.error, CONSOLE["error"])
 
     # _register_commands and all duplicate _cmd_* methods removed.
     # All commands are routed through CommandHandler (src/commands/).

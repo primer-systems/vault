@@ -227,6 +227,10 @@ _STATUS_TOKEN = {
     "settled":   "success",
     "approved":  "success",
     "failed":    "error",
+    # An on-chain check Vault could not perform. Not an error: it says nothing
+    # about the payment, only that the network could not be reached.
+    "unavailable": "pending",
+    "not_found":   "error",
     # Payment lifecycle (served dashboard + payment dialogs)
     "payment-completed": "accent",
     "payment-verified":  "success",

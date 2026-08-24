@@ -181,25 +181,6 @@ class TestGUIConsoleParity:
 
             pytest.fail(msg)
 
-    def test_list_all_core_calls(self):
-        """List all Core method calls for both GUI and Console."""
-        gui_calls = get_gui_core_calls()
-        console_calls = get_console_core_calls()
-
-        all_methods = set(gui_calls.keys()) | set(console_calls.keys())
-
-        print("\n\nCore method usage comparison:")
-        print("-" * 60)
-        print(f"{'Method':<35} {'GUI':<10} {'Console':<10}")
-        print("-" * 60)
-
-        for method in sorted(all_methods):
-            in_gui = "✓" if method in gui_calls else ""
-            in_console = "✓" if method in console_calls else ""
-            print(f"{method:<35} {in_gui:<10} {in_console:<10}")
-
-        print("-" * 60)
-
     def test_no_gui_only_state_changes(self):
         """
         State-changing operations shouldn't exist only in GUI.
@@ -233,94 +214,6 @@ class TestGUIConsoleParity:
                 msg += f"  - {method}() in {', '.join(files)}\n"
             # This is a warning, not a failure - some operations may be GUI-specific
             print(f"\nWARNING: {msg}")
-
-
-class TestConsoleCommands:
-    """Verify Console commands map to Core methods properly."""
-
-    def get_console_command_handlers(self) -> Dict[str, List[Tuple[int, str]]]:
-        """
-        Find all command handler methods in Console.
-
-        Returns dict mapping handler name to (lineno, first_line) tuples.
-        """
-        handlers = {}
-        console_file = PRIMER_VAULT_DIR / 'ui' / 'console.py'
-
-        if not console_file.exists():
-            return handlers
-
-        try:
-            with open(console_file, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            # Pattern: def _cmd_xxx(self, ...) or def _xxx_xxx(self, args)
-            pattern = re.compile(r'def (_(?:cmd_)?[a-z_]+)\s*\(self')
-
-            for lineno, line in enumerate(lines, 1):
-                match = pattern.search(line)
-                if match:
-                    handler = match.group(1)
-                    if handler not in handlers:
-                        handlers[handler] = []
-                    handlers[handler].append((lineno, line.strip()))
-        except Exception:
-            pass
-
-        return handlers
-
-    def test_list_console_commands(self):
-        """List all Console command handlers."""
-        handlers = self.get_console_command_handlers()
-
-        print("\n\nConsole command handlers:")
-        for handler in sorted(handlers.keys()):
-            locations = handlers[handler]
-            for lineno, line in locations:
-                print(f"  L{lineno}: {handler}")
-
-
-class TestEventSubscriptions:
-    """Both GUI and Console should subscribe to relevant EventBus events."""
-
-    def get_event_subscriptions(self, filepath: Path) -> Set[str]:
-        """Find all EventType subscriptions in a file."""
-        events = set()
-
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            # Pattern: subscribe(EventType.XXX, ...)
-            pattern = re.compile(r'subscribe\s*\(\s*EventType\.([A-Z_]+)')
-            events.update(pattern.findall(content))
-        except Exception:
-            pass
-
-        return events
-
-    def test_event_subscriptions(self):
-        """List event subscriptions for GUI and Console."""
-        gui_file = PRIMER_VAULT_DIR / 'ui' / 'main_window.py'
-        console_file = PRIMER_VAULT_DIR / 'ui' / 'console.py'
-
-        gui_events = self.get_event_subscriptions(gui_file) if gui_file.exists() else set()
-        console_events = self.get_event_subscriptions(console_file) if console_file.exists() else set()
-
-        all_events = gui_events | console_events
-
-        print("\n\nEvent subscriptions comparison:")
-        print("-" * 50)
-        print(f"{'Event':<30} {'GUI':<10} {'Console':<10}")
-        print("-" * 50)
-
-        for event in sorted(all_events):
-            in_gui = "✓" if event in gui_events else ""
-            in_console = "✓" if event in console_events else ""
-            print(f"{event:<30} {in_gui:<10} {in_console:<10}")
-
-        print("-" * 50)
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

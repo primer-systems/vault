@@ -11,16 +11,19 @@ and maintains stability under various conditions.
 import sys
 import tempfile
 import shutil
-import time
 import json
 import base64
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
 
 import pytest
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+
+# A stand-in master key for calls that exercise signature handling rather than
+# credential decryption; the paths under test reject before reaching the key.
+DATA_KEY = bytes(32)
 
 
 @pytest.fixture
@@ -29,13 +32,6 @@ def temp_data_dir():
     temp_dir = tempfile.mkdtemp()
     yield Path(temp_dir)
     shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 @pytest.fixture
@@ -66,7 +62,7 @@ class TestRateLimiting:
         client_ip = "192.168.1.100"
 
         # Should allow many requests under the limit (is_rate_limited returns False)
-        for i in range(10):
+        for _i in range(10):
             assert limiter.is_rate_limited(client_ip) is False
 
     def test_rate_limiter_blocks_excessive_traffic(self):
@@ -78,7 +74,7 @@ class TestRateLimiting:
         client_ip = "192.168.1.101"
 
         # Exhaust the limit
-        for i in range(5):
+        for _i in range(5):
             limiter.is_rate_limited(client_ip)
 
         # Next request should be blocked (rate limited)
@@ -92,7 +88,7 @@ class TestRateLimiting:
         client_ip = "192.168.1.102"
 
         # Make some requests - should not be rate limited
-        for i in range(5):
+        for _i in range(5):
             result = limiter.is_rate_limited(client_ip)
             assert result is False
 
@@ -104,7 +100,7 @@ class TestRateLimiting:
         limiter = RateLimiter(requests_per_minute=3)
 
         # Exhaust limit for client 1
-        for i in range(3):
+        for _i in range(3):
             limiter.is_rate_limited("client1")
 
         # Client 1 should now be rate limited
@@ -160,7 +156,7 @@ class TestRequestParsing:
 
         try:
             base64.b64decode(invalid_base64)
-            assert False, "Should have raised"
+            raise AssertionError("Should have raised")
         except Exception:
             pass  # Expected
 
@@ -172,7 +168,7 @@ class TestRequestParsing:
         decoded_bytes = base64.b64decode(invalid_json)
         try:
             json.loads(decoded_bytes)
-            assert False, "Should have raised"
+            raise AssertionError("Should have raised")
         except json.JSONDecodeError:
             pass  # Expected
 
@@ -183,11 +179,6 @@ class TestRequestParsing:
 
 class TestRequestSizes:
     """Test handling of various request sizes."""
-
-    def test_empty_request_body_handled(self):
-        """Empty request body should be handled."""
-        # Implementation should reject empty body
-        pass
 
     def test_very_large_payload_handled(self):
         """Very large payload should be handled (or rejected)."""
@@ -301,7 +292,7 @@ class TestServerLifecycle:
 
         if core.is_server_running():
             # Second start should be handled gracefully
-            result = core.start_server(port=0)
+            core.start_server(port=0)
             # May return False or True - implementation dependent
             core.stop_server()
 
@@ -418,7 +409,7 @@ class TestHeaderHandling:
             agent=agent,
             agent_id="TEST123",
             signature_header=None,  # Missing
-            wallet_password="test",
+            data_key=DATA_KEY,
             payment_required="test",
             x402_data=None,
             request_url="https://example.com"
@@ -445,27 +436,13 @@ class TestHeaderHandling:
             agent=agent,
             agent_id="TEST123",
             signature_header="",  # Empty
-            wallet_password="test",
+            data_key=DATA_KEY,
             payment_required="test",
             x402_data=None,
             request_url="https://example.com"
         )
 
         assert result is not None
-
-
-# =============================================================================
-# Content Type Tests
-# =============================================================================
-
-class TestContentTypes:
-    """Test content type handling."""
-
-    def test_json_content_type_expected(self):
-        """Server should expect JSON content type."""
-        # This is more of a documentation test
-        # Actual content type checking is in the HTTP handler
-        pass
 
 
 # =============================================================================

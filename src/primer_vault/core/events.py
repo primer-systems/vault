@@ -6,7 +6,7 @@ The daemon broadcasts events, clients subscribe to receive them.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Callable
 from enum import Enum
 import logging
 

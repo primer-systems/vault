@@ -2,7 +2,7 @@
 Agent command implementations.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import requests as _requests
 
@@ -23,8 +23,20 @@ class AgentCommands:
         self.core = core
         self.handler = handler
 
-    def _upload_mandate(self, mandate: dict) -> dict:
-        """Upload mandate directly to AP2 registry, bypassing CoreClient proxy."""
+    def _upload_mandate(self, mandate: dict, agent_code: str) -> dict:
+        """Upload a mandate to the AP2 registry and record where it landed.
+
+        Takes the agent code because publishing is not finished when the request
+        returns: the registry hands back the id it filed the mandate under, and
+        that id has to go onto the stored mandate. Without it the agent's
+        `mandate_registry_id` is null forever, so an agent commissioned here
+        cannot tell a merchant where to verify it - and nothing reports an error,
+        because the upload itself succeeded. The window path stamps the mandate
+        the same way; doing it here rather than at each call site is what stops
+        the two drifting apart again.
+
+        Uploads directly rather than through the CoreClient proxy.
+        """
         try:
             response = _requests.post(
                 self._MANDATE_REGISTRY_URL,
@@ -35,10 +47,14 @@ class AgentCommands:
             if response.status_code in (200, 201):
                 data = response.json()
                 mandate_id = data.get("id", mandate.get("id"))
+                viewer_url = f"https://ap2.primer.systems/mandate.html?id={mandate_id}"
+                mandate["registryId"] = mandate_id
+                mandate["registryUrl"] = viewer_url
+                self.core.set_agent_mandate(agent_code, mandate)
                 return {
                     "success": True,
                     "mandate_id": mandate_id,
-                    "viewer_url": f"https://ap2.primer.systems/mandate.html?id={mandate_id}",
+                    "viewer_url": viewer_url,
                 }
             return {"success": False, "error": f"Registry returned status {response.status_code}"}
         except Exception as e:
@@ -224,11 +240,12 @@ Example:
 
     def _register(self, args: list[str]) -> CommandResult:
         """Register a new agent."""
-        # Require unlocked wallet (agent credentials are encrypted with wallet password)
+        # Require unlocked wallet: agent credentials are encrypted under the
+        # wallet's master key, which only exists while the wallet is open.
         if not self.core.is_wallet_unlocked():
             return CommandResult.fail(
-                "Error: Please unlock a wallet first.\n"
-                "Agent credentials are encrypted with your wallet password for security."
+                "Please unlock a wallet first.\n"
+                "Agent credentials are encrypted with your wallet's key."
             )
 
         # Parse arguments
@@ -241,7 +258,7 @@ Example:
                     auth_mode = args[i + 1]
                     i += 2
                 else:
-                    return CommandResult.fail("Error: --auth requires a value (hmac or bearer)")
+                    return CommandResult.fail("--auth requires a value (hmac or bearer)")
             elif args[i].startswith("-"):
                 return CommandResult.fail(f"Unknown option: {args[i]}")
             else:
@@ -250,7 +267,7 @@ Example:
                 i += 1
 
         if not name:
-            return CommandResult.fail("Error: Missing agent name")
+            return CommandResult.fail("Missing agent name")
 
         try:
             agent, secret = self.core.create_agent(name, auth_mode)
@@ -315,7 +332,7 @@ Examples:
         addresses = self.core.get_wallet_addresses()
         address = None
         for addr in addresses:
-            if addr["id"].upper() == address_id.upper() or addr["address"] == address_id:
+            if addr["id"].upper() == address_id.upper() or addr["address"].lower() == address_id.lower():
                 address = addr
                 break
 
@@ -340,11 +357,11 @@ Examples:
                 self.core.set_agent_mandate(agent.code, mandate_data)
 
                 lines.append("")
-                lines.append(f"Intent mandate generated:")
+                lines.append("Intent mandate generated:")
                 lines.append(f"  ID: {mandate_data.get('id', 'N/A')}")
 
                 if upload:
-                    result = self._upload_mandate(mandate_data)
+                    result = self._upload_mandate(mandate_data, agent.code)
                     if result.get("success"):
                         lines.append("")
                         lines.append("Mandate uploaded to registry.")
@@ -412,7 +429,7 @@ Example:
             ]
 
             if upload:
-                result = self._upload_mandate(mandate)
+                result = self._upload_mandate(mandate, agent.code)
                 if result.get("success"):
                     lines.append("")
                     lines.append("Mandate uploaded to registry.")
@@ -490,13 +507,13 @@ Example:
                     policy_name = args[i + 1]
                     i += 2
                 else:
-                    return CommandResult.fail("Error: --policy requires a value")
+                    return CommandResult.fail("--policy requires a value")
             elif args[i] == "--address":
                 if i + 1 < len(args):
                     address_id = args[i + 1]
                     i += 2
                 else:
-                    return CommandResult.fail("Error: --address requires a value")
+                    return CommandResult.fail("--address requires a value")
             elif args[i].startswith("-"):
                 return CommandResult.fail(f"Unknown option: {args[i]}")
             else:
@@ -505,10 +522,10 @@ Example:
                 i += 1
 
         if not identifier:
-            return CommandResult.fail("Error: Missing agent name or ID")
+            return CommandResult.fail("Missing agent name or ID")
 
         if not policy_name and not address_id:
-            return CommandResult.fail("Error: Specify --policy and/or --address to change")
+            return CommandResult.fail("Specify --policy and/or --address to change")
 
         agent = self._find_agent(identifier)
         if not agent:
@@ -532,7 +549,7 @@ Example:
             addresses = self.core.get_wallet_addresses()
             address = None
             for addr in addresses:
-                if addr["id"].upper() == address_id.upper() or addr["address"] == address_id:
+                if addr["id"].upper() == address_id.upper() or addr["address"].lower() == address_id.lower():
                     address = addr
                     break
 
@@ -657,10 +674,13 @@ Examples:
             })
 
         if token is None:
-            # HMAC but couldn't decrypt (shouldn't happen now, but safety check)
+            # HMAC, but the secret would not decrypt. The password is not what
+            # encrypts it, so a wrong password is not the cause - the open wallet
+            # holds a different key from the one this agent was created under.
             return CommandResult.fail(
                 f"Could not retrieve credentials for agent '{agent.name}'.\n"
-                "The agent's secret may have been encrypted with a different wallet password."
+                "This agent belongs to a different wallet. Open that wallet to "
+                "read its credentials."
             )
 
         # Success - show full instructions

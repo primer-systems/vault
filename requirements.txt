@@ -1,18 +1,48 @@
+# Direct dependencies, pinned.
+#
+# A release build must be reproducible: the provenance attestation on each binary
+# proves CI produced it, which is only worth something if CI builds the same
+# thing twice. Open-ended ranges meant a tagged release picked up whatever had
+# been published that morning — including, for a wallet, whatever had been
+# published to any of these projects that morning.
+#
+# These are the versions the test suite passes against. Raise them deliberately,
+# as a commit, so the change is reviewable and bisectable.
+#
+# requirements.lock beside this file is what the workflows actually install: the
+# whole tree, 83 packages, each with a hash. Nothing can be substituted under a
+# release build.
+#
+# It is resolved for every platform at once, which matters — a lock produced by
+# pip-compile on one machine carries that machine's packages and no markers, so a
+# Windows-made lock breaks the macOS and Linux builds. Regenerate with uv, which
+# resolves across platforms, and for the Python the workflows use:
+#
+#   uv pip compile requirements.txt --universal --generate-hashes #       --python-version 3.11 --output-file requirements.lock
+#
+# Change a version here, regenerate, and commit both files together.
+
 # UI
-PyQt6>=6.6.0
+PyQt6==6.10.2
 
 # Cryptography
-cryptography>=42.0.0
-argon2-cffi>=23.1.0
+cryptography==50.0.0
+argon2-cffi==25.1.0
 
 # Ethereum
-eth-account>=0.11.0
-mnemonic>=0.20
-eth-keys>=0.5.0
-web3>=6.15.0
+eth-account==0.13.7
+mnemonic==0.21
+eth-keys==0.7.0
+web3==7.14.0
 
 # File watching
-watchdog>=3.0.0
+watchdog==6.0.0
+
+# HTTP (mandate registry uploads)
+requests==2.33.0
 
 # Platform paths
-platformdirs>=4.0.0
+platformdirs==4.10.0
+
+# Hardware wallet (Ledger)
+ledgereth==0.10.0

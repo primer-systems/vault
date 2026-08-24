@@ -11,11 +11,8 @@ various conditions including concurrent requests.
 import sys
 import tempfile
 import shutil
-import threading
-import time
 from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -32,11 +29,6 @@ def temp_data_dir():
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance with temporary data directory."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 @pytest.fixture
@@ -93,7 +85,6 @@ class TestConcurrentSpendingLimits:
         request_amount = 600_000  # $0.60
 
         results = []
-        errors = []
 
         def make_request(i):
             try:
@@ -117,8 +108,8 @@ class TestConcurrentSpendingLimits:
                 results.append(future.result())
 
         # Count successes
-        successful = sum(1 for r in results if r[0] == "success")
-        total_spent = sum(r[1] for r in results if r[0] == "success")
+        sum(1 for r in results if r[0] == "success")
+        sum(r[1] for r in results if r[0] == "success")
 
         # Should not exceed daily limit
         # Note: Due to race conditions without proper locking, this might fail
@@ -165,6 +156,7 @@ class TestDailyReset:
         # Set some spending
         agent.spent_today_micro = 5_000_000  # $5
         agent.last_reset_date = (date.today() - timedelta(days=1)).isoformat()
+        agent.last_reset_at = ""
         core._policy_store.update_agent(agent)
 
         # Trigger daily reset check
@@ -200,6 +192,7 @@ class TestDailyReset:
         yesterday = (date.today() - timedelta(days=1)).isoformat()
         agent.spent_today_micro = 1_000_000
         agent.last_reset_date = yesterday
+        agent.last_reset_at = ""
         core._policy_store.update_agent(agent)
 
         # Check reset
@@ -215,6 +208,7 @@ class TestDailyReset:
 
         # Clear reset date
         agent.last_reset_date = None
+        agent.last_reset_at = ""
         agent.spent_today_micro = 1_000_000
         core._policy_store.update_agent(agent)
 
@@ -260,7 +254,11 @@ class TestPolicyLimitConsistency:
         assert policy.auto_approve_below_micro > policy.per_request_max_micro
 
     def test_zero_limits_behavior(self, core):
-        """Zero limits should effectively disable spending."""
+        """Zero limits are stored as zero and mean a cap of zero.
+
+        Enforcement is proven end to end in TestZeroLimitsAreEnforced below;
+        this pins only that the values survive creation unchanged.
+        """
         policy = core.create_policy(
             name="ZeroLimit",
             networks=[4663],
@@ -428,3 +426,189 @@ class TestSpendingEdgeCases:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestZeroLimitsAreEnforced:
+    """A limit of $0.00 refuses every payment - zero is a cap, not an absence.
+
+    Guarded by truthiness (`if policy.daily_limit_micro:`), a policy set to 0
+    would skip them entirely and an agent configured to spend nothing could
+    spend without any cap at all. "No limit" is spelled None for
+    per_request_max_micro and cannot be spelled for the daily limit; see the
+    convention note on SpendPolicy in models/policy.py.
+
+    End to end through handle_sign_request, because this is a property of the
+    enforcement rather than of the model.
+    """
+
+    @staticmethod
+    def _x402(pay_to="0x00000000000000000000000000000000000c0De0"):
+        """A well-formed $1.00 USDG payment requirement on Robinhood Chain."""
+        from primer_vault.networks import TOKENS
+        return {
+            "x402Version": 2,
+            "accepts": [{
+                "scheme": "exact",
+                "network": "eip155:4663",
+                "amount": "1000000",
+                "asset": TOKENS["USDG"].addresses[4663],
+                "payTo": pay_to,
+                "maxTimeoutSeconds": 60,
+                "extra": {"name": "Global Dollar", "version": "1"},
+            }],
+            "resource": {"url": "https://api.example.com/thing",
+                         "description": "", "mimeType": ""},
+        }
+
+    def _commission(self, core, *, daily, per_req, auto):
+        agent, token = core.create_agent(name="ZeroPayer", auth_mode="bearer")
+        policy = core.create_policy(
+            name="ZeroEnforced", networks=[4663],
+            daily_limit_micro=daily,
+            per_request_max_micro=per_req,
+            auto_approve_below_micro=auto)
+        address = core.get_wallet_addresses()[0]
+        core.commission_agent(agent.code, policy.id, address["address"])
+        return core._signing_service, agent, token
+
+    def test_a_zero_daily_limit_refuses_a_payment(self, core):
+        svc, agent, token = self._commission(
+            core, daily=0, per_req=50_000_000, auto=10_000_000)
+
+        result = svc.handle_sign_request(
+            agent_id=agent.id, signature=token, x402_data=self._x402())
+
+        assert result["status"] != "success"
+        assert result["code"] == "EXCEEDS_DAILY_LIMIT"
+
+    def test_a_zero_per_request_max_refuses_a_payment(self, core):
+        svc, agent, token = self._commission(
+            core, daily=100_000_000, per_req=0, auto=10_000_000)
+
+        result = svc.handle_sign_request(
+            agent_id=agent.id, signature=token, x402_data=self._x402())
+
+        assert result["status"] != "success"
+        assert result["code"] == "EXCEEDS_PER_REQUEST_MAX"
+
+    def test_nothing_accumulates_under_a_zero_daily_limit(self, core):
+        """Repeated attempts must all refuse - the drain was $5 slices forever."""
+        svc, agent, token = self._commission(
+            core, daily=0, per_req=50_000_000, auto=10_000_000)
+
+        signed = 0
+        for i in range(3):
+            # A distinct payTo per request sidesteps the idempotency cache.
+            data = self._x402(pay_to=f"0x{'65' * 19}{i:02d}")
+            result = svc.handle_sign_request(
+                agent_id=agent.id, signature=token, x402_data=data)
+            if result.get("status") == "success":
+                signed += 1
+
+        assert signed == 0
+        assert core.get_agent_by_code(agent.code).spent_today_micro == 0
+
+    def test_a_zero_daily_limit_refuses_at_intake_not_queued(self, core):
+        """Manual-approval policies refuse too, rather than asking a human to
+        approve a payment the policy cannot admit."""
+        svc, agent, token = self._commission(
+            core, daily=0, per_req=50_000_000, auto=None)
+
+        result = svc.handle_sign_request(
+            agent_id=agent.id, signature=token, x402_data=self._x402())
+
+        assert result.get("status") != "pending"
+        assert result["code"] == "EXCEEDS_DAILY_LIMIT"
+
+
+class TestDailyAllowanceRenewal:
+    """A daily allowance must cover at least a day, whichever way the clock moves.
+
+    The reset is keyed to the local day on purpose - "my daily limit" means the
+    user's day, and one renewing at four in the afternoon because that is midnight
+    UTC reads as broken. Timestamps stay UTC, because a record has to be
+    comparable to a chain and to other machines.
+
+    The date alone is not enough to hold that, though. Comparing it for mere
+    inequality renewed the allowance whenever the date moved *backwards*, so a
+    clock correction or a laptop carried west handed out a second one. And a
+    laptop carried east crosses midnight early, so the date moving forward is not
+    proof a day has passed either.
+    """
+
+    from datetime import datetime, timedelta, timezone
+
+    def _hours_ago(self, hours):
+        from datetime import datetime, timedelta, timezone
+        return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+    def _days_ago_local(self, days):
+        from datetime import date, timedelta
+        return (date.today() - timedelta(days=days)).isoformat()
+
+    def _today_local(self):
+        from datetime import date
+        return date.today().isoformat()
+
+    def test_a_fresh_agent_is_due(self):
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert daily_allowance_is_due("", "")
+
+    def test_the_same_day_is_not_due(self):
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert not daily_allowance_is_due(self._today_local(), self._hours_ago(3))
+
+    def test_the_next_day_is_due(self):
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert daily_allowance_is_due(self._days_ago_local(1), self._hours_ago(25))
+
+    def test_a_date_that_moved_backwards_is_not_due(self):
+        """A clock set back, or a flight west. Comparing dates for inequality
+        treated this as a new day and renewed the allowance."""
+        from primer_vault.models.agent import daily_allowance_is_due
+        tomorrow_stored = self._days_ago_local(-1)  # stored date is in the future
+        assert not daily_allowance_is_due(tomorrow_stored, self._hours_ago(3))
+
+    def test_crossing_midnight_early_is_not_due(self):
+        """A flight east crosses into the next local date after a few hours. The
+        date has advanced, but a day has not passed."""
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert not daily_allowance_is_due(self._days_ago_local(1), self._hours_ago(6))
+
+    def test_a_full_day_later_is_due_even_across_a_timezone_move(self):
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert daily_allowance_is_due(self._days_ago_local(1), self._hours_ago(21))
+
+    def test_a_missing_instant_renews_rather_than_deadlocks(self):
+        """The instant is only written by a renewal, so refusing without one
+        would mean never renewing again."""
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert daily_allowance_is_due(self._days_ago_local(1), "")
+
+    def test_an_unreadable_instant_renews(self):
+        from primer_vault.models.agent import daily_allowance_is_due
+        assert daily_allowance_is_due(self._days_ago_local(1), "not-a-timestamp")
+
+    def test_resetting_records_both_the_day_and_the_instant(self):
+        from primer_vault.models.agent import Agent
+        agent = Agent.create(name="t", encrypted_auth_key="x",
+                             auth_key_iv="i", auth_key_tag="g")
+        agent.spent_today_micro = 5
+        agent.reset_daily_spend()
+
+        assert agent.spent_today_micro == 0
+        assert agent.last_reset_date == self._today_local()
+        assert agent.last_reset_at, "without the instant, elapsed time cannot be checked"
+
+    def test_a_clock_set_back_does_not_hand_out_a_second_allowance(self):
+        """End to end: an agent that has spent its limit does not get a fresh one
+        because the machine's date went backwards."""
+        from primer_vault.models.agent import Agent, daily_allowance_is_due
+        agent = Agent.create(name="t", encrypted_auth_key="x",
+                             auth_key_iv="i", auth_key_tag="g")
+        agent.reset_daily_spend()
+        agent.spent_today_micro = 99_000_000
+
+        agent.last_reset_date = self._days_ago_local(-1)  # as a clock-back leaves it
+        assert not daily_allowance_is_due(agent.last_reset_date, agent.last_reset_at)
+        assert agent.spent_today_micro == 99_000_000

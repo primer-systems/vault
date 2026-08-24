@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Optional, Callable, TYPE_CHECKING
 
 from ..models import Agent, SpendPolicy, Transaction, verify_agent_hmac, verify_bearer_token
+from ..models.agent import daily_allowance_is_due
 from .server import server_stats
 # Network name <-> CAIP-2 maps are derived from the central registry (networks.py).
 from ..networks import NAME_TO_CAIP as NETWORK_V1_TO_CAIP, CAIP_TO_NAME as NETWORK_CAIP_TO_V1
@@ -33,8 +34,45 @@ if TYPE_CHECKING:
 # Default max age for signed requests (5 minutes)
 DEFAULT_MAX_REQUEST_AGE_SECONDS = 300
 
+# How long a payment may wait for a human before it is abandoned.
+#
+# The authorization it would produce is only valid for an hour, and the agent's
+# own request signature only for five minutes, so a request parked much longer
+# than this cannot lead anywhere useful. Matching the trading window keeps one
+# number to remember rather than two.
+#
+# Pending approvals live in memory only and are lost on restart. That is
+# deliberate: nothing has been signed or submitted while a request waits, so a
+# lost one costs the agent a retry and risks nothing on-chain. Persisting
+# transient state would buy a durable store and a migration to save that retry.
+PENDING_REQUEST_TTL_SECONDS = 900  # 15 minutes
+
+# How many requests one agent may have waiting at once.
+#
+# Per-agent rather than global: a global ceiling would let one noisy agent crowd
+# every other agent's approvals out of the queue, and bury the person approving
+# them.
+MAX_PENDING_PER_AGENT = 20
+
+# Verification outcomes. "failed" is reserved for what the chain reports, so a
+# payment is never recorded as failed because Vault could not reach a node.
+VERIFY_PENDING = "pending"          # queued, not yet checked
+VERIFY_VERIFIED = "verified"        # the chain confirmed it succeeded
+VERIFY_FAILED = "failed"            # the chain confirmed it reverted
+VERIFY_NOT_FOUND = "not_found"      # the chain has no such transaction
+VERIFY_UNAVAILABLE = "unavailable"  # Vault could not ask; says nothing either way
+
 # Signature cache limits (for idempotency)
 SIGNATURE_CACHE_MAX_SIZE = 1000
+
+# How many finished requests to keep an answer for.
+#
+# A request that has been signed, rejected or has failed is terminal, and the
+# agent that submitted it comes back to read the outcome. The signature cache
+# cannot serve that on its own: it is keyed for idempotency, and a failed
+# signing has to be dropped from it so the agent can submit again - which would
+# otherwise leave the poll with nothing to find.
+MAX_RESOLVED_REQUESTS = 1000
 SIGNATURE_CACHE_PRUNE_COUNT = 100
 
 
@@ -202,9 +240,17 @@ class SigningService:
         self._on_request_rejected: Optional[Callable] = None
         self._on_activity: Optional[Callable] = None
         self._on_transaction_updated: Optional[Callable] = None
+        self._on_hardware_sign_needed: Optional[Callable] = None  # For hardware wallet signing
         self._wallet_provider = None  # Function to get unlocked wallet by address
         self._wallet_status_checker = None  # Function that returns True if any wallet is loaded
+        self._rpc_resolver: Optional[Callable] = None  # Vault.get_rpc_url, injected by the core
+        # Returns USD an agent has promised to trades not yet recorded. Injected
+        # by the core, because the trading service is what holds them.
+        self._reserved_volume_provider: Optional[Callable] = None
         self._pending_requests: dict[str, SigningRequest] = {}
+        # request_id -> monotonic deadline, kept beside _pending_requests so an
+        # abandoned request cannot sit in memory until the process ends.
+        self._pending_deadlines: dict[str, float] = {}
         # Global network enable/disable (overrides policy-level settings)
         self._enabled_networks: dict[int, bool] = {
             4663: True,   # Robinhood Chain - enabled by default
@@ -220,6 +266,11 @@ class SigningService:
         # Request ID → cache_key mapping for status lookups
         # When agent polls /sign/status/{request_id}, we can find the cached result
         self._request_to_signature: dict[str, str] = {}
+        # Terminal outcomes by request id, for agents polling /sign/status.
+        # Separate from the signature cache because the two want opposite things
+        # from a failure: the cache must forget it so a resubmit is processed
+        # fresh, this must remember it so the agent learns what happened.
+        self._resolved: dict[str, dict] = {}
         # Lock for spending limit updates to prevent race conditions
         self._spending_lock = threading.Lock()
 
@@ -229,12 +280,24 @@ class SigningService:
         on_request_signed: Callable = None,
         on_request_rejected: Callable = None,
         on_activity: Callable = None,
-        on_transaction_updated: Callable = None
+        on_transaction_updated: Callable = None,
+        on_hardware_sign_needed: Callable = None
     ):
         """
         Set callback functions for events.
 
         These replace the old Qt signals. The GUI bridges these to Qt signals.
+
+        Callbacks:
+        - on_approval_needed(request: SigningRequest): Payment needs user approval
+        - on_request_signed(agent_name, agent_id, wallet_id, amount_micro): Payment was signed
+        - on_request_rejected(agent_id, reason): Payment was rejected
+        - on_activity(message, is_error): Activity log message
+        - on_transaction_updated(transaction_id): Transaction record was updated
+        - on_hardware_sign_needed(typed_data, device_path, callback): Hardware wallet signing needed
+            typed_data: EIP-712 typed data dict
+            device_path: Derivation path on the Ledger device
+            callback(signature_or_error): Called with signature hex or error string
         """
         if on_approval_needed:
             self._on_approval_needed = on_approval_needed
@@ -246,6 +309,8 @@ class SigningService:
             self._on_activity = on_activity
         if on_transaction_updated:
             self._on_transaction_updated = on_transaction_updated
+        if on_hardware_sign_needed:
+            self._on_hardware_sign_needed = on_hardware_sign_needed
 
     def _emit_activity(self, message: str, is_error: bool = False):
         """Emit activity event via callback."""
@@ -275,6 +340,39 @@ class SigningService:
     def set_verify_settlements(self, enabled: bool):
         """Enable or disable on-chain verification of settlements."""
         self._verify_settlements = enabled
+
+    def _drop_pending(self, request_id: str) -> None:
+        """Remove a request and its deadline together, so neither outlives the other."""
+        self._pending_requests.pop(request_id, None)
+        self._pending_deadlines.pop(request_id, None)
+
+    def _expire_pending_requests(self) -> None:
+        """Drop requests nobody approved in time.
+
+        Run before every read of, or decision on, the pending set, so an expired
+        request cannot be approved by whoever happens to look first.
+        """
+        now = time.monotonic()
+        for request_id, deadline in list(self._pending_deadlines.items()):
+            if deadline > now:
+                continue
+            request = self._pending_requests.get(request_id)
+            self._drop_pending(request_id)
+            if request is None:
+                continue
+            reason = (f"Expired: not approved within "
+                      f"{PENDING_REQUEST_TTL_SECONDS // 60} minutes")
+            result = {"status": "rejected", "reason": reason, "code": "REQUEST_EXPIRED"}
+            if request.cache_key:
+                self._signature_cache[request.cache_key] = (request_id, result)
+            self._remember_outcome(request_id, result)
+            self._emit_activity(
+                f"Payment request from {request.agent_name} expired without approval",
+                True)
+
+    def _pending_count_for(self, agent_id: str) -> int:
+        """How many requests this agent already has waiting."""
+        return sum(1 for r in self._pending_requests.values() if r.agent_id == agent_id)
 
     def _make_cache_key(
         self,
@@ -342,6 +440,17 @@ class SigningService:
                         del self._request_to_signature[req_id]
         return result
 
+    def _remember_outcome(self, request_id: str, result: dict) -> dict:
+        """Record a request's final answer for the agent to poll, oldest first out.
+
+        dict preserves insertion order, so the oldest keys are the first ones.
+        """
+        if request_id:
+            self._resolved[request_id] = result
+            while len(self._resolved) > MAX_RESOLVED_REQUESTS:
+                self._resolved.pop(next(iter(self._resolved)))
+        return result
+
     def set_max_request_age(self, seconds: int):
         """Set the maximum age for signed requests (replay protection window)."""
         if seconds < 30:
@@ -350,27 +459,61 @@ class SigningService:
         self._max_request_age_seconds = seconds
         logger.info(f"Max request age set to {seconds}s")
 
+    def _check_asset_supported(self, chain_id: int, asset: str) -> Optional[str]:
+        """Check the payment asset is USDG on this chain.
+
+        Vault denominates every spending limit in USDG and reads the requested
+        amount as micro-USDG. The asset is chosen by whoever issued the 402, so
+        it is checked against the chain's USDG address here, before the amount
+        is interpreted or any limit is applied.
+
+        Returns None if the asset is supported, or an error message.
+        """
+        from ..networks import TOKENS
+
+        expected = TOKENS["USDG"].addresses.get(chain_id)
+        if not expected:
+            return f"No supported payment asset is configured for chain {chain_id}"
+
+        if not asset or asset.lower() != expected.lower():
+            return (
+                f"Unsupported payment asset {asset}. Vault settles x402 payments "
+                f"in USDG ({expected}) on chain {chain_id}."
+            )
+
+        return None
+
     def _check_daily_reset(self, agent: "Agent") -> bool:
         """Check if agent's daily spending needs to be reset (new calendar day).
 
         Returns True if reset was performed.
+
+        The reset writes `spent_today_micro`, the counter the binding spend check
+        reads and increments under `_spending_lock`. So the reset is taken under
+        that same lock, and re-confirms it is still due once it holds it: the
+        first check is cheap but can be stale, and a reset that lands late - after
+        another request (even an unauthenticated `/ping`) has already recorded a
+        spend - would set the counter back to zero and hand out the day's
+        allowance a second time. Re-checking under the lock closes that window.
+        The disk write is done after the lock is released.
         """
-        from datetime import date
-        today = date.today().isoformat()
-        if agent.last_reset_date != today:
+        if not daily_allowance_is_due(agent.last_reset_date, agent.last_reset_at):
+            return False
+        with self._spending_lock:
+            if not daily_allowance_is_due(agent.last_reset_date, agent.last_reset_at):
+                return False
             old_spent = agent.spent_today_micro
             agent.reset_daily_spend()
-            if self._policy_store:
-                self._policy_store.update_agent(agent)
-            if old_spent > 0:
-                logger.info(f"Reset daily spending for agent {agent.id}: was {old_spent/1_000_000:.6f} USDG")
-            return True
-        return False
+        if self._policy_store:
+            self._policy_store.update_agent(agent)
+        if old_spent > 0:
+            logger.info(f"Reset daily spending for agent {agent.id}: was {old_spent/1_000_000:.6f} USDG")
+        return True
 
     def _queue_verification(self, tx: Transaction):
         """Queue a transaction for on-chain verification."""
         # Mark as pending verification
-        tx.verification_status = "pending"
+        tx.verification_status = VERIFY_PENDING
         # Run verification in background thread after a short delay
         timer = threading.Timer(1.0, lambda: self._verify_transaction_sync(tx))
         timer.daemon = True
@@ -383,7 +526,7 @@ class SigningService:
             from web3 import Web3
 
             if not tx.tx_hash:
-                tx.verification_status = "not_found"
+                tx.verification_status = VERIFY_NOT_FOUND
                 if self._policy_store:
                     self._policy_store.update_transaction(tx)
                 self._emit_transaction_updated(tx.id)
@@ -400,39 +543,57 @@ class SigningService:
 
             if not chain_id or chain_id not in NETWORKS:
                 self._emit_activity(f"Cannot verify tx: unknown network {network_str}", True)
-                tx.verification_status = "failed"
+                tx.verification_status = VERIFY_UNAVAILABLE
+                tx.verification_detail = f"unknown network {network_str}"
                 if self._policy_store:
                     self._policy_store.update_transaction(tx)
                 self._emit_transaction_updated(tx.id)
                 return
 
             network = NETWORKS[chain_id]
-            w3 = Web3(Web3.HTTPProvider(network.rpc_url))
+            rpc_url = network.rpc_url
+            if self._rpc_resolver is not None:
+                try:
+                    rpc_url = self._rpc_resolver(chain_id) or rpc_url
+                except Exception:
+                    logger.exception("RPC resolver failed for chain %s", chain_id)
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
 
             receipt = w3.eth.get_transaction_receipt(tx.tx_hash)
             if receipt and receipt.get("status") == 1:
-                tx.verification_status = "verified"
+                tx.verification_status = VERIFY_VERIFIED
+                tx.verification_detail = None
                 tx.verification_block = receipt.get("blockNumber")
                 self._emit_activity(
                     f"Verified on-chain: {tx.tx_hash[:10]}... (block {tx.verification_block})",
                     False
                 )
             elif receipt and receipt.get("status") == 0:
-                tx.verification_status = "failed"
+                tx.verification_status = VERIFY_FAILED
+                tx.verification_detail = "the chain reports this transaction reverted"
                 self._emit_activity(
                     f"Warning: tx {tx.tx_hash[:10]}... failed on-chain!",
                     True
                 )
             else:
-                tx.verification_status = "not_found"
+                tx.verification_status = VERIFY_NOT_FOUND
                 self._emit_activity(
                     f"Warning: tx {tx.tx_hash[:10]}... not found on-chain",
                     True
                 )
         except Exception as e:
-            logger.warning(f"Transaction verification failed for {tx.tx_hash}: {e}")
-            self._emit_activity(f"Verification error: {e}", True)
-            tx.verification_status = "failed"
+            # Could not ask. That is not the same as being told no, and the
+            # record has to say which, because "failed" against a payment is
+            # read as a fact about the payment rather than about the network.
+            logger.warning(f"Could not verify {tx.tx_hash}: {e}")
+            self._emit_activity(
+                f"Could not check {tx.tx_hash[:10]}... on-chain: {e}. "
+                f"It will be retried.", True)
+            tx.verification_status = VERIFY_UNAVAILABLE
+            # Redacted: this reaches the AP2 receipt, which /receipt/{id} serves
+            # unauthenticated, and the exception names the RPC URL (API key).
+            from ..utils import redact_urls
+            tx.verification_detail = redact_urls(str(e))
 
         # Persist the verification result
         if self._policy_store:
@@ -445,7 +606,7 @@ class SigningService:
             self._emit_activity("Can only verify settled transactions with tx_hash", True)
             return
 
-        tx.verification_status = "pending"
+        tx.verification_status = VERIFY_PENDING
         self._emit_transaction_updated(tx.id)
 
         # Run verification in background thread after a short delay
@@ -473,7 +634,8 @@ class SigningService:
             return
         stuck_count = 0
         for tx in self._policy_store.get_all_transactions():
-            if tx.status == "settled" and tx.verification_status == "pending" and tx.tx_hash:
+            if (tx.status == "settled" and tx.tx_hash
+                    and tx.verification_status in (VERIFY_PENDING, VERIFY_UNAVAILABLE)):
                 self._queue_verification(tx)
                 stuck_count += 1
         if stuck_count:
@@ -483,9 +645,18 @@ class SigningService:
         """Set the wallet provider function (gets unlocked wallet by address)."""
         self._wallet_provider = provider
 
+    def set_reserved_volume_provider(self, provider):
+        """Set the callable that reports an agent's in-flight trading volume."""
+        self._reserved_volume_provider = provider
+
     def set_wallet_status_checker(self, checker):
         """Set callable that returns True if any wallet is currently unlocked."""
         self._wallet_status_checker = checker
+
+    def set_rpc_resolver(self, resolver):
+        """Inject Vault.get_rpc_url so settlement verification uses the user's
+        endpoint if they set one. Unset, the network's built-in endpoint is used."""
+        self._rpc_resolver = resolver
 
     def _create_rejection_transaction(
         self,
@@ -528,7 +699,7 @@ class SigningService:
         agent: Agent,
         agent_id: str,
         signature_header: str,
-        wallet_password: str,
+        data_key: Optional[bytes],
         payment_required: Optional[str] = None,
         x402_data: Optional[dict] = None,
         request_url: Optional[str] = None
@@ -559,7 +730,8 @@ class SigningService:
             agent: The agent making the request
             agent_id: The agent's ID (for message reconstruction)
             signature_header: The SIG:timestamp:signature header OR "Bearer AT_..." token
-            wallet_password: Password to decrypt agent's auth key (HMAC mode only)
+            data_key: The unlocked wallet's master key, to decrypt the agent's
+                shared secret (HMAC mode only; unused for bearer)
             payment_required: Payment-Required header value (base64-encoded x402 payload)
             x402_data: Direct x402 data (if using AP2 format)
             request_url: The URL the agent fetched the 402 from (for domain verification)
@@ -574,14 +746,14 @@ class SigningService:
         if request_url:
             signed_fields["request_url"] = request_url
         return self.verify_agent_signature(
-            agent, agent_id, signature_header, wallet_password, signed_fields)
+            agent, agent_id, signature_header, data_key, signed_fields)
 
     def verify_agent_signature(
         self,
         agent: Agent,
         agent_id: str,
         signature_header: str,
-        wallet_password: Optional[str],
+        data_key: Optional[bytes],
         signed_fields: dict,
     ) -> Optional[str]:
         """Verify an agent's bearer/HMAC auth over an arbitrary signed payload.
@@ -590,7 +762,7 @@ class SigningService:
         ``{agent_id, timestamp, **signed_fields}`` (sorted keys). /sign passes the
         payment fields; /trade passes ``{"trade": {...}}``. Returns None on
         success, or an error string. HMAC mode needs the unlocked wallet's
-        password to decrypt the agent's shared secret; bearer mode ignores it.
+        master key to decrypt the agent's shared secret; bearer mode ignores it.
         """
         if not signature_header:
             return "Missing authentication"
@@ -632,7 +804,7 @@ class SigningService:
 
         # Decrypt agent's shared secret
         try:
-            shared_secret = agent.decrypt_auth_key(wallet_password)
+            shared_secret = agent.decrypt_auth_key(data_key)
         except Exception as e:
             logger.error(f"Failed to decrypt agent auth key: {e}")
             return "Failed to decrypt agent credentials"
@@ -648,7 +820,7 @@ class SigningService:
         agent: Agent,
         agent_id: str,
         signature_header: str,
-        wallet_password: str
+        data_key: Optional[bytes]
     ) -> Optional[str]:
         """
         Verify agent authentication for /mandate endpoint.
@@ -708,7 +880,7 @@ class SigningService:
 
         # Decrypt agent's shared secret
         try:
-            shared_secret = agent.decrypt_auth_key(wallet_password)
+            shared_secret = agent.decrypt_auth_key(data_key)
         except Exception as e:
             logger.error(f"Failed to decrypt agent auth key: {e}")
             return "Failed to decrypt agent credentials"
@@ -751,16 +923,24 @@ class SigningService:
                 "agent_name": agent.name
             }
 
-        policy = self._policy_store.get_policy(agent.policy_id) if agent.policy_id else None
-
+        # Deliberately spare. /ping carries no signature - it is what an agent
+        # calls to confirm its wiring before it can sign anything, so requiring
+        # one would make setup impossible to debug.
+        #
+        # That means anyone who knows an agent id gets this reply, and an id is
+        # six characters that travel in environment variables and logs. So it
+        # answers only "is this agent able to work", and nothing about the
+        # policy behind it. In particular it must not disclose the daily limit,
+        # the spend so far, or auto_approve_below_micro - the last of which is
+        # precisely the figure needed to size a payment that never prompts the
+        # user.
+        #
+        # An agent that wants its own limits asks /mandate, which is signed and
+        # returns them in full.
         return {
             "status": "ready",
             "agent_name": agent.name,
             "agent_status": agent.status,
-            "policy_name": policy.name if policy else None,
-            "daily_limit_micro": policy.daily_limit_micro if policy else None,
-            "spent_today_micro": agent.spent_today_micro,
-            "auto_approve_below_micro": policy.auto_approve_below_micro if policy else None
         }
 
     def handle_get_mandate(self, agent_id: str, signature: str) -> dict:
@@ -800,6 +980,19 @@ class SigningService:
         if not self._wallet_provider:
             return {"status": "error", "error": "Wallet provider not set", "code": "NO_WALLET_PROVIDER"}
 
+        # For bearer auth: verify token BEFORE the wallet check — bearer doesn't
+        # need the wallet key, so a wrong token must return AUTH_FAILED, and a
+        # locked wallet must not be revealed to a caller that hasn't authenticated
+        # (the same lock-oracle /sign guards against). See handle_sign_request.
+        if agent.auth_mode == "bearer":
+            auth_result = self._verify_mandate_auth(agent, agent_id, signature, None)
+            if auth_result:
+                return {
+                    "status": "error",
+                    "error": auth_result,
+                    "code": "AUTH_FAILED"
+                }
+
         wallet: "VaultWallet" = self._wallet_provider(agent.wallet_address)
         if not wallet:
             if self._wallet_status_checker and self._wallet_status_checker():
@@ -808,20 +1001,33 @@ class SigningService:
                     "error": "Agent's wallet address is not available in the unlocked wallet. Check that the correct wallet is open.",
                     "code": "WALLET_ADDRESS_NOT_FOUND"
                 }
+            # Locked wallet. An HMAC credential can only be verified with the
+            # wallet key, so an HMAC caller has NOT authenticated - answering
+            # WALLET_LOCKED would hand it the same lock oracle. A bearer caller
+            # was already verified above, so it has earned the honest answer.
+            if agent.auth_mode == "bearer":
+                return {
+                    "status": "error",
+                    "error": "Wallet is locked. Open Vault and unlock the wallet.",
+                    "code": "WALLET_LOCKED"
+                }
+            self._emit_activity(f"Auth failed for {agent.name}: wallet locked", True)
             return {
                 "status": "error",
-                "error": "Wallet is locked. Open Vault and unlock the wallet.",
-                "code": "WALLET_LOCKED"
-            }
-
-        # Verify signature (for /mandate, we sign over just agent_id + timestamp)
-        auth_result = self._verify_mandate_auth(agent, agent_id, signature, wallet._password)
-        if auth_result:
-            return {
-                "status": "error",
-                "error": auth_result,
+                "error": "Authentication failed",
                 "code": "AUTH_FAILED"
             }
+
+        # For HMAC auth: verify signature (needs the wallet key to decrypt the
+        # agent's shared secret). Bearer was already verified above.
+        if agent.auth_mode != "bearer":
+            auth_result = self._verify_mandate_auth(agent, agent_id, signature, wallet.data_key)
+            if auth_result:
+                return {
+                    "status": "error",
+                    "error": auth_result,
+                    "code": "AUTH_FAILED"
+                }
 
         policy = self._policy_store.get_policy(agent.policy_id) if agent.policy_id else None
 
@@ -835,11 +1041,14 @@ class SigningService:
                 "auto_approve_below_micro": policy.auto_approve_below_micro,
                 "allowed_domains": policy.allowed_domains if policy.allowed_domains else None,
                 "blocked_domains": policy.blocked_domains if policy.blocked_domains else None,
+                "trading": self._trading_summary(agent, policy),
             }
 
-        # Calculate remaining budget
+        # Calculate remaining budget. Reported whenever there is a policy at all:
+        # a daily limit of 0 has 0 remaining, which is a true answer, not a
+        # missing one.
         remaining_today_micro = None
-        if policy and policy.daily_limit_micro:
+        if policy:
             remaining_today_micro = max(0, policy.daily_limit_micro - agent.spent_today_micro)
 
         result = {
@@ -867,6 +1076,57 @@ class SigningService:
             result["mandate_note"] = "No Intent Mandate has been generated for this agent. Check back later or contact your administrator."
 
         return result
+
+    def _trading_summary(self, agent: "Agent", policy: "SpendPolicy") -> dict:
+        """The trading limits an agent is held to, so it can stay inside them.
+
+        The payment side has always published its limits here, and the trading
+        skill tells agents to check before spending a request - but the trading
+        limits were not returned by anything, so the only way to find them was to
+        trip them. This closes that.
+
+        Telling the agent costs nothing: every limit is enforced whatever the
+        agent believes, and one that wanted to map them could do so by bisection
+        anyway. Knowing max_price_impact_percent in particular steers it toward a
+        sensible pool, which is the behaviour worth encouraging.
+        """
+        rules = policy.trading_rules
+        if rules is None or not rules.enabled:
+            return {"enabled": False}
+
+        # Volume is reset lazily, when a trade is evaluated. A read must not
+        # write, so report what the figure will be rather than what is stored -
+        # otherwise an agent checking after midnight sees yesterday's total.
+        #
+        # Asking the agent the same question the trading service asks, rather
+        # than comparing dates here: two copies of the rule would answer
+        # differently the moment either changed, and this one is published.
+        due = daily_allowance_is_due(
+            agent.last_trading_reset_date, agent.last_trading_reset_at)
+        used = 0.0 if due else agent.trading_volume_today_usd
+
+        # Trades queued for approval have already claimed their volume, so a
+        # remaining figure that ignored them would be one the agent cannot spend.
+        promised = 0.0
+        if self._reserved_volume_provider:
+            try:
+                promised = self._reserved_volume_provider(agent.id)
+            except Exception:
+                logger.exception("could not read in-flight trading volume")
+
+        return {
+            "enabled": True,
+            "per_trade_max_usd": rules.per_trade_max_usd,
+            "daily_volume_limit_usd": rules.daily_volume_limit_usd,
+            "auto_approve_below_usd": rules.auto_approve_below_usd,
+            "max_slippage_percent": rules.max_slippage_percent,
+            "max_price_impact_percent": rules.max_price_impact_percent,
+            "min_reserve_eth": rules.min_reserve_eth,
+            "volume_today_usd": used,
+            "committed_today_usd": used + promised,
+            "remaining_today_usd": max(
+                0.0, rules.daily_volume_limit_usd - used - promised),
+        }
 
     def _check_mandate_staleness(self, mandate: dict, current_policy: Optional["SpendPolicy"]) -> tuple[bool, Optional[str]]:
         """
@@ -995,7 +1255,7 @@ class SigningService:
         if agent.auth_mode == "bearer":
             auth_result = self._verify_agent_auth(
                 agent, agent_id, signature,
-                wallet_password=None,
+                data_key=None,
                 payment_required=payment_required,
                 x402_data=x402_data,
                 request_url=request_url
@@ -1020,17 +1280,31 @@ class SigningService:
                     "error": "Agent's wallet address is not available in the unlocked wallet. Check that the correct wallet is open.",
                     "code": "WALLET_ADDRESS_NOT_FOUND"
                 }
+            # Wallet is locked. An HMAC credential can only be verified with the
+            # wallet key, so we have NOT authenticated this caller yet - and
+            # answering WALLET_LOCKED here would tell an unauthenticated caller
+            # the wallet is locked (a "keys are/aren't in memory" oracle they
+            # could poll). Answer AUTH_FAILED instead, identical to an unlocked
+            # wallet's answer to a bad credential. A bearer agent was already
+            # verified above, so it has earned the honest WALLET_LOCKED.
+            if agent.auth_mode == "bearer":
+                return {
+                    "status": "error",
+                    "error": "Wallet is locked. Open Vault and unlock the wallet to enable signing.",
+                    "code": "WALLET_LOCKED"
+                }
+            self._emit_activity(f"Auth failed for {agent.name}: wallet locked", True)
             return {
                 "status": "error",
-                "error": "Wallet is locked. Open Vault and unlock the wallet to enable signing.",
-                "code": "WALLET_LOCKED"
+                "error": "Authentication failed",
+                "code": "AUTH_FAILED"
             }
 
         # For HMAC auth: verify signature (needs wallet password to decrypt auth key)
         if agent.auth_mode != "bearer":
             auth_result = self._verify_agent_auth(
                 agent, agent_id, signature,
-                wallet_password=wallet._password,
+                data_key=wallet.data_key,
                 payment_required=payment_required,
                 x402_data=x402_data,
                 request_url=request_url
@@ -1096,6 +1370,30 @@ class SigningService:
             logger.info(f"Returning cached result for {agent_id} (tx: {tx_id[:8]}...)")
             return cached_result
 
+        # In-memory cache miss. After a restart it is empty, but the payment's
+        # transaction record is on disk - so consult it before signing again,
+        # or one purchase becomes two independently redeemable authorizations.
+        if signature and self._policy_store:
+            prior = self._policy_store.get_transaction_by_cache_key(cache_key)
+            if prior is not None:
+                if prior.status == "settled" or prior.verification_status == "verified":
+                    return {
+                        "status": "error",
+                        "code": "PAYMENT_ALREADY_SETTLED",
+                        "error": "This payment was already settled on-chain. Use idempotency_key for a fresh payment.",
+                        "previous_transaction_id": prior.id,
+                        "hint": "Add 'idempotency_key': 'unique-string' to your request"
+                    }
+                # A prior authorization exists and may still be redeemable within
+                # its validity window; signing a second one is the double-spend.
+                return {
+                    "status": "error",
+                    "code": "PAYMENT_ALREADY_AUTHORIZED",
+                    "error": "A payment for this request was already authorized and may still be redeemable. Use idempotency_key for a fresh payment.",
+                    "previous_transaction_id": prior.id,
+                    "hint": "Add 'idempotency_key': 'unique-string' to your request"
+                }
+
         # Handle the two input formats -> a single decoded dict
         if x402_data is not None:
             # AP2/A2A format: x402 data provided directly as JSON
@@ -1139,6 +1437,23 @@ class SigningService:
             chain_id = int(caip_network.split(":")[1]) if ":" in caip_network else 0
         except (ValueError, IndexError):
             chain_id = 0
+
+        # Asset check runs before any limit is applied: the amount above was read
+        # as micro-USDG, which only holds for USDG.
+        asset_error = self._check_asset_supported(chain_id, requirements.asset)
+        if asset_error:
+            self._emit_activity(f"Request from {agent.name} rejected: {asset_error}", True)
+            server_stats.rejected += 1
+            tx = self._create_rejection_transaction(
+                agent, amount_micro, network, recipient, asset_error, resource,
+                decoded_x402_data, request_url=request_url
+            )
+            return {
+                "status": "error",
+                "error": asset_error,
+                "code": "UNSUPPORTED_ASSET",
+                "transaction_id": tx.id
+            }
 
         if chain_id and not self.is_network_enabled(chain_id):
             network_name = network_to_v1(caip_network)
@@ -1211,7 +1526,9 @@ class SigningService:
                 "transaction_id": tx.id
             }
 
-        if policy.per_request_max_micro and amount_micro > policy.per_request_max_micro:
+        # `is not None`, not truthiness: None is this field's "no per-request cap",
+        # but 0 is a cap of zero and must refuse everything.
+        if policy.per_request_max_micro is not None and amount_micro > policy.per_request_max_micro:
             reason = f"Exceeds per-request maximum ({amount_micro/1_000_000:.6f} > {policy.per_request_max_micro/1_000_000:.6f} USDG)"
             self._emit_activity(f"Request from {agent.name}: {reason}", True)
             server_stats.rejected += 1
@@ -1229,25 +1546,27 @@ class SigningService:
                 "transaction_id": tx.id
             }
 
-        if policy.daily_limit_micro:
-            remaining = policy.daily_limit_micro - agent.spent_today_micro
-            if amount_micro > remaining:
-                reason = f"Would exceed daily limit ({amount_micro/1_000_000:.6f} > {remaining/1_000_000:.6f} USDG remaining)"
-                self._emit_activity(f"Request from {agent.name}: {reason}", True)
-                server_stats.rejected += 1
-                # Create rejection receipt for audit trail
-                tx = self._create_rejection_transaction(
-                    agent, amount_micro, network, recipient, reason, resource, decoded_x402_data,
-                    request_url=request_url
-                )
-                return {
-                    "status": "error",
-                    "error": "Would exceed daily limit",
-                    "code": "EXCEEDS_DAILY_LIMIT",
-                    "requested_micro": amount_micro,
-                    "remaining_micro": remaining,
-                    "transaction_id": tx.id
-                }
+        # Unconditional: daily_limit_micro is always an integer, and 0 is a limit
+        # of zero. Guarding this with `if policy.daily_limit_micro:` skips the
+        # check entirely for a policy set to 0 - see models/policy.py.
+        remaining = policy.daily_limit_micro - agent.spent_today_micro
+        if amount_micro > remaining:
+            reason = f"Would exceed daily limit ({amount_micro/1_000_000:.6f} > {remaining/1_000_000:.6f} USDG remaining)"
+            self._emit_activity(f"Request from {agent.name}: {reason}", True)
+            server_stats.rejected += 1
+            # Create rejection receipt for audit trail
+            tx = self._create_rejection_transaction(
+                agent, amount_micro, network, recipient, reason, resource, decoded_x402_data,
+                request_url=request_url
+            )
+            return {
+                "status": "error",
+                "error": "Would exceed daily limit",
+                "code": "EXCEEDS_DAILY_LIMIT",
+                "requested_micro": amount_micro,
+                "remaining_micro": remaining,
+                "transaction_id": tx.id
+            }
 
         needs_approval = (
             policy.auto_approve_below_micro is None or
@@ -1255,6 +1574,14 @@ class SigningService:
         )
 
         if needs_approval:
+            self._expire_pending_requests()
+            if self._pending_count_for(agent_id) >= MAX_PENDING_PER_AGENT:
+                reason = (f"{MAX_PENDING_PER_AGENT} requests from this agent are "
+                          f"already waiting for approval")
+                self._emit_activity(f"Request from {agent.name} refused: {reason}", True)
+                server_stats.rejected += 1
+                return {"status": "error", "error": reason, "code": "TOO_MANY_PENDING"}
+
             request_id = str(uuid.uuid4())
             request = SigningRequest(
                 id=request_id,
@@ -1274,6 +1601,8 @@ class SigningService:
             request.signature = signature
             request.cache_key = cache_key  # Full cache key including payload hash
             self._pending_requests[request_id] = request
+            self._pending_deadlines[request_id] = (
+                time.monotonic() + PENDING_REQUEST_TTL_SECONDS)
 
             self._emit_activity(
                 f"Payment request from {agent.name}: {amount_micro/1_000_000:.6f} USDG - awaiting approval",
@@ -1297,7 +1626,8 @@ class SigningService:
         result = self._sign_payment(
             agent, policy, decoded_x402_data, amount_micro, x402_version,
             auto_approved=True,  # Below auto-approve threshold
-            request_url=request_url
+            request_url=request_url,
+            cache_key=cache_key
         )
         # Cache successful result so retries get same response
         tx_id = result.get("transaction_id", "unknown")
@@ -1309,6 +1639,7 @@ class SigningService:
 
     def approve_request(self, request_id: str) -> dict:
         """Approve a pending request and sign the payment."""
+        self._expire_pending_requests()
         request = self._pending_requests.get(request_id)
         if not request:
             return {"status": "error", "error": "Request not found or expired", "code": "REQUEST_NOT_FOUND"}
@@ -1320,39 +1651,78 @@ class SigningService:
         policy = self._policy_store.get_policy(agent.policy_id) if agent else None
 
         if not agent or not policy:
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
             return {"status": "error", "error": "Agent or policy no longer exists", "code": "AGENT_OR_POLICY_MISSING"}
 
         # Re-validate agent status (may have changed since request was queued)
         if agent.status == "suspended":
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
             return {"status": "error", "error": "Agent is now suspended", "code": "AGENT_SUSPENDED"}
 
         if agent.status == "limit_reached":
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
             return {"status": "error", "error": "Agent has reached daily limit", "code": "LIMIT_REACHED"}
 
-        # Re-validate policy limits (may have changed since request was queued)
-        if policy.per_request_max_micro and request.amount_micro > policy.per_request_max_micro:
-            del self._pending_requests[request_id]
+        # Re-validate that payments are still switched on for this policy.
+        # Every other check below is re-run at approval; this one and the domain
+        # rules below were not, so turning payments off or blocking a domain left
+        # anything already queued able to sail through.
+        if not policy.is_x402_enabled():
+            self._drop_pending(request_id)
+            return {
+                "status": "error",
+                "error": "x402 payments are no longer enabled for this policy",
+                "code": "X402_DISABLED"
+            }
+
+        # Re-validate domain rules against the same URL the request was judged on.
+        domain_check_url = request.request_url or request.resource
+        if policy.has_domain_restrictions() and not domain_check_url:
+            self._drop_pending(request_id)
+            return {
+                "status": "error",
+                "error": "Domain restrictions now apply but this request carries no URL to check",
+                "code": "DOMAIN_URL_REQUIRED"
+            }
+        domain_allowed, domain_reason = policy.check_domain_allowed(domain_check_url)
+        if not domain_allowed:
+            self._drop_pending(request_id)
+            return {
+                "status": "error",
+                "error": domain_reason,
+                "code": "DOMAIN_NOT_ALLOWED"
+            }
+
+        # Re-validate policy limits (may have changed since request was queued).
+        # Both tests are written the same way as at intake: `is not None` where
+        # None means "no cap", unconditional where every policy carries a number.
+        if policy.per_request_max_micro is not None and request.amount_micro > policy.per_request_max_micro:
+            self._drop_pending(request_id)
             return {
                 "status": "error",
                 "error": f"Amount {request.amount_micro/1_000_000:.6f} USDG exceeds current per-request limit {policy.per_request_max_micro/1_000_000:.6f} USDG",
                 "code": "EXCEEDS_PER_REQUEST_MAX"
             }
 
-        if policy.daily_limit_micro:
-            remaining = policy.daily_limit_micro - agent.spent_today_micro
-            if request.amount_micro > remaining:
-                del self._pending_requests[request_id]
-                return {
-                    "status": "error",
-                    "error": f"Amount {request.amount_micro/1_000_000:.6f} USDG exceeds remaining daily limit {remaining/1_000_000:.6f} USDG",
-                    "code": "EXCEEDS_DAILY_LIMIT"
-                }
+        remaining = policy.daily_limit_micro - agent.spent_today_micro
+        if request.amount_micro > remaining:
+            self._drop_pending(request_id)
+            return {
+                "status": "error",
+                "error": f"Amount {request.amount_micro/1_000_000:.6f} USDG exceeds remaining daily limit {remaining/1_000_000:.6f} USDG",
+                "code": "EXCEEDS_DAILY_LIMIT"
+            }
 
-        # Re-validate network is still enabled (global setting)
-        network = request.x402_data.get("accepts", [{}])[0].get("network", "unknown")
+        # Re-validate network is still enabled (global setting).
+        #
+        # The network is a fact about the payment, so it comes from the parsed
+        # request - not a fresh dig into the raw agent message. Re-reading the
+        # wire fields here would return "unknown" for anything the parser
+        # accepted but that does not carry the field at that exact path, and
+        # "unknown" yields chain_id 0, which the guards below treat as "nothing
+        # to check" and skip. The policy state either side of this is still read
+        # live, which is the point of re-validating at approval time.
+        network = request.network
         caip_network = network_to_caip(network)
         try:
             chain_id = int(caip_network.split(":")[1]) if ":" in caip_network else 0
@@ -1360,7 +1730,7 @@ class SigningService:
             chain_id = 0
 
         if chain_id and not self.is_network_enabled(chain_id):
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
             return {
                 "status": "error",
                 "error": f"Network {network} is no longer enabled",
@@ -1369,7 +1739,7 @@ class SigningService:
 
         # Re-validate network is allowed by policy (may have changed)
         if chain_id and policy.networks and chain_id not in policy.networks:
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
             return {
                 "status": "error",
                 "error": f"Network {network} is no longer allowed by policy",
@@ -1379,7 +1749,8 @@ class SigningService:
         result = self._sign_payment(
             agent, policy, request.x402_data, request.amount_micro, request.x402_version,
             auto_approved=False,  # Manual approval
-            request_url=request.request_url
+            request_url=request.request_url,
+            cache_key=request.cache_key
         )
 
         if result.get("status") == "success":
@@ -1388,17 +1759,23 @@ class SigningService:
             if request.cache_key:
                 tx_id = result.get("transaction_id", request_id)
                 self._signature_cache[request.cache_key] = (tx_id, result)
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
         else:
-            # Signing failed — clean up so the operator can retry
+            # Signing failed after the user approved. Drop the idempotency entry
+            # so the agent can submit the payment again, but keep the outcome
+            # here - otherwise the agent polls a request that no longer exists
+            # anywhere and cannot tell failure from never having been accepted.
             if request.cache_key and request.cache_key in self._signature_cache:
                 del self._signature_cache[request.cache_key]
-            del self._pending_requests[request_id]
+            self._drop_pending(request_id)
+
+        self._remember_outcome(request_id, result)
 
         return result
 
     def reject_request(self, request_id: str, reason: str = "User rejected") -> dict:
         """Reject a pending request."""
+        self._expire_pending_requests()
         request = self._pending_requests.get(request_id)
         if not request:
             return {"status": "error", "error": "Request not found or expired", "code": "REQUEST_NOT_FOUND"}
@@ -1428,11 +1805,13 @@ class SigningService:
         if request.cache_key:
             self._signature_cache[request.cache_key] = (tx_id, result)
 
-        del self._pending_requests[request_id]
+        self._drop_pending(request_id)
+        self._remember_outcome(request_id, result)
         return result
 
     def get_pending_requests(self) -> list[SigningRequest]:
         """Get all pending approval requests."""
+        self._expire_pending_requests()
         return list(self._pending_requests.values())
 
     def get_request_status(self, request_id: str) -> dict:
@@ -1443,6 +1822,7 @@ class SigningService:
         This allows agents to poll for approval and retrieve the payment header.
         """
         # Check pending requests first
+        self._expire_pending_requests()
         request = self._pending_requests.get(request_id)
         if request:
             return {
@@ -1461,6 +1841,13 @@ class SigningService:
         if cache_key and cache_key in self._signature_cache:
             _, cached_result = self._signature_cache[cache_key]
             return cached_result
+
+        # A terminal outcome recorded when the request was resolved. This is
+        # what answers a poll after a failed signing, where the idempotency
+        # entry above was deliberately dropped.
+        resolved = self._resolved.get(request_id)
+        if resolved is not None:
+            return resolved
 
         # Fallback: check if there's a transaction with this ID
         if self._policy_store:
@@ -1496,10 +1883,33 @@ class SigningService:
         x402_version: int = 2,
         auto_approved: bool = True,
         existing_tx: Optional[Transaction] = None,
-        request_url: Optional[str] = None
+        request_url: Optional[str] = None,
+        cache_key: Optional[str] = None
     ) -> dict:
         """Actually sign a payment using the wallet."""
         try:
+            # If the transaction ledger cannot be written - its file was
+            # unreadable at startup and is now protected from being overwritten -
+            # refuse rather than sign a payment Vault cannot record. That record
+            # is the cross-restart idempotency guard (without it a retry becomes a
+            # second redeemable authorization for the same purchase) and it is
+            # where the payment shows up in the user's history. Fail closed and
+            # tell the user, instead of signing blind and carrying on silently.
+            _is_protected = getattr(self._policy_store, "is_transactions_protected", None)
+            if callable(_is_protected) and _is_protected():
+                self._emit_activity(
+                    f"Payment for {agent.name} ({agent.id}) refused: Vault cannot "
+                    f"write the transaction record. Restart Vault when "
+                    f"transactions.json is readable.", True)
+                return {
+                    "status": "error",
+                    "error": ("Vault cannot record this payment because the "
+                              "transaction file is unavailable, and will not sign "
+                              "a payment it cannot log. Restart Vault when the "
+                              "file is readable."),
+                    "code": "LEDGER_UNWRITABLE",
+                }
+
             # Get unlocked wallet from provider
             if not self._wallet_provider:
                 return {"status": "error", "error": "Wallet provider not set", "code": "NO_WALLET_PROVIDER"}
@@ -1520,7 +1930,7 @@ class SigningService:
             wallet_id = addr_entry.id  # Use address ID (A001, etc.)
 
             # Use local EIP-3009 signing (no external SDK dependency)
-            from .eip3009 import parse_x402, create_payment
+            from .eip3009 import parse_x402, create_payment, _select_offer
 
             # Single dialect-aware parse - deterministically the same result the
             # intake produced, so the value signed here equals the amount that
@@ -1534,8 +1944,16 @@ class SigningService:
                     "code": "INVALID_X402_FORMAT"
                 }
 
+            # The offer parse_x402 actually settled on. On a multi-offer 402 this
+            # is not accepts[0], and both values taken from it below must describe
+            # the offer that gets signed: the audit record's network (or on-chain
+            # verification resolves the wrong chain and never confirms the
+            # payment) and the `accepted` echo (or the merchant reconstructs the
+            # wrong EIP-712 domain and rejects a valid signature).
+            selected_accept = _select_offer(x402_data.get("accepts", [{}]))
+
             # Keep the merchant's raw network string for the audit record.
-            original_network = x402_data.get("accepts", [{}])[0].get("network", "")
+            original_network = selected_accept.get("network", "")
             recipient = requirements.pay_to
             resource = requirements.resource
 
@@ -1555,38 +1973,165 @@ class SigningService:
                         "code": "INVALID_PAYMENT_DATA"
                     }
 
-            # Get private key from wallet using address ID
-            private_key_bytes = wallet.get_private_key(addr_entry.id)
-            private_key_hex = private_key_bytes.hex()
+            # Every signing route converges here, so the asset is confirmed once
+            # more immediately before the signature is produced.
+            asset_error = self._check_asset_supported(
+                requirements.chain_id, requirements.asset)
+            if asset_error:
+                self._emit_activity(f"Signing blocked: {asset_error}", True)
+                return {
+                    "status": "error",
+                    "error": asset_error,
+                    "code": "UNSUPPORTED_ASSET"
+                }
 
-            # Create payment using local EIP-3009 signing. Echo the merchant's
-            # selected offer (`accepted`) and resource so the v2 payload is
-            # spec-shaped; the signature itself is unaffected by these fields.
-            selected_accept = x402_data.get("accepts", [{}])[0]
-            payment = create_payment(
-                private_key_hex, requirements,
-                accepted=selected_accept,
-                resource=x402_data.get("resource"),
-            )
+            # Bind the signature to the amount that was checked. amount_micro is
+            # the figure the limits were applied to, the daily spend is debited
+            # by, and the transaction records; the value about to be signed is
+            # read from the payload. In normal operation they are the same parse
+            # and always equal - but the signature must never commit to an
+            # amount that was never limit-checked, so refuse if they diverge.
+            if int(requirements.max_amount_required) != amount_micro:
+                return {
+                    "status": "error",
+                    "code": "AMOUNT_MISMATCH",
+                    "error": ("Payment amount does not match the checked amount; "
+                              "refusing to sign."),
+                }
+
+            # Check if this is a Ledger address
+            if addr_entry.is_hardware:
+                # Ledger hardware wallet signing
+                if not self._on_hardware_sign_needed:
+                    return {
+                        "status": "error",
+                        "error": "Ledger signing not available (GUI required)",
+                        "code": "LEDGER_SIGN_NOT_AVAILABLE"
+                    }
+
+                # Import Ledger-specific functions
+                from .eip3009 import build_transfer_authorization_typed_data, create_payment_from_signature
+
+                # Use provided token metadata, fall back to requirements, then defaults
+                name = requirements.token_name or "Global Dollar"
+                version = requirements.token_version or "1"
+
+                # Generate parameters for signing
+                nonce_bytes = secrets.token_bytes(32)
+                nonce_hex = "0x" + nonce_bytes.hex()
+                now = int(time.time())
+                valid_after = now - 60  # Valid 1 minute ago (clock skew tolerance)
+                valid_before = now + 3600  # Valid for 1 hour
+
+                # Build the typed data for the Ledger to sign
+                typed_data = build_transfer_authorization_typed_data(
+                    chain_id=requirements.chain_id,
+                    token_address=requirements.asset,
+                    token_name=name,
+                    token_version=version,
+                    from_address=agent.wallet_address,
+                    to_address=requirements.pay_to,
+                    value=int(requirements.max_amount_required),
+                    valid_after=valid_after,
+                    valid_before=valid_before,
+                    nonce=nonce_bytes
+                )
+
+                # Call the Ledger signing callback (blocking - shows dialog)
+                # The callback should return the signature hex string or raise an exception
+                try:
+                    signature = self._on_hardware_sign_needed(
+                        typed_data,
+                        addr_entry.device_path,
+                        agent.wallet_address  # For verification
+                    )
+                except Exception as e:
+                    error_msg = str(e)
+                    if "rejected" in error_msg.lower() or "cancelled" in error_msg.lower():
+                        return {
+                            "status": "error",
+                            "error": "Signing rejected on Ledger device",
+                            "code": "LEDGER_REJECTED"
+                        }
+                    elif "disconnected" in error_msg.lower():
+                        return {
+                            "status": "error",
+                            "error": "Ledger device disconnected",
+                            "code": "LEDGER_DISCONNECTED"
+                        }
+                    return {
+                        "status": "error",
+                        "error": f"Ledger signing failed: {error_msg}",
+                        "code": "LEDGER_ERROR"
+                    }
+
+                if not signature:
+                    return {
+                        "status": "error",
+                        "error": "No signature received from Ledger",
+                        "code": "LEDGER_NO_SIGNATURE"
+                    }
+
+                # Create payment from the Ledger signature
+                payment = create_payment_from_signature(
+                    from_address=agent.wallet_address,
+                    requirements=requirements,
+                    signature=signature,
+                    valid_after=valid_after,
+                    valid_before=valid_before,
+                    nonce_hex=nonce_hex,
+                    accepted=selected_accept,
+                    resource=x402_data.get("resource"),
+                )
+            else:
+                # Software wallet signing
+                private_key_bytes = wallet.get_private_key(addr_entry.id)
+                private_key_hex = private_key_bytes.hex()
+
+                # Create payment using local EIP-3009 signing. Echo the merchant's
+                # selected offer (`accepted`) and resource so the v2 payload is
+                # spec-shaped; the signature itself is unaffected by these fields.
+                payment = create_payment(
+                    private_key_hex, requirements,
+                    accepted=selected_accept,
+                    resource=x402_data.get("resource"),
+                )
 
             if x402_version == 1:
                 payment = self._convert_payment_to_v1(payment)
 
             # Atomically check and update spending limits to prevent race conditions
             with self._spending_lock:
-                # Re-check daily limit inside lock (initial check may have been racy)
-                if policy.daily_limit_micro:
-                    remaining = policy.daily_limit_micro - agent.spent_today_micro
-                    if amount_micro > remaining:
-                        return {
-                            "status": "error",
-                            "error": "Would exceed daily limit (concurrent request)",
-                            "code": "EXCEEDS_DAILY_LIMIT",
-                            "requested_micro": amount_micro,
-                            "remaining_micro": remaining
-                        }
+                # Re-check daily limit inside lock (initial check may have been racy).
+                # This is the binding check - the two before it are advisory - so a
+                # policy of 0 has to refuse here above all.
+                remaining = policy.daily_limit_micro - agent.spent_today_micro
+                if amount_micro > remaining:
+                    return {
+                        "status": "error",
+                        "error": "Would exceed daily limit (concurrent request)",
+                        "code": "EXCEEDS_DAILY_LIMIT",
+                        "requested_micro": amount_micro,
+                        "remaining_micro": remaining
+                    }
+                # The spend is recorded here, when the authorization is created,
+                # and nothing anywhere ever subtracts it. A payment the merchant
+                # rejects, one that reverts on-chain, one that is never redeemed:
+                # all keep their spend until the next daily reset.
+                #
+                # That is deliberate, and load-bearing. The authorization is a
+                # bearer instrument valid for a full hour (valid_before, below),
+                # Vault cannot revoke it, and the only word that it failed arrives
+                # over an agent-authenticated channel. Refund on that word and an
+                # agent with a cooperative merchant reports every payment failed,
+                # reclaims the budget, and redeems the signatures anyway - on-chain
+                # spend then exceeds the daily limit without bound. A confirmed
+                # revert is no safer: the signature stays good until it expires.
+                #
+                # The trading lane commits its volume at broadcast for the same
+                # reason. Do not "fix" either one into refunding.
                 agent.spent_today_micro += amount_micro
-                if policy.daily_limit_micro and agent.spent_today_micro >= policy.daily_limit_micro:
+                if agent.spent_today_micro >= policy.daily_limit_micro:
                     agent.status = "limit_reached"
                 self._policy_store.update_agent(agent)
 
@@ -1612,6 +2157,11 @@ class SigningService:
                 if agent.intent_mandate:
                     tx.mandate_id = agent.intent_mandate.get("id")
                 tx.mark_signed(agent.wallet_address, wallet_id, auto_approved)
+
+            # Persist the idempotency key with the record so a duplicate request
+            # after a restart is recognised from disk, not only from memory.
+            if cache_key:
+                tx.cache_key = cache_key
 
             self._policy_store.add_transaction(tx)
             self._emit_transaction_updated(tx.id)
@@ -1670,10 +2220,15 @@ class SigningService:
         transaction_id: str,
         event: str,
         tx_hash: Optional[str] = None,
-        error: Optional[str] = None
+        error: Optional[str] = None,
+        signature: Optional[str] = None
     ) -> dict:
         """
         Handle a callback from an agent reporting transaction status.
+
+        Authenticated exactly like /sign and /trade: a callback writes the
+        settlement record, so it has to prove it comes from the agent whose
+        payment it claims to be reporting.
 
         Args:
             agent_id: The agent's ID
@@ -1681,6 +2236,7 @@ class SigningService:
             event: One of 'submitted', 'settled', 'failed'
             tx_hash: Transaction hash (required for 'settled')
             error: Error message (optional for 'failed')
+            signature: Bearer token, or SIG:ts:hex over the callback fields
 
         Returns:
             Status response dict
@@ -1692,6 +2248,11 @@ class SigningService:
         agent = self._policy_store.get_agent_by_id(agent_id)
         if not agent:
             return {"status": "error", "error": "Agent not found", "code": "AGENT_NOT_FOUND"}
+
+        auth_error = self._verify_callback_auth(
+            agent, agent_id, signature, transaction_id, event, tx_hash)
+        if auth_error:
+            return auth_error
 
         # Find the transaction
         tx = self._policy_store.get_transaction(transaction_id)
@@ -1725,8 +2286,16 @@ class SigningService:
                 self._queue_verification(tx)
         elif event == "failed":
             tx.mark_failed(error)
+            # The allowance this payment consumed is not returned, and the user
+            # deserves to hear why their remaining budget dropped for a payment
+            # that visibly failed: the signed authorization is a bearer
+            # instrument that stays redeemable until it expires, whatever this
+            # callback says. See the comment at the spend increment in
+            # _sign_payment.
             self._emit_activity(
-                f"Payment failed for {agent.name}: {error or 'Unknown error'}",
+                f"Payment failed for {agent.name}: {error or 'Unknown error'}. "
+                f"Its {tx.format_amount()} stays spent until the daily reset - "
+                f"the signed authorization remains redeemable.",
                 True
             )
         else:
@@ -1736,6 +2305,52 @@ class SigningService:
         self._emit_transaction_updated(tx.id)
 
         return {"status": "ok", "transaction_id": tx.id, "new_status": tx.status}
+
+    def _verify_callback_auth(
+        self,
+        agent: Agent,
+        agent_id: str,
+        signature: Optional[str],
+        transaction_id: str,
+        event: str,
+        tx_hash: Optional[str],
+    ) -> Optional[dict]:
+        """Authenticate a settlement callback. Returns None on success.
+
+        Bearer agents are checked without the wallet, as elsewhere. An HMAC
+        credential can only be verified with the wallet's master key, so when the
+        wallet is locked the caller has NOT been authenticated - and answering
+        WALLET_LOCKED would hand an unauthenticated caller a pollable "keys are in
+        memory now" oracle, the same one /sign and /mandate refuse to give. So a
+        locked wallet answers AUTH_FAILED, identical to an unlocked wallet's
+        answer to a bad credential.
+        """
+        signed_fields = {
+            "callback": {
+                "transaction_id": transaction_id,
+                "event": event,
+                "tx_hash": tx_hash,
+            }
+        }
+
+        if agent.auth_mode == "bearer":
+            err = self.verify_agent_signature(agent, agent_id, signature, None, signed_fields)
+            return None if not err else {
+                "status": "error", "error": err, "code": "AUTH_FAILED"}
+
+        if not self._wallet_provider:
+            return {"status": "error", "error": "Wallet provider not set",
+                    "code": "NO_WALLET_PROVIDER"}
+        wallet = self._wallet_provider(agent.wallet_address)
+        if not wallet:
+            self._emit_activity(f"Auth failed for {agent.name}: wallet locked", True)
+            return {"status": "error", "error": "Authentication failed",
+                    "code": "AUTH_FAILED"}
+
+        err = self.verify_agent_signature(
+            agent, agent_id, signature, wallet.data_key, signed_fields)
+        return None if not err else {
+            "status": "error", "error": err, "code": "AUTH_FAILED"}
 
     def get_receipt(self, identifier: str) -> dict:
         """
@@ -1771,17 +2386,17 @@ class SigningService:
         """
         Convert a parsed atomic amount to a bounds-checked int of micro-USDG.
 
-        The amount is already in 6-decimal format for USDG (1_000_000 = $1.00),
-        the standard for stablecoins on EVM chains (USDG/USDT: 6 decimals). An
-        asset with different decimals (e.g. DAI with 18) would be miscounted.
+        USDG has 6 decimals, so the atomic amount is already micro-USDG
+        (1_000_000 = $1.00). `_check_asset_supported` guarantees the asset is
+        USDG before this runs.
 
         Raises ValueError on a non-integer, non-positive, or absurdly large
         amount.
         """
         try:
             amount_micro = int(raw_amount)
-        except (ValueError, TypeError):
-            raise ValueError(f"Invalid amount: {raw_amount!r}")
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid amount: {raw_amount!r}") from e
 
         # Bounds validation
         if amount_micro <= 0:
@@ -1790,12 +2405,3 @@ class SigningService:
             raise ValueError(f"amount exceeds maximum ({amount_micro} > 10^15)")
 
         return amount_micro
-
-    def _parse_amount_micro(self, x402_data: dict) -> int:
-        """Dialect-aware amount extraction + bounds check (v1 or v2).
-
-        Retained for callers/tests that hand in a raw x402 dict; delegates to
-        the single intake parser so it can never disagree with the signed value.
-        """
-        from .eip3009 import parse_x402
-        return self._bounded_amount_micro(parse_x402(x402_data).max_amount_required)

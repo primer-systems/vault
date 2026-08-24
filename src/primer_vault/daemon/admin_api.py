@@ -3,19 +3,32 @@ Admin API - HTTP endpoints for GUI/Console to control the daemon.
 
 This runs on localhost only (port 4664 by default).
 
-Security modes (configurable in GUI settings):
-- "open": Any local process can access (default, current behavior)
-- "gui_only": Reject external HTTP requests with 403 (only GUI can control)
+Security modes:
+- "gui_only" (DEFAULT): only the embedded GUI drives the API; everything else
+  gets 403. This is the whole of the protection, because the Admin API has no
+  authentication of its own.
+- "open": any local process on this machine can use it — create agents and read
+  back their tokens, commission them to a funded address, approve requests. With
+  the wallet unlocked that is a complete drain path and no user interaction is
+  required, so it is opt-in and stays that way.
+
+Change it with `config set admin-api open`, `--admin-open` on a daemon, or the
+Vault window under Settings > Security.
 """
 
 import json
 import logging
+import os
+import socket
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs
 
-from ..core.settings import ADMIN_API_MODE_GUI_ONLY
+from ..core.settings import ADMIN_API_MODE_GUI_ONLY, ADMIN_API_MODE_OPEN
+from ..utils import is_browser_request, is_rebound_host
 
 if TYPE_CHECKING:
     from ..core import Vault
@@ -23,11 +36,75 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Largest request body accepted, matching the agent API. Admin payloads are
+# small (a policy, an agent name), so this only bounds a caller that lies about
+# how much it is about to send.
+MAX_CONTENT_LENGTH = 1 * 1024 * 1024
+
+# Ceiling on concurrently served connections. Callers are the CLI and the
+# occasional local script, so this is generous and still bounds a runaway one.
+MAX_WORKER_THREADS = 16
+
+# How long a connection may go without sending anything before it is dropped.
+# Without this a caller can announce a body and then never send it, holding its
+# worker for as long as the process lives.
+SOCKET_TIMEOUT_SECONDS = 30
+
+# Failed wallet unlocks tolerated before the endpoint pauses, and for how long.
+UNLOCK_MAX_FAILURES = 5
+UNLOCK_LOCKOUT_SECONDS = 60
+
+
+class _UnlockThrottle:
+    """Counts consecutive failed unlocks and pauses the endpoint after a run.
+
+    Deliberately global rather than per-IP: every caller here is on this machine,
+    so an IP distinguishes nothing, and keying on one would let a caller reset
+    its own budget. A successful unlock clears the count.
+
+    This does not carry the security of the wallet - Argon2id does, at roughly
+    280ms a guess. What it adds is a ceiling on unattended grinding and a line in
+    the log, so an attempt to work through passwords is visible rather than
+    silent.
+    """
+
+    def __init__(self):
+        self._failures = 0
+        self._blocked_until = 0.0
+        self._lock = threading.Lock()
+
+    def blocked_for(self) -> int:
+        """Seconds remaining before another attempt is accepted; 0 if allowed."""
+        with self._lock:
+            remaining = self._blocked_until - time.monotonic()
+            return int(remaining) + 1 if remaining > 0 else 0
+
+    def record_failure(self) -> int:
+        """Count a failed attempt. Returns the consecutive failure count."""
+        with self._lock:
+            self._failures += 1
+            if self._failures >= UNLOCK_MAX_FAILURES:
+                self._blocked_until = time.monotonic() + UNLOCK_LOCKOUT_SECONDS
+                self._failures = 0
+            return self._failures
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._blocked_until = 0.0
+
+
+_unlock_attempts = _UnlockThrottle()
+
+
 class AdminRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for admin API."""
 
     # Reference to the Vault core (set by AdminAPIServer)
     core: "Vault" = None
+
+    # Drop a connection that stalls rather than holding a worker on it.
+    timeout = SOCKET_TIMEOUT_SECONDS
 
     def log_message(self, format, *args):
         """Override to use our logger."""
@@ -37,13 +114,65 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         """Send JSON response."""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "http://localhost")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
     def _send_error(self, message: str, code: str = "ERROR", status: int = 400):
         """Send error response."""
         self._send_json({"status": "error", "error": message, "code": code}, status)
+
+    def _drain_request_body(self):
+        """Read and discard any request body before replying with an error.
+
+        Rejecting a request without consuming its body leaves the client still
+        writing while we close the socket, which surfaces as a connection reset
+        instead of the 403 we meant to send. Draining first makes the refusal
+        legible to whoever asked.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _check_not_from_browser(self) -> bool:
+        """Reject requests a web page told the browser to send.
+
+        Returns True if the request should proceed, False if it was blocked.
+        See utils.is_browser_request for why the Origin header decides this,
+        and utils.is_rebound_host for the DNS-rebinding case, where the page
+        has made itself same-origin with us and so sends no Origin at all.
+        """
+        if is_rebound_host(self.headers, self.server.server_address[0]):
+            logger.warning(
+                "Admin API rejected a request for host %r; this socket is "
+                "loopback-only", self.headers.get("Host")
+            )
+            self._drain_request_body()
+            self._send_json({
+                "status": "error",
+                "code": "FOREIGN_HOST_REJECTED",
+                "error": "Requests for a host other than localhost are not accepted.",
+            }, 403)
+            return False
+
+        origin = self.headers.get("Origin")
+        if not is_browser_request(self.headers):
+            return True
+
+        logger.warning(f"Admin API rejected a browser-originated request from {origin}")
+        self._drain_request_body()
+        self._send_json({
+            "status": "error",
+            "code": "BROWSER_ORIGIN_REJECTED",
+            "error": "Requests from web pages are not accepted by the Admin API.",
+        }, 403)
+        return False
 
     def _check_gui_only_access(self, path: str) -> bool:
         """Check if request is allowed given the current admin API mode.
@@ -56,11 +185,19 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         """
         try:
             mode = self.core.settings_manager.get_admin_api_mode()
-        except Exception:
-            # Fail-open if settings unavailable (e.g., during startup)
-            return True
+        except Exception as e:
+            # Settings unreadable (e.g. still starting up). Assume the locked-down
+            # mode rather than permitting the request: a check that cannot
+            # establish whether something is allowed should answer no. /status
+            # still passes below, so CLI instance detection keeps working - denying
+            # that would make a second core start against the same data directory.
+            logger.warning(f"Admin API mode unreadable, assuming gui_only: {e}")
+            mode = ADMIN_API_MODE_GUI_ONLY
 
-        if mode != ADMIN_API_MODE_GUI_ONLY:
+        # Only the exact "open" string opens the API. Anything else - including a
+        # value this build does not recognise - is treated as locked down, so the
+        # one control protecting the wallet fails closed rather than open.
+        if mode == ADMIN_API_MODE_OPEN:
             return True
 
         # In gui_only mode, allow /status so CLI knows daemon is running
@@ -68,35 +205,46 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             return True
 
         # Block everything else with a clear message
+        self._drain_request_body()
         self._send_json({
             "status": "error",
             "code": "GUI_ONLY_MODE",
-            "error": "Admin API is in GUI-only mode. External access is disabled. "
-                     "Change this setting in Vault GUI under Settings > Security.",
+            "error": "Admin API is in GUI-only mode, so only the Vault window can "
+                     "drive it. Manage Vault from that window - Settings > "
+                     "Security there also lets you allow CLI access. A headless "
+                     "server has no window: restart it with --admin-open.",
             "mode": "gui_only"
         }, 403)
         return False
 
     def _read_json_body(self) -> dict:
-        """Read and parse JSON body."""
-        content_length = int(self.headers.get("Content-Length", 0))
+        """Read and parse the JSON body, refusing an implausible one.
+
+        The declared length is checked before a single byte is read: it is the
+        caller's claim, and reading first would mean allocating whatever it
+        asked for. Raises ValueError, which the verb handlers already answer
+        with 400.
+        """
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError) as e:
+            raise ValueError("Invalid Content-Length header") from e
+        if content_length < 0:
+            raise ValueError("Invalid Content-Length header")
+        if content_length > MAX_CONTENT_LENGTH:
+            raise ValueError(f"Payload too large (max {MAX_CONTENT_LENGTH} bytes)")
         if content_length == 0:
             return {}
         body = self.rfile.read(content_length)
         return json.loads(body.decode())
 
-    def do_OPTIONS(self):
-        """Handle CORS preflight."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "http://localhost")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
     def do_GET(self):
         """Handle GET requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_not_from_browser():
+            return
 
         # Check gui_only mode (allows /status through for daemon detection)
         if not self._check_gui_only_access(path):
@@ -140,13 +288,20 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_error("Not found", "NOT_FOUND", 404)
         except Exception as e:
+            # The detail goes to the log, not to the caller: an exception string
+            # carries filesystem paths and internal structure, and the caller can
+            # do nothing with it either way.
             logger.error(f"Admin API error: {e}", exc_info=True)
-            self._send_error(str(e), "INTERNAL_ERROR", 500)
+            self._send_error("Internal error - see the Vault log for details",
+                             "INTERNAL_ERROR", 500)
 
     def do_POST(self):
         """Handle POST requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_not_from_browser():
+            return
 
         # Check gui_only mode
         if not self._check_gui_only_access(path):
@@ -227,14 +382,26 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 self._send_error("Not found", "NOT_FOUND", 404)
         except json.JSONDecodeError:
             self._send_error("Invalid JSON", "INVALID_JSON", 400)
+        except ValueError as e:
+            # A refused body (bad or oversized Content-Length) is the caller's
+            # mistake, not ours - 400, not 500. Ordered after JSONDecodeError,
+            # which is itself a ValueError.
+            self._send_error(str(e), "BAD_REQUEST", 400)
         except Exception as e:
+            # The detail goes to the log, not to the caller: an exception string
+            # carries filesystem paths and internal structure, and the caller can
+            # do nothing with it either way.
             logger.error(f"Admin API error: {e}", exc_info=True)
-            self._send_error(str(e), "INTERNAL_ERROR", 500)
+            self._send_error("Internal error - see the Vault log for details",
+                             "INTERNAL_ERROR", 500)
 
     def do_PUT(self):
         """Handle PUT requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_not_from_browser():
+            return
 
         # Check gui_only mode
         if not self._check_gui_only_access(path):
@@ -253,14 +420,26 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 self._send_error("Not found", "NOT_FOUND", 404)
         except json.JSONDecodeError:
             self._send_error("Invalid JSON", "INVALID_JSON", 400)
+        except ValueError as e:
+            # A refused body (bad or oversized Content-Length) is the caller's
+            # mistake, not ours - 400, not 500. Ordered after JSONDecodeError,
+            # which is itself a ValueError.
+            self._send_error(str(e), "BAD_REQUEST", 400)
         except Exception as e:
+            # The detail goes to the log, not to the caller: an exception string
+            # carries filesystem paths and internal structure, and the caller can
+            # do nothing with it either way.
             logger.error(f"Admin API error: {e}", exc_info=True)
-            self._send_error(str(e), "INTERNAL_ERROR", 500)
+            self._send_error("Internal error - see the Vault log for details",
+                             "INTERNAL_ERROR", 500)
 
     def do_PATCH(self):
         """Handle PATCH requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_not_from_browser():
+            return
 
         # Check gui_only mode
         if not self._check_gui_only_access(path):
@@ -275,14 +454,26 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 self._send_error("Not found", "NOT_FOUND", 404)
         except json.JSONDecodeError:
             self._send_error("Invalid JSON", "INVALID_JSON", 400)
+        except ValueError as e:
+            # A refused body (bad or oversized Content-Length) is the caller's
+            # mistake, not ours - 400, not 500. Ordered after JSONDecodeError,
+            # which is itself a ValueError.
+            self._send_error(str(e), "BAD_REQUEST", 400)
         except Exception as e:
+            # The detail goes to the log, not to the caller: an exception string
+            # carries filesystem paths and internal structure, and the caller can
+            # do nothing with it either way.
             logger.error(f"Admin API error: {e}", exc_info=True)
-            self._send_error(str(e), "INTERNAL_ERROR", 500)
+            self._send_error("Internal error - see the Vault log for details",
+                             "INTERNAL_ERROR", 500)
 
     def do_DELETE(self):
         """Handle DELETE requests."""
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if not self._check_not_from_browser():
+            return
 
         # Check gui_only mode
         if not self._check_gui_only_access(path):
@@ -298,25 +489,45 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_error("Not found", "NOT_FOUND", 404)
         except Exception as e:
+            # The detail goes to the log, not to the caller: an exception string
+            # carries filesystem paths and internal structure, and the caller can
+            # do nothing with it either way.
             logger.error(f"Admin API error: {e}", exc_info=True)
-            self._send_error(str(e), "INTERNAL_ERROR", 500)
+            self._send_error("Internal error - see the Vault log for details",
+                             "INTERNAL_ERROR", 500)
 
     # -------------------------------------------------------------------------
     # Status
     # -------------------------------------------------------------------------
 
     def _handle_status(self):
-        """Get daemon status."""
+        """Get daemon status.
+
+        /status answers unauthenticated in the default gui_only mode so the CLI
+        can detect a running instance. It must therefore not disclose anything
+        an unauthenticated local caller should not watch - in particular the
+        wallet lock state, which would be a "the keys are in memory now" signal.
+        The CLI reads only server_running, server_port and data_dir; the
+        lock/queue fields are added only in open mode, where the caller is
+        already authorised to drain the wallet anyway.
+        """
         running = self.core.is_server_running()
-        self._send_json({
+        status = {
             "status": "ok",
-            "wallet_unlocked": self.core.is_wallet_unlocked(),
             "server_running": running,
             "server_port": self.core.server_port if running else None,
-            "pending_approvals": len(self.core.get_pending_requests()),
-            "pending_trades": len(self.core.get_pending_trades()),
             "data_dir": str(self.core.data_dir),
-        })
+        }
+        try:
+            open_mode = (self.core.settings_manager.get_admin_api_mode()
+                         == ADMIN_API_MODE_OPEN)
+        except Exception:
+            open_mode = False
+        if open_mode:
+            status["wallet_unlocked"] = self.core.is_wallet_unlocked()
+            status["pending_approvals"] = len(self.core.get_pending_requests())
+            status["pending_trades"] = len(self.core.get_pending_trades())
+        self._send_json(status)
 
     # -------------------------------------------------------------------------
     # Agents
@@ -345,7 +556,11 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             return
 
         auth_mode = body.get("auth_mode", "hmac")
-        agent, secret = self.core.create_agent(name, auth_mode)
+        try:
+            agent, secret = self.core.create_agent(name, auth_mode)
+        except ValueError as e:
+            self._send_error(str(e), "WALLET_LOCKED", 409)
+            return
 
         self._send_json({
             "agent": self._agent_to_dict(agent),
@@ -490,7 +705,15 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self._send_error("Policy not found", "NOT_FOUND", 404)
             return
 
-        # Update fields
+        # Parse the one field that can raise (trading_rules) before applying
+        # anything, so a malformed body cannot leave the policy half-edited (it
+        # is the live store object the enforcement code reads).
+        _UNSET = object()
+        new_trading_rules = _UNSET
+        if "trading_rules" in body:
+            tr_data = body["trading_rules"]
+            new_trading_rules = None if tr_data is None else TradingRules.from_dict(tr_data)
+
         if "name" in body:
             policy.name = body["name"]
         if "daily_limit_micro" in body:
@@ -505,12 +728,8 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             policy.blocked_domains = body["blocked_domains"]
         if "networks" in body:
             policy.networks = body["networks"]
-        if "trading_rules" in body:
-            tr_data = body["trading_rules"]
-            if tr_data is None:
-                policy.trading_rules = None
-            else:
-                policy.trading_rules = TradingRules.from_dict(tr_data)
+        if new_trading_rules is not _UNSET:
+            policy.trading_rules = new_trading_rules
         if "x402_enabled" in body:
             policy.x402_enabled = body["x402_enabled"]
 
@@ -566,7 +785,13 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
         })
 
     def _handle_unlock_wallet(self, body: dict):
-        """Unlock the wallet."""
+        """Unlock the wallet.
+
+        This is the one endpoint that takes a guess at a secret, so failures are
+        counted and reported. Argon2id already makes each attempt cost about a
+        quarter of a second, which is the real defence; the point of the backoff
+        is that a process grinding away at the password cannot do so quietly.
+        """
         wallet_path = body.get("wallet_path")
         password = body.get("password")
 
@@ -577,13 +802,25 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        blocked_for = _unlock_attempts.blocked_for()
+        if blocked_for:
+            self._send_error(
+                f"Too many failed unlock attempts. Try again in {blocked_for} seconds.",
+                "TOO_MANY_ATTEMPTS", 429)
+            return
+
         result = self.core.load_wallet(wallet_path, password)
         if result.get("success"):
+            _unlock_attempts.record_success()
             self._send_json({
                 "status": "unlocked",
                 "addresses": result.get("addresses", [])
             })
         else:
+            failures = _unlock_attempts.record_failure()
+            logger.warning(
+                "Admin API wallet unlock failed from %s (%d consecutive)",
+                self.client_address[0], failures)
             self._send_error(result.get("error", "Unknown error"), "UNLOCK_FAILED", 401)
 
     def _handle_lock_wallet(self):
@@ -859,6 +1096,7 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
                 "amount_out_expected": quote.amount_out_expected,
                 "amount_out_min": quote.amount_out_min,
                 "notional_usdg": quote.notional_usdg,
+                "price_impact_pct": quote.price_impact_pct,
                 "pool": quote.pool,
                 "gas_estimate": quote.gas_estimate,
                 "symbol_in": quote.symbol_in,
@@ -920,13 +1158,17 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             "server": {
                 "default_port": settings.server.default_port,
                 "allow_lan": settings.server.allow_lan,
+                "rate_limit_per_minute": settings.server.rate_limit_per_minute,
             },
             "display": {
                 "default_network": settings.display.default_network,
             },
             "rpc": {
                 "endpoints": dict(settings.rpc.endpoints),
-            }
+            },
+            "security": {
+                "admin_api_mode": settings.security.admin_api_mode,
+            },
         })
 
     def _handle_patch_settings(self, body: dict):
@@ -945,6 +1187,8 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             sm.set_default_port(int(value))
         elif key == "allow_lan":
             sm.set_allow_lan(bool(value))
+        elif key == "rate_limit":
+            sm.set_rate_limit(int(value))
         elif key == "default_network":
             sm.set_default_network(int(value))
         elif key == "rpc_endpoint":
@@ -1036,9 +1280,73 @@ class AdminRequestHandler(BaseHTTPRequestHandler):
             self._send_error(str(e), "UPLOAD_FAILED", 400)
 
 
-class ThreadedHTTPServer(HTTPServer):
-    """HTTP server that handles requests in threads."""
-    allow_reuse_address = True
+class ThreadedAdminServer(ThreadingMixIn, HTTPServer):
+    """Admin API server, one thread per connection.
+
+    Serving connections one at a time would mean any single caller could hold
+    the API for as long as it liked - and since a caller may simply stop writing
+    mid-request, "as long as it liked" has no upper bound without the socket
+    timeout below. A CLI process asking a running GUI for its agent list has no
+    way to recover from that, or even to explain it.
+
+    Threads are capped rather than unbounded. Past the cap connections wait in
+    the listen backlog, which a caller can cope with, instead of each claiming a
+    thread. The cap is enforced with a semaphore rather than by setting
+    `max_children`: that attribute belongs to ForkingMixIn; ThreadingMixIn never
+    reads it, so setting it here looked like a ceiling and was not one.
+
+    Address reuse is POSIX-only, deliberately. On POSIX, SO_REUSEADDR only
+    permits rebinding past TIME_WAIT remnants after a restart - a second live
+    bind still fails, which is what lets a bind failure mean something. On
+    Windows the same flag means more: it lets a second socket bind a port that
+    is actively in use, so two Vault processes could both "own" 4664 with
+    connections split unpredictably between them, and neither would see an
+    error. Windows instead gets SO_EXCLUSIVEADDRUSE, which also stops any other
+    local process from binding over us with SO_REUSEADDR and stealing admin
+    connections. (Windows does not need SO_REUSEADDR for restarts; asyncio
+    makes the same platform split for the same reason.)
+    """
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True  # Don't block shutdown waiting for threads
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_WORKER_THREADS)
+
+    def process_request(self, request, client_address):
+        """Claim a slot before handing the connection to a thread."""
+        self._slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def shutdown_request(self, request):
+        """Give the slot back. Called once per handled connection, in the worker."""
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._slots.release()
+
+    def server_bind(self):
+        if os.name == "nt":
+            try:
+                self.socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass  # non-Windows Python without the constant, or an odd stack
+        super().server_bind()
+
+    def handle_error(self, request, client_address):
+        """Log a dropped connection instead of printing a traceback.
+
+        A caller that disconnects mid-request is ordinary - a CLI interrupted
+        with Ctrl-C does it every time - but socketserver's default prints a
+        stack trace to stderr, which in the GUI's log looks like a crash.
+        """
+        logger.debug("Admin API connection from %s ended early", client_address,
+                     exc_info=True)
 
 
 class AdminAPIServer:
@@ -1051,7 +1359,7 @@ class AdminAPIServer:
     def __init__(self, core: "Vault", port: int = 4664):
         self._core = core
         self._port = port
-        self._server: ThreadedHTTPServer = None
+        self._server: ThreadedAdminServer = None
         self._thread: threading.Thread = None
 
     def start(self):
@@ -1060,7 +1368,7 @@ class AdminAPIServer:
         AdminRequestHandler.core = self._core
 
         # Bind to localhost only
-        self._server = ThreadedHTTPServer(("127.0.0.1", self._port), AdminRequestHandler)
+        self._server = ThreadedAdminServer(("127.0.0.1", self._port), AdminRequestHandler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 

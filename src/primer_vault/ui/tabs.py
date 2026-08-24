@@ -10,12 +10,7 @@ Contains:
 - LogTab: Real-time logs
 """
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QCheckBox, QSpinBox, QLineEdit, QTextEdit, QGroupBox,
-    QFormLayout, QFileDialog, QDialog, QFrame, QSplitter
-)
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QCheckBox, QSpinBox, QLineEdit, QTextEdit, QGroupBox, QFormLayout, QFileDialog, QDialog, QFrame, QSplitter
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QByteArray
 from PyQt6.QtGui import QFont, QColor, QPixmap, QIcon
 from typing import Optional
@@ -34,15 +29,15 @@ from .dialogs import (
     NewPolicyDialog
 )
 from ..models import SpendPolicy, Agent, Transaction
-from ..core.settings import DEFAULT_PORT
-from ..wallet import VaultWallet, AddressEntry, NO_PASSWORD_SENTINEL
+from ..version import USER_AGENT
+from ..wallet import VaultWallet, AddressEntry, WalletInfo, NO_PASSWORD_SENTINEL
 from ..wallet.dialogs import (
     AddAddressDialog, SeedSelectionDialog, DerivationBrowserDialog,
     NewSeedDialog, ImportSeedToWalletDialog, ImportPrivateKeyToWalletDialog,
     VaultWalletUnlockDialog, CreateWalletWizard,
     AddWalletChoiceDialog, WalletFilenameDialog, WalletSettingsDialog,
 )
-from ..networks import NETWORKS, DEFAULT_NETWORK, MultiNetworkBalanceFetcher, format_address, Balance
+from ..networks import DEFAULT_NETWORK, MultiNetworkBalanceFetcher, format_address, Balance
 from ..version import __version__
 # Note: Do NOT import get_wallet_dir or get_app_dir here. Use core methods instead.
 # See ARCHITECTURE.md "Common Mistakes" section.
@@ -94,7 +89,7 @@ class IconFetcherThread(QThread):
         try:
             req = urllib.request.Request(
                 self.url,
-                headers={"User-Agent": "PrimerVault/1.0"}
+                headers={"User-Agent": USER_AGENT}
             )
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = response.read()
@@ -309,6 +304,19 @@ class AgentsTab(QWidget):
         "limit_reached": "warn",
     }
 
+    #: How each agent proves its identity on /sign and /trade.
+    _AUTH_MODE_LABEL = {
+        "hmac": "HMAC",
+        "bearer": "Bearer",
+    }
+
+    _AUTH_MODE_TOOLTIP = {
+        "hmac": "HMAC — the agent signs each request with a shared secret.\n"
+                "The secret itself is never sent over the wire.",
+        "bearer": "Bearer — the agent sends its token with each request.\n"
+                  "Simpler to integrate, but the token travels with every call.",
+    }
+
     def __init__(self, core):
         """
         Args:
@@ -332,21 +340,19 @@ class AgentsTab(QWidget):
         layout.addLayout(toolbar)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "Name", "Code", "Verify Key", "Policy", "Spent Today", "Status", "Actions"
+            "Name", "Code", "Auth", "Policy", "Status", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(1, 70)
-        self.table.setColumnWidth(2, 140)
-        self.table.setColumnWidth(4, 100)  # Spent Today
-        self.table.setColumnWidth(5, 90)   # Status
-        self.table.setColumnWidth(6, 95)   # Actions
+        self.table.setColumnWidth(2, 70)   # Auth
+        self.table.setColumnWidth(4, 90)   # Status
+        self.table.setColumnWidth(5, 95)   # Actions
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -379,10 +385,10 @@ class AgentsTab(QWidget):
             id_item.setFont(QFont(Theme.MONO_FONT, 9))
             self.table.setItem(row, 1, id_item)
 
-            pubkey_short = agent.auth_key[:8] + "..." + agent.auth_key[-6:]
-            pubkey_item = QTableWidgetItem(pubkey_short)
-            pubkey_item.setFont(QFont(Theme.MONO_FONT, 9))
-            self.table.setItem(row, 2, pubkey_item)
+            auth_item = QTableWidgetItem(
+                self._AUTH_MODE_LABEL.get(agent.auth_mode, agent.auth_mode))
+            auth_item.setToolTip(self._AUTH_MODE_TOOLTIP.get(agent.auth_mode, ""))
+            self.table.setItem(row, 2, auth_item)
 
             # Clear any stale cell widget from a previous populate — otherwise an
             # agent that goes unassigned -> commissioned shows both the policy name
@@ -401,13 +407,11 @@ class AgentsTab(QWidget):
                 policy_link.setCursor(Qt.CursorShape.PointingHandCursor)
                 self.table.setCellWidget(row, 3, policy_link)
 
-            self.table.setItem(row, 4, QTableWidgetItem(agent.format_spent_today()))
-
             # Display status - use "pending" for uncommissioned
             display_status = "pending" if agent.status == "uncommissioned" else agent.status
             status_item = QTableWidgetItem(display_status)
             status_item.setForeground(QColor(active()[self._AGENT_STATUS_TOKEN.get(agent.status, "muted")]))
-            self.table.setItem(row, 5, status_item)
+            self.table.setItem(row, 4, status_item)
 
             actions_widget = QWidget()
             actions_layout = QHBoxLayout(actions_widget)
@@ -453,7 +457,7 @@ class AgentsTab(QWidget):
             actions_layout.addWidget(delete_btn)
 
             actions_layout.addStretch()
-            self.table.setCellWidget(row, 6, actions_widget)
+            self.table.setCellWidget(row, 5, actions_widget)
 
     def register_agent(self):
         """Show dialog to register a new agent."""
@@ -463,7 +467,7 @@ class AgentsTab(QWidget):
                 self,
                 "Wallet Required",
                 "Please unlock a wallet first before registering an agent.\n\n"
-                "Agent credentials are encrypted with your wallet password for security."
+                "Agent credentials are encrypted with your wallet's key."
             )
             return
 
@@ -857,9 +861,12 @@ class HistoryTab(QWidget):
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
+                # "In" is the fill and "In (quoted)" the prediction. Both are
+                # exported so the difference is not lost on the way out.
                 writer.writerow([
-                    "Timestamp", "Type", "Agent", "ID", "Out", "In", "Recipient",
-                    "Network", "Status", "Auto", "Wallet ID", "TX Hash"
+                    "Timestamp", "Type", "Agent", "ID", "Out", "In",
+                    "In (quoted)", "Recipient", "Network", "Status", "Auto",
+                    "Wallet ID", "TX Hash"
                 ])
                 for tx in self._transactions:
                     tx_type = getattr(tx, 'type', 'x402')
@@ -873,8 +880,12 @@ class HistoryTab(QWidget):
                         out_val = tx.format_amount()
 
                     # Format "In" based on type
+                    quoted_val = ""
                     if tx_type == 'trade':
-                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {getattr(tx, 'symbol_out', '')}"
+                        sym_out = getattr(tx, 'symbol_out', '')
+                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {sym_out}"
+                        quoted = getattr(tx, 'amount_out_quoted', None)
+                        quoted_val = f"{quoted} {sym_out}" if quoted else ""
                     elif tx_type == 'transfer':
                         in_val = ""
                     else:
@@ -887,6 +898,7 @@ class HistoryTab(QWidget):
                         tx.agent_id,
                         out_val,
                         in_val,
+                        quoted_val,
                         tx.recipient or "",
                         tx.network,
                         tx.status,
@@ -913,6 +925,11 @@ class WalletTab(QWidget):
     wallet_path_changed = pyqtSignal(str)  # Emitted when wallet path changes (for settings persistence)
     activity = pyqtSignal(str, bool)    # Activity log (message, is_error)
 
+    # Activity with a separate header line and log line.
+    # summary: short text for the header pane, or None to log without summarising
+    # detail: full text for the Logs tab
+    activity_detail = pyqtSignal(object, bool, object)  # summary, is_error, detail
+
     def __init__(self, core):
         super().__init__()
 
@@ -922,6 +939,11 @@ class WalletTab(QWidget):
         self._wallet_path = wallet_dir / PRIMER_VAULT_WALLET_FILE
         self._custom_rpcs: dict[int, str] = {}
         self._balance_threads: list = []
+        # Addresses still being fetched as part of a bulk refresh. While this is
+        # non-empty, per-address results stay out of the header pane - one
+        # aggregate line is emitted when the last one lands.
+        self._bulk_refresh_remaining: set[str] = set()
+        self._bulk_refresh_failed = 0
         self._selected_network_chain_id: int = DEFAULT_NETWORK  # RHC (4663)
 
         # Lock state
@@ -982,6 +1004,9 @@ class WalletTab(QWidget):
         self.lock_error_label = QLabel("")
         self.lock_error_label.setProperty("role", "error")
         self.lock_error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # A damaged-file message names the fault and the way back, and is far
+        # longer than "Wrong password" - unwrapped it would stretch the panel.
+        self.lock_error_label.setWordWrap(True)
         lock_layout.addWidget(self.lock_error_label)
 
         layout.addWidget(self.lock_overlay)
@@ -1071,6 +1096,14 @@ class WalletTab(QWidget):
         self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         self.refresh_btn.setVisible(False)
         assets_header.addWidget(self.refresh_btn)
+
+        # Verify button (Ledger addresses only)
+        self.verify_device_btn = QPushButton("Verify on Ledger")
+        self.verify_device_btn.setToolTip(
+            "Check that the connected Ledger still derives this address")
+        self.verify_device_btn.clicked.connect(self._on_verify_device_clicked)
+        self.verify_device_btn.setVisible(False)
+        assets_header.addWidget(self.verify_device_btn)
 
         # Send button
         self.send_btn = QPushButton("Send")
@@ -1202,8 +1235,15 @@ class WalletTab(QWidget):
             # Refresh balances after auto-unlock
             QTimer.singleShot(500, self.refresh_all_balances)
         else:
-            import logging
-            logging.getLogger(__name__).warning(f"Failed to auto-unlock wallet: {result.get('error')}")
+            # The open failed - a damaged file, or an unencrypted one this build
+            # no longer opens. Do not leave an empty, unlocked-looking screen
+            # with the failure only in the log: tell the user and show the locked
+            # state so it is clear the wallet did not open.
+            error = result.get("error", "The wallet could not be opened.")
+            self.activity.emit(f"Could not open the wallet: {error}", True)
+            self.lock_overlay.setVisible(True)
+            self.content_widget.setVisible(False)
+            self.unencrypted_warning.setVisible(False)
 
     @property
     def is_unlocked(self) -> bool:
@@ -1314,11 +1354,20 @@ class WalletTab(QWidget):
             QTimer.singleShot(500, self.refresh_all_balances)
         else:
             error = result.get("error", "Unknown error")
-            if "password" in error.lower():
+            # By the code the core sets, not by searching the message. The
+            # damaged-file message says "Your password may well be correct",
+            # so a substring test for "password" classified it as a wrong
+            # password - the one thing that message exists to rule out.
+            code = result.get("code", "")
+            if code == "WRONG_PASSWORD":
                 self.lock_error_label.setText("Wrong password")
-            elif "not found" in error.lower():
+            elif code == "WALLET_NOT_FOUND":
                 self.lock_error_label.setText("Wallet file not found")
                 self._update_display()
+            elif code in ("WALLET_DAMAGED", "UNSUPPORTED_WALLET_VERSION"):
+                # In full: it names the fault and the way back, and truncating
+                # it would cut the recovery advice off the end.
+                self.lock_error_label.setText(error)
             else:
                 self.lock_error_label.setText(f"Error: {error[:50]}")
             self.password_input.clear()
@@ -1382,12 +1431,17 @@ class WalletTab(QWidget):
         previously_selected = self._selected_address
 
         for row, addr in enumerate(addresses):
-            # Seed column: show seed_id or "—" for imported
-            seed_text = addr.seed_id if addr.seed_id else "—"
-            if addr.seed_id and addr.index is not None:
-                seed_text = f"{addr.seed_id}#{addr.index}"
+            # Source column: show seed_id, the device name, or "—" for imported
+            if addr.is_hardware:
+                seed_text = addr.device_label
+            elif addr.seed_id:
+                seed_text = f"{addr.seed_id}#{addr.index}" if addr.index is not None else addr.seed_id
+            else:
+                seed_text = "—"
             seed_item = QTableWidgetItem(seed_text)
             seed_item.setFont(QFont(Theme.MONO_FONT, 9))
+            if addr.is_hardware:
+                seed_item.setToolTip(f"{addr.device_label} hardware wallet\nPath: {addr.device_path}")
             self.address_table.setItem(row, 0, seed_item)
 
             # Name
@@ -1424,6 +1478,7 @@ class WalletTab(QWidget):
         self.no_address_label.setVisible(True)
         self.send_btn.setVisible(False)
         self.refresh_btn.setVisible(False)
+        self.verify_device_btn.setVisible(False)
 
     def _on_address_selected(self):
         """Handle address selection change."""
@@ -1449,6 +1504,15 @@ class WalletTab(QWidget):
         self.no_address_label.setVisible(False)
         self.send_btn.setVisible(True)
         self.refresh_btn.setVisible(True)
+
+        # Verifying only means something for hardware-backed addresses, and the
+        # button names whichever device this one came from.
+        entry = self._wallet.get_address_by_address(full_address) if self._wallet else None
+        if entry and entry.is_hardware:
+            self.verify_device_btn.setText(f"Verify on {entry.device_label}")
+            self.verify_device_btn.setVisible(True)
+        else:
+            self.verify_device_btn.setVisible(False)
 
         # Populate assets from cache
         self._populate_assets(full_address)
@@ -1671,6 +1735,64 @@ class WalletTab(QWidget):
         if self._selected_address:
             self._open_send_dialog(from_address=self._selected_address)
 
+    def _on_verify_device_clicked(self):
+        """Re-derive the selected address on its hardware wallet.
+
+        A quick pre-flight check: confirms the device is plugged in, unlocked,
+        in the right app, and holding the same seed this address came from -
+        without asking the user to approve anything.
+        """
+        from ..wallet.ledger import LedgerDevice, LedgerError
+
+        if not self._selected_address or not self._wallet:
+            return
+
+        entry = self._wallet.get_address_by_address(self._selected_address)
+        if not entry or not entry.is_hardware:
+            return
+
+        label = entry.device_label
+        self.verify_device_btn.setEnabled(False)
+        self.verify_device_btn.setText("Checking...")
+        try:
+            # Only Ledger is supported so far; a second brand dispatches here
+            # on entry.wallet_type.
+            device = LedgerDevice.discover()
+            if device is None:
+                FramelessMessageBox.warning(
+                    self, f"{label} Not Found",
+                    f"No {label} device found.\n\n"
+                    f"Connect and unlock your {label}, then open the Ethereum app."
+                )
+                return
+
+            derived = device.derive_address(entry.device_path)
+            if derived.lower() == entry.address.lower():
+                self.activity.emit(f"{label} verified for {entry.name}", False)
+                FramelessMessageBox.information(
+                    self, f"{label} Verified",
+                    f"The connected {label} derives this address at "
+                    f"{entry.device_path}.\n\nSigning will work."
+                )
+            else:
+                FramelessMessageBox.warning(
+                    self, f"Wrong {label}",
+                    f"This device derives a different address at {entry.device_path}:\n\n"
+                    f"Expected: {entry.address}\n"
+                    f"Device:   {derived}\n\n"
+                    f"This is a different {label}, or it was restored from another seed."
+                )
+        except LedgerError as e:
+            FramelessMessageBox.warning(self, f"{label} Error", str(e))
+        except BaseException as e:
+            # Belt and braces: this is a UI slot, so anything escaping here
+            # would surface as an app-level crash dialog.
+            logger.exception("Hardware wallet verification failed")
+            FramelessMessageBox.warning(self, f"{label} Error", f"Verification failed: {e}")
+        finally:
+            self.verify_device_btn.setEnabled(True)
+            self.verify_device_btn.setText(f"Verify on {label}")
+
     def _on_refresh_clicked(self):
         """Handle Refresh button click."""
         if self._selected_address:
@@ -1687,8 +1809,6 @@ class WalletTab(QWidget):
         # Get all addresses for the From dropdown
         addresses = self._wallet.addresses
 
-        # Get balances for the selected address
-        balances = self._address_balances.get(from_address, []) if from_address else []
 
         get_key_fn = self.core.get_private_key_for_address if self.core else None
 
@@ -1700,6 +1820,7 @@ class WalletTab(QWidget):
             chain_id=self._selected_network_chain_id,
             preselect_from=from_address,
             preselect_asset=asset_symbol,
+            rpc_url=self.core.get_rpc_url(self._selected_network_chain_id),
         )
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1752,10 +1873,14 @@ class WalletTab(QWidget):
         if VaultWallet.is_file_encrypted(wallet_path):
             # Show unlock dialog - this prompts for password
             dialog = VaultWalletUnlockDialog(wallet_path, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            # Dialog already loaded the wallet, now load through core
-            password = dialog.password if hasattr(dialog, 'password') else ""
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                password = dialog.password
+            finally:
+                # The dialog holds a second decrypted wallet no lock() can
+                # reach; scrub locks and drops it, whichever way exec() ended.
+                dialog.scrub()
             result = self.core.load_wallet(str(wallet_path), password)
         else:
             # Load unencrypted through core
@@ -1802,18 +1927,37 @@ class WalletTab(QWidget):
 
         # Now run the wallet creation wizard
         dialog = CreateWalletWizard(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        password = dialog.password
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            method = dialog.method
+            password = dialog.password
+            ledger_addresses = getattr(dialog, "ledger_addresses", None)
+            private_key = getattr(dialog, "private_key", None)
+            seed_phrase = getattr(dialog, "seed_phrase", None)
+            derivation_path = getattr(dialog, "derivation_path", None)
+            selected_indices = getattr(dialog, "selected_indices", None)
+            selected_names = getattr(dialog, "selected_names", None)
+        finally:
+            # The wizard holds the password, the generated/typed seed and any
+            # imported key; none of it may outlive the dialog.
+            dialog.scrub()
 
         # Use core.create_wallet() - this creates, saves, and unlocks the wallet
-        if dialog.method == 'import_pkey':
+        if method == 'ledger':
+            # Hardware-only wallet: no seed, no key, nothing to back up.
+            result = self.core.create_wallet(
+                wallet_path=str(new_wallet_path),
+                password=password,
+                hardware_addresses=ledger_addresses,
+                unlock=True
+            )
+        elif method == 'import_pkey':
             # Private key import
             result = self.core.create_wallet(
                 wallet_path=str(new_wallet_path),
                 password=password,
-                private_key=dialog.private_key,
+                private_key=private_key,
                 unlock=True
             )
         else:
@@ -1821,10 +1965,10 @@ class WalletTab(QWidget):
             result = self.core.create_wallet(
                 wallet_path=str(new_wallet_path),
                 password=password,
-                seed_phrase=dialog.seed_phrase,
-                derivation_path=dialog.derivation_path,
-                address_indices=dialog.selected_indices,
-                address_names=dialog.selected_names,
+                seed_phrase=seed_phrase,
+                derivation_path=derivation_path,
+                address_indices=selected_indices,
+                address_names=selected_names,
                 unlock=True
             )
 
@@ -1840,11 +1984,14 @@ class WalletTab(QWidget):
 
             # Log activity
             addresses = result.get("addresses", [])
-            if dialog.method == 'import_pkey':
+            if method == 'ledger':
+                self.activity.emit(
+                    f"Created wallet with {len(addresses)} Ledger address(es)", False)
+            elif method == 'import_pkey':
                 if addresses:
                     self.activity.emit(f"Imported private key: {format_address(addresses[0]['address'])}", False)
             else:
-                action = "Created" if dialog.method == 'new_seed' else "Imported"
+                action = "Created" if method == 'new_seed' else "Imported"
                 self.activity.emit(f"{action} wallet with {len(addresses)} address(es)", False)
 
             self.activity.emit(f"Wallet created: {wallet_filename}", False)
@@ -1871,6 +2018,9 @@ class WalletTab(QWidget):
             self._handle_import_seed()
         elif dialog.choice == 'import_pkey':
             self._handle_import_pkey()
+        elif dialog.choice == 'ledger':
+            self._handle_ledger_addresses(
+                dialog.ledger_addresses, dialog.ledger_renames, dialog.ledger_removals)
 
     def _handle_existing_seed(self, preselected_seed_id: str = None):
         """Handle deriving from an existing seed."""
@@ -2019,10 +2169,14 @@ class WalletTab(QWidget):
             return
 
         dialog = NewSeedDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            seed_phrase = dialog.seed_phrase
+        finally:
+            dialog.scrub()  # the generated phrase must not outlive the dialog
 
-        result = self.core.add_seed(dialog.seed_phrase)
+        result = self.core.add_seed(seed_phrase)
         if result.get("success"):
             seed_id = result.get("seed_id")
             self._wallet = self.core.get_wallet()  # Refresh local reference
@@ -2038,13 +2192,17 @@ class WalletTab(QWidget):
             return
 
         dialog = ImportSeedToWalletDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            seed_phrase = dialog.seed_phrase
+        finally:
+            dialog.scrub()  # the typed phrase must not outlive the dialog
 
         # Check if seed already exists
         existing_seed_ids = {s.id for s in self._wallet.seeds}
 
-        result = self.core.add_seed(dialog.seed_phrase)
+        result = self.core.add_seed(seed_phrase)
         if not result.get("success"):
             self.activity.emit(f"Error: {result.get('error')}", True)
             return
@@ -2072,10 +2230,14 @@ class WalletTab(QWidget):
             return
 
         dialog = ImportPrivateKeyToWalletDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            private_key, name = dialog.private_key, dialog.name
+        finally:
+            dialog.scrub()  # the typed key must not outlive the dialog
 
-        result = self.core.add_imported_key(dialog.private_key, dialog.name)
+        result = self.core.add_imported_key(private_key, name)
         if not result.get("success"):
             self.activity.emit(f"Error: {result.get('error')}", True)
             return
@@ -2089,34 +2251,60 @@ class WalletTab(QWidget):
             self.activity.emit(f"Imported private key: {format_address(address)}", False)
         QTimer.singleShot(500, self.refresh_all_balances)
 
-    def _on_sweep_clicked(self):
-        """Open the sweep USDG dialog."""
-        if not self._wallet or not self._is_unlocked:
-            FramelessMessageBox.warning(self, "Wallet Required", "Please unlock your wallet first.")
+    def _handle_ledger_addresses(self, ledger_addresses: list,
+                                 renames: dict = None, removals: set = None):
+        """Apply the result of the Ledger address browser.
+
+        Mirrors _handle_existing_seed: the picker is the same dialog, so it can
+        add, rename and remove in one pass.
+
+        Args:
+            ledger_addresses: List of (path, address, path_type, name) tuples to add
+            renames: address_id -> new name
+            removals: address_ids to remove
+        """
+        if not self.core or not self._wallet:
             return
 
-        addresses = self._wallet.addresses
-        if len(addresses) < 2:
-            FramelessMessageBox.information(
-                self, "Not Enough Addresses",
-                "Sweep requires at least 2 addresses (sponsor + donor or recipient)."
-            )
-            return
+        # Remove addresses that were unchecked
+        removed = 0
+        removed_addresses = []  # Track 0x addresses for agent cleanup
+        for address_id in (removals or set()):
+            result = self.core.remove_address(address_id)
+            if result.get("success"):
+                removed_addresses.append(result.get("removed_address"))
+                removed += 1
 
-        from .dialogs import SweepUSDGDialog
+        added = 0
+        for path, address, path_type, name in ledger_addresses:
+            result = self.core.add_hardware_address(address, path, path_type, name)
+            if result.get("success"):
+                added += 1
+            else:
+                self.activity.emit(f"Error adding Ledger address: {result.get('error')}", True)
 
-        # Use core's method to get private keys
-        get_key_fn = self.core.get_private_key_for_address if self.core else None
-        dialog = SweepUSDGDialog(
-            parent=self,
-            addresses=addresses,
-            get_private_key_fn=get_key_fn,
-            chain_id=self._selected_network_chain_id
-        )
-        dialog.exec()
+        renamed = 0
+        for address_id, new_name in (renames or {}).items():
+            if self.core.rename_address(address_id, new_name):
+                renamed += 1
 
-        # Refresh balances after sweep
-        self.refresh_all_balances()
+        if added > 0 or renamed > 0 or removed > 0:
+            self._wallet = self.core.get_wallet()  # Refresh local reference
+            self.populate_table()
+            self.wallets_changed.emit(self._wallet.addresses if self._wallet else [])
+
+            # Emit wallet_deleted for each removed address (for agent cleanup)
+            for addr in removed_addresses:
+                if addr:
+                    self.wallet_deleted.emit(addr)
+
+            if added > 0:
+                self.activity.emit(f"Added {added} Ledger address{'es' if added > 1 else ''}", False)
+            if renamed > 0:
+                self.activity.emit(f"Renamed {renamed} address{'es' if renamed > 1 else ''}", False)
+            if removed > 0:
+                self.activity.emit(f"Removed {removed} address{'es' if removed > 1 else ''}", False)
+            QTimer.singleShot(500, self.refresh_all_balances)
 
     def _on_wallet_settings(self):
         """Open the wallet settings dialog."""
@@ -2364,20 +2552,58 @@ class WalletTab(QWidget):
                 self.activity.emit(f"Removed address: {format_address(removed_address)}", False)
 
     def refresh_all_balances(self):
-        """Refresh balances for all addresses."""
+        """Refresh balances for all addresses.
+
+        Per-address results are kept out of the header pane: with dozens of
+        addresses they would evict everything else from a six-line display.
+        One aggregate line is emitted when the last fetch lands.
+        """
         if not self._wallet:
             return
-        for addr in self._wallet.addresses:
-            self.refresh_address_balance(addr.address)
+
+        addresses = [addr.address for addr in self._wallet.addresses]
+        if not addresses:
+            return
+
+        self._bulk_refresh_remaining = set(addresses)
+        self._bulk_refresh_failed = 0
+        for address in addresses:
+            self.refresh_address_balance(address)
 
     def refresh_address_balance(self, address: str):
         """Refresh balance for a single address."""
-        self.activity.emit(f"Fetching balance for {format_address(address)}...", False)
+        # Logs only: a progress ping with no outcome does not belong in the
+        # header, and the result line right after it says everything.
+        self.activity_detail.emit(
+            None, False, f"Fetching balance for {format_address(address)}...")
 
         thread = BalanceFetcherThread(address, self._custom_rpcs)
         thread.balances_updated.connect(lambda bal, addr=address: self.on_balance_updated(addr, bal))
         self._balance_threads.append(thread)
         thread.start()
+
+    @staticmethod
+    def _abbreviate_balances(bal_list: list) -> str:
+        """Short balance summary for the header, e.g. "1.4 ETH & 3 other tokens".
+
+        Always leads with the native balance, even at zero - it is the gas
+        token, so having none is worth seeing, and a fixed leader keeps the
+        line stable between refreshes instead of reordering by size.
+        """
+        if not bal_list or any(b.fetch_failed for b in bal_list):
+            return "unavailable"
+
+        native = next((b for b in bal_list if b.is_native), None)
+        if native is not None:
+            amount = f"{native.formatted:.4f}".rstrip("0").rstrip(".") or "0"
+            lead = f"{amount} {native.symbol}"
+        else:
+            lead = "0 ETH"
+
+        others = sum(1 for b in bal_list if not b.is_native and b.formatted > 0)
+        if not others:
+            return lead
+        return f"{lead} & {others} other token{'s' if others != 1 else ''}"
 
     def set_custom_rpcs(self, rpcs: dict[int, str]):
         """Set custom RPC URLs for balance fetching."""
@@ -2397,23 +2623,42 @@ class WalletTab(QWidget):
         if address == self._selected_address:
             self._populate_assets(address)
 
-        # Summarize balances for log
+        # Full breakdown for the Logs tab
         bal_list = self._address_balances.get(address, [])
-        if bal_list:
-            # Check if any balance failed to fetch
-            any_failed = any(bal.fetch_failed for bal in bal_list)
-            if any_failed:
-                summary = "error"
-            else:
-                summaries = []
-                for bal in bal_list:
-                    if bal.formatted > 0:
-                        summaries.append(f"{bal.formatted:.4f} {bal.symbol}")
-                summary = ", ".join(summaries) if summaries else "0"
+        failed = not bal_list or any(bal.fetch_failed for bal in bal_list)
+        if failed:
+            full = "error fetching" if not bal_list else "error"
         else:
-            summary = "error fetching"
+            holdings = [f"{bal.formatted:.4f} {bal.symbol}"
+                        for bal in bal_list if bal.formatted > 0]
+            full = ", ".join(holdings) if holdings else "0"
 
-        self.activity.emit(f"Balance: {format_address(address)} = {summary}", False)
+        short = self._abbreviate_balances(bal_list)
+        detail = f"Balance: {format_address(address)} = {full}"
+
+        if address in self._bulk_refresh_remaining:
+            # Part of a bulk refresh: log it, but leave the header for the
+            # single aggregate line emitted once every address has landed.
+            self._bulk_refresh_remaining.discard(address)
+            if failed:
+                self._bulk_refresh_failed += 1
+            self.activity_detail.emit(None, False, detail)
+
+            if not self._bulk_refresh_remaining:
+                self._emit_bulk_refresh_summary()
+        else:
+            self.activity_detail.emit(
+                f"Balance {format_address(address)}: {short}", False, detail)
+
+    def _emit_bulk_refresh_summary(self):
+        """One header line for a completed bulk refresh."""
+        total = len(self._wallet.addresses) if self._wallet else 0
+        failed = self._bulk_refresh_failed
+        self._bulk_refresh_failed = 0
+
+        summary = f"Balances updated ({total} address{'es' if total != 1 else ''}"
+        summary += f", {failed} failed)" if failed else ")"
+        self.activity_detail.emit(summary, bool(failed), summary)
 
     def get_wallet_list(self) -> list[AddressEntry]:
         """Get list of all address entries (for other components)."""
@@ -2614,7 +2859,7 @@ PRIMER_VAULT_ASCII = (
     f'<span style="color: {CONSOLE["border"]};">═══════════════════════════════════════</span><br>'
     f'<span style="color: {CONSOLE["muted"]};"> Agentic trading hub for RWA on Robinhood Chain</span>'
     f'  <span style="color: {CONSOLE["border"]};">│</span>'
-    f'  <span style="color: {CONSOLE["text"]};">v0.1.0</span>'
+    f'  <span style="color: {CONSOLE["text"]};">v{__version__}</span>'
     f'  <span style="color: {CONSOLE["border"]};">│</span>'
     f'<span style="color: {CONSOLE["muted"]};">localhost:4663</span><br>'
     f'<span style="color: {CONSOLE["border"]};">═══════════════════════════════════════</span><br>'

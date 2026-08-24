@@ -5,6 +5,7 @@ Defines reusable spending rules that can be attached to agents.
 Supports two lanes: x402 payments and trading (swaps).
 """
 
+import math
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, field
@@ -24,8 +25,17 @@ class TradingRules:
     per_trade_max_usd: float = 100.0                # Max notional per swap ($)
     daily_volume_limit_usd: float = 500.0           # Max total volume per day ($)
     auto_approve_below_usd: Optional[float] = None  # None = manual approval for all
-    min_reserve_eth: float = 0.0001                 # Keep this much ETH for gas (0 = no reserve)
+    min_reserve_eth: float = 0.0001                 # Halt trading below this ETH balance (0 = no floor)
     max_slippage_percent: float = 3.0               # Reject if slippage > this %
+    #: Most a trade may pay away in price impact plus fee.
+    #:
+    #: Set by the user only. The agent chooses which pool to trade through, so
+    #: this is the user's ceiling on how bad that choice may be; letting the
+    #: agent propose it would remove the protection it exists to provide.
+    #:
+    #: Must clear the fee of the tiers in use - a 1% pool starts at 1% before
+    #: anything is wrong with it.
+    max_price_impact_percent: float = 5.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON storage."""
@@ -58,6 +68,26 @@ class TradingRules:
         if not isinstance(max_slippage, (int, float)) or max_slippage < 0:
             raise ValueError(f"max_slippage_percent must be non-negative number, got {max_slippage}")
 
+        # Absent in policies written before this rule existed; the default
+        # applies rather than leaving the trade unchecked.
+        max_impact = data.get("max_price_impact_percent", 5.0)
+        if not isinstance(max_impact, (int, float)) or max_impact < 0:
+            raise ValueError(
+                f"max_price_impact_percent must be non-negative number, got {max_impact}")
+
+        # A non-finite limit passes the >= 0 checks above but makes every
+        # comparison against it False, disabling the cap. Reject it.
+        for _n, _v in (("per_trade_max_usd", per_trade_max),
+                       ("daily_volume_limit_usd", daily_volume),
+                       ("min_reserve_eth", min_reserve),
+                       ("max_slippage_percent", max_slippage),
+                       ("max_price_impact_percent", max_impact)):
+            if not math.isfinite(_v):
+                raise ValueError(f"{_n} must be a finite number, got {_v}")
+        if auto_approve is not None and not math.isfinite(auto_approve):
+            raise ValueError(
+                f"auto_approve_below_usd must be finite, got {auto_approve}")
+
         return cls(
             enabled=enabled,
             per_trade_max_usd=float(per_trade_max),
@@ -65,6 +95,7 @@ class TradingRules:
             auto_approve_below_usd=float(auto_approve) if auto_approve is not None else None,
             min_reserve_eth=float(min_reserve),
             max_slippage_percent=float(max_slippage),
+            max_price_impact_percent=float(max_impact),
         )
 
     def format_per_trade_max(self) -> str:
@@ -91,6 +122,10 @@ class TradingRules:
         """Format max slippage for display."""
         return f"{self.max_slippage_percent:.1f}%"
 
+    def format_max_price_impact(self) -> str:
+        """Format the price impact ceiling for display."""
+        return f"{self.max_price_impact_percent:.1f}%"
+
 
 @dataclass
 class SpendPolicy:
@@ -100,6 +135,18 @@ class SpendPolicy:
     Supports two lanes:
     - x402 payments: controlled by x402_enabled + daily_limit_micro, per_request_max_micro, etc.
     - Trading (swaps): controlled by trading_rules (optional)
+
+    Reading the limits: all three treat 0 the same way - a limit of zero, which
+    refuses everything. What differs is whether "no limit" can be said at all.
+    per_request_max_micro and auto_approve_below_micro can say it, with None;
+    daily_limit_micro cannot, because every policy bounds the day, and a large
+    allowance is spelled as a large number.
+
+    So a check against these fields is either `is not None` (where None is
+    meaningful) or unconditional (where it is not). Never truthiness:
+    `if policy.daily_limit_micro:` reads correctly and silently means the
+    opposite, because 0 is falsy - which is exactly how a policy set to $0.00
+    came to permit unlimited spending.
     """
     id: str
     name: str
@@ -129,11 +176,33 @@ class SpendPolicy:
         trading_rules: Optional[TradingRules] = None,
         x402_enabled: bool = True
     ) -> "SpendPolicy":
-        """Create a new spend policy."""
+        """Create a new spend policy.
+
+        Validated to the same rules `from_dict` applies on the way back in, so a
+        policy that can be created is always a policy that can be read again. A
+        value accepted here but rejected there would be unreadable only after it
+        had already reached disk, which is the worst moment to find out.
+
+        Raises:
+            ValueError: if a limit is not a non-negative integer.
+        """
+        if not isinstance(daily_limit_micro, int) or isinstance(daily_limit_micro, bool) \
+                or daily_limit_micro < 0:
+            raise ValueError(
+                f"daily_limit_micro must be a non-negative integer, got "
+                f"{daily_limit_micro!r}")
+        for field_name, value in (("per_request_max_micro", per_request_max_micro),
+                                  ("auto_approve_below_micro", auto_approve_below_micro)):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"{field_name} must be a non-negative integer or None, got {value!r}")
+
         return cls(
             id=str(uuid.uuid4()),
             name=name,
-            networks=networks,
+            networks=list(networks) if networks else [],
             daily_limit_micro=daily_limit_micro,
             per_request_max_micro=per_request_max_micro,
             auto_approve_below_micro=auto_approve_below_micro,
@@ -153,6 +222,12 @@ class SpendPolicy:
     @classmethod
     def from_dict(cls, data: dict) -> "SpendPolicy":
         """Create from dictionary with input validation."""
+        # Work on a copy: this method pops fields and defaults `networks`. If it
+        # raises on a bad record, the store keeps the caller's dict verbatim as
+        # the "unreadable, still repairable" copy - mutating it would strip
+        # trading_rules and x402_enabled from that copy, and x402 would then
+        # default back to enabled on the next load.
+        data = dict(data)
         # Validate numeric fields are non-negative
         daily_limit = data.get("daily_limit_micro", 0)
         if not isinstance(daily_limit, int) or daily_limit < 0:

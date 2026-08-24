@@ -8,7 +8,7 @@ import os
 import pytest
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -144,10 +144,8 @@ class TestHandleInputRequestWithContext:
         assert inputs == {"password": "testpass", "value": "testpass"}
 
     def test_no_context_falls_back_to_interactive(self):
-        """Without context, would prompt interactively (mocked)."""
-        result = CommandResult.need_input("confirm", "Type YES:")
-        # Without context, it would call input() - we just verify it doesn't crash
-        # Full interactive test would need mocking input()
+        """With no script context there is no value to auto-supply."""
+        CommandResult.need_input("confirm", "Type YES:")
         ctx = ScriptContext()  # No auto_confirm
         assert ctx.get_input_for("confirm") is None
 
@@ -163,11 +161,6 @@ class TestScriptableIntegration:
         (data_dir / "wallets").mkdir()
         return data_dir
 
-    @pytest.fixture
-    def core(self, temp_data_dir):
-        """Create a Core instance with temp directory."""
-        from primer_vault.core import Vault
-        return Vault(data_dir=temp_data_dir)
 
     @pytest.fixture
     def handler(self, core):

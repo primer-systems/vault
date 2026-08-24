@@ -23,16 +23,6 @@ def temp_data_dir(tmp_path):
     return data_dir
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Core instance with temp directory and unlocked wallet."""
-    from primer_vault.core import Vault
-    core = Vault(data_dir=temp_data_dir)
-    # Create and unlock a wallet for agent operations
-    wallet_path = str(temp_data_dir / "wallets" / "test.wallet")
-    core.create_wallet(wallet_path, "testpass")
-    core.load_wallet(wallet_path, "testpass")
-    return core
 
 
 @pytest.fixture
@@ -83,6 +73,114 @@ class TestBasicCommands:
         result = handler.execute("")
         assert result.success
         assert result.output == ""
+
+
+class TestMandatePublishing:
+    """Publishing a mandate is not finished when the upload returns.
+
+    The registry files the mandate under an id and hands it back, and that id has
+    to be stored on the agent - it is what `/mandate` reports as
+    `mandate_registry_id`, and what an agent gives a merchant who wants to verify
+    the authorization. Uploading without recording it leaves the field null
+    forever while every visible sign says the upload worked.
+
+    The window path always did this. The command path did not, so an agent
+    commissioned from a terminal could never be verified.
+    """
+
+    def _an_address(self, core):
+        """A real address in the wallet - `agent commission` will not accept one
+        the wallet does not hold."""
+        from eth_account.hdaccount import generate_mnemonic
+
+        seed = core.add_seed(generate_mnemonic(num_words=12, lang="english"))
+        entry = core.add_address_from_seed(seed["seed_id"], 0, "Primary")
+        return entry["address"]
+
+    def _agent_with_a_policy(self, core, name="pubbot"):
+        agent, _ = core.create_agent(name=name, auth_mode="bearer")
+        policy = core.create_policy(name="pub-" + name, daily_limit_micro=100_000_000)
+        core.commission_agent(
+            agent_code=agent.code, policy_id=policy.id,
+            wallet_address=self._an_address(core))
+        return core.get_agent_by_code(agent.code)
+
+    def _registry(self, monkeypatch, *, ok=True):
+        """Stand in for the AP2 registry, and record what was sent to it."""
+        from primer_vault.commands import agent as agent_cmd
+
+        posted = []
+
+        class Response:
+            status_code = 201 if ok else 500
+
+            def json(self):
+                return {"id": "reg-9f3c"}
+
+        def post(url, json=None, headers=None, timeout=None):
+            posted.append(json)
+            return Response()
+
+        monkeypatch.setattr(agent_cmd._requests, "post", post)
+        return posted
+
+    def test_the_registry_id_is_stored_on_the_agent(self, core, handler, monkeypatch):
+        self._registry(monkeypatch)
+        agent = self._agent_with_a_policy(core)
+
+        result = handler.execute(f"agent mandate {agent.name} --upload")
+        assert result.success, result.output
+
+        stored = core.get_agent_by_code(agent.code).intent_mandate
+        assert stored["registryId"] == "reg-9f3c"
+        assert stored["registryUrl"].endswith("id=reg-9f3c")
+
+    def test_the_id_reaches_the_field_agents_read(self, core, handler, monkeypatch):
+        """`/mandate` reports it as mandate_registry_id. That is the whole point
+        of storing it, so assert the value at the end of the journey."""
+        self._registry(monkeypatch)
+        agent = self._agent_with_a_policy(core)
+        handler.execute(f"agent mandate {agent.name} --upload")
+
+        stored = core.get_agent_by_code(agent.code).intent_mandate
+        assert stored.get("registryId") == "reg-9f3c"
+
+    def test_commissioning_with_upload_stores_it_too(self, core, handler, monkeypatch):
+        """The other command that publishes. Both go through one helper, so
+        this guards against them drifting apart."""
+        self._registry(monkeypatch)
+        agent, _ = core.create_agent(name="combot", auth_mode="bearer")
+        policy = core.create_policy(name="com", daily_limit_micro=100_000_000)
+        address = self._an_address(core)
+
+        result = handler.execute(
+            f"agent commission {agent.name} {policy.name} {address} "
+            f"--mandate --upload")
+        assert result.success, result.output
+
+        stored = core.get_agent_by_code(agent.code).intent_mandate
+        assert stored["registryId"] == "reg-9f3c"
+
+    def test_nothing_is_stamped_when_the_upload_fails(self, core, handler, monkeypatch):
+        """A mandate that was never published must not claim a registry id."""
+        self._registry(monkeypatch, ok=False)
+        agent = self._agent_with_a_policy(core)
+
+        handler.execute(f"agent mandate {agent.name} --upload")
+
+        stored = core.get_agent_by_code(agent.code).intent_mandate
+        assert stored is not None, "the mandate itself is still generated"
+        assert "registryId" not in stored
+
+    def test_generating_without_upload_stores_no_registry_id(self, core, handler,
+                                                             monkeypatch):
+        self._registry(monkeypatch)
+        agent = self._agent_with_a_policy(core)
+
+        handler.execute(f"agent mandate {agent.name}")
+
+        stored = core.get_agent_by_code(agent.code).intent_mandate
+        assert "registryId" not in stored
 
 
 class TestAgentCommands:

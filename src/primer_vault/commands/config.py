@@ -2,8 +2,9 @@
 Config commands - CLI interface for settings management.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
+from ..core.settings import ADMIN_API_MODE_GUI_ONLY, ADMIN_API_MODE_OPEN
 from .result import CommandResult
 from ..networks import NETWORKS
 
@@ -31,7 +32,9 @@ class ConfigCommands:
         subcmd = args[0].lower()
         subargs = args[1:]
 
-        if subcmd == "show":
+        if subcmd in ("--help", "-h", "help"):
+            return self._cmd_help()
+        elif subcmd == "show":
             return self._cmd_show(subargs)
         elif subcmd == "set":
             return self._cmd_set(subargs)
@@ -39,6 +42,28 @@ class ConfigCommands:
             return self._cmd_get(subargs)
         else:
             return CommandResult.fail(f"Unknown config command: {subcmd}")
+
+    def _cmd_help(self) -> CommandResult:
+        """Help for the config command."""
+        return CommandResult.ok(
+            "config - View and change Vault settings\n\n"
+            "Usage:\n"
+            "  config show                 Show all settings\n"
+            "  config get <setting>        Read one setting\n"
+            "  config set <setting> <val>  Change one setting\n\n"
+            "Settings:\n"
+            "  admin-api           open | gui-only  (who may drive a running instance)\n"
+            "  verify-settlements  on | off\n"
+            "  replay-window       seconds\n"
+            "  default-port        agent API port\n"
+            "  allow-lan           on | off  (expose the agent API on the LAN)\n"
+            "  rate-limit          requests per minute\n"
+            "  default-network     chain id\n"
+            "  network <id>        on | off\n"
+            "  rpc <id> <url|default>  set a chain's RPC endpoint, or 'default' to clear\n\n"
+            "Examples:\n"
+            "  config set admin-api open\n"
+            "  config get admin-api")
 
     def _cmd_show(self, args: list[str]) -> CommandResult:
         """Show current settings."""
@@ -65,6 +90,16 @@ class ConfigCommands:
         lines.append("Server:")
         lines.append(f"  default-port: {settings.server.default_port}")
         lines.append(f"  allow-lan: {'on' if settings.server.allow_lan else 'off'}")
+        limit = settings.server.rate_limit_per_minute
+        lines.append(f"  rate-limit: {limit if limit else 'unlimited'}"
+                     f"{' req/min' if limit else ''}")
+
+        lines.append("")
+        lines.append("Security:")
+        mode = settings.security.admin_api_mode
+        lines.append(f"  admin-api: {mode}")
+        if mode == ADMIN_API_MODE_OPEN:
+            lines.append("    any local process can drive the Admin API")
 
         lines.append("")
         lines.append("Display:")
@@ -89,6 +124,9 @@ class ConfigCommands:
         setting = args[0].lower()
         settings = self.core.settings_manager
 
+        if setting == "admin-api":
+            return CommandResult.ok(f"admin-api: {settings.get_admin_api_mode()}")
+
         if setting == "verify-settlements":
             value = "on" if settings.get_verify_settlements() else "off"
             return CommandResult.ok(f"verify-settlements: {value}")
@@ -104,6 +142,11 @@ class ConfigCommands:
         elif setting == "allow-lan":
             value = "on" if settings.get_allow_lan() else "off"
             return CommandResult.ok(f"allow-lan: {value}")
+
+        elif setting == "rate-limit":
+            limit = settings.get_rate_limit()
+            return CommandResult.ok(
+                f"rate-limit: {limit} req/min" if limit else "rate-limit: unlimited")
 
         elif setting == "default-network":
             value = settings.get_default_network()
@@ -152,7 +195,8 @@ class ConfigCommands:
                 "  default-port <port>          - Set default server port\n"
                 "  allow-lan on|off             - Allow LAN connections\n"
                 "  default-network <chain_id>   - Set default network for display\n"
-                "  rpc <chain_id> <url|default> - Set custom RPC endpoint"
+                "  rpc <chain_id> <url|default> - Set custom RPC endpoint\n"
+                "  admin-api open|gui-only      - Who may drive the Admin API"
             )
 
         setting = args[0].lower()
@@ -216,6 +260,20 @@ class ConfigCommands:
             except ValueError:
                 return CommandResult.fail("Value must be a port number")
 
+        elif setting == "rate-limit":
+            # Reachable without a screen on purpose: the ceiling matters most on
+            # a headless box, which is the one most likely to be exposed.
+            try:
+                per_minute = int(value)
+            except ValueError:
+                return CommandResult.fail("Value must be a number of requests per minute")
+            if per_minute < 0:
+                return CommandResult.fail("Value must be 0 or more (0 = no limit)")
+            settings.set_rate_limit(per_minute)
+            return CommandResult.ok(
+                f"Agent API rate limit set to {per_minute} req/min" if per_minute
+                else "Agent API rate limit removed")
+
         elif setting == "allow-lan":
             if value.lower() in ("on", "true", "1", "yes"):
                 settings.set_allow_lan(True)
@@ -225,6 +283,27 @@ class ConfigCommands:
                 return CommandResult.ok("LAN connections disabled")
             else:
                 return CommandResult.fail("Value must be 'on' or 'off'")
+
+        elif setting == "admin-api":
+            # Deliberately opt-in, and deliberately reachable without a screen.
+            # The point of the default was that opening this port is a conscious
+            # act, not that the act happens in the GUI - and on a headless box
+            # the GUI is not somewhere the operator can go.
+            choice = value.lower().replace("_", "-")
+            if choice == "open":
+                settings.set_admin_api_mode(ADMIN_API_MODE_OPEN)
+                return CommandResult.ok(
+                    "Admin API opened to local processes.\n\n"
+                    "Any program running as you can now create agents, read wallet\n"
+                    "addresses and approve requests through port "
+                    "4664. "
+                    "Only do this on a machine you trust.")
+            elif choice in ("gui-only", "guionly"):
+                settings.set_admin_api_mode(ADMIN_API_MODE_GUI_ONLY)
+                return CommandResult.ok(
+                    "Admin API restricted to the Vault window (the default).")
+            else:
+                return CommandResult.fail("Value must be 'open' or 'gui-only'")
 
         elif setting == "default-network":
             try:

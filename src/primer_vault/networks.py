@@ -12,9 +12,10 @@ import json
 import logging
 import urllib.request
 import urllib.error
-from pathlib import Path
 
 from web3 import Web3
+
+from .version import USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +183,8 @@ class DexConfig:
 DEX = {
     4663: DexConfig(
         factory="0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
-        quoter_v2="0x33e885ed0Ec9bF04eCFB19341582aadcB4c8a9E7",
-        swap_router="0xcaf681a66d020601342297493863e78C959e5cb2",
+        quoter_v2="0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7",
+        swap_router="0xCaf681a66D020601342297493863E78C959E5cb2",
         weth="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
     ),
 }
@@ -201,8 +202,12 @@ class DexConfigV4:
     V4 uses a singleton PoolManager architecture. Pools are identified by PoolKey:
     (currency0, currency1, fee, tickSpacing, hooks).
 
-    RHC (chain 4663) has a modified UniversalRouter with an extra `minHopPriceX36`
-    field in swap structs - standard Uniswap SDK calldata will REVERT.
+    RHC (chain 4663) has a modified UniversalRouter: its
+    `IV4Router.ExactInputSingleParams` carries an extra `uint256 minHopPriceX36`
+    between `amountOutMinimum` and `hookData`, so standard Uniswap SDK swap
+    calldata will REVERT. Confirmed against the router's verified source on
+    Blockscout. The quoter, StateView, PoolManager and Permit2 are all stock
+    Uniswap - only the router differs. See services/dex_v4.py.
 
     Addresses from: https://github.com/Uniswap/contracts/blob/main/deployments/4663.md
     """
@@ -217,12 +222,12 @@ class DexConfigV4:
 
 DEX_V4 = {
     4663: DexConfigV4(
-        pool_manager="0x8366a39cc670b4001a1121b8f6a443a643e40951",
-        position_manager="0x58daec3116aae6d93017baaea7749052e8a04fa7",
-        state_view="0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
-        quoter="0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
-        universal_router="0x8876789976decbfcbbbe364623c63652db8c0904",
-        permit2="0x000000000022d473030f116ddee9f6b43ac78ba3",
+        pool_manager="0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        position_manager="0x58daec3116aae6D93017bAAea7749052E8a04fA7",
+        state_view="0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
+        quoter="0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
+        universal_router="0x8876789976dEcBfCbBbe364623C63652db8C0904",
+        permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
         weth="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
     ),
 }
@@ -231,21 +236,6 @@ DEX_V4 = {
 def get_dex_v4(chain_id: int) -> Optional[DexConfigV4]:
     """Return the Uniswap v4 deployment for a chain, or None if unsupported."""
     return DEX_V4.get(chain_id)
-
-
-# Minimal ERC-20 ABI for transfers (used by SendDialog)
-ERC20_ABI = [
-    {
-        "constant": False,
-        "inputs": [
-            {"name": "_to", "type": "address"},
-            {"name": "_value", "type": "uint256"}
-        ],
-        "name": "transfer",
-        "outputs": [{"name": "", "type": "bool"}],
-        "type": "function"
-    },
-]
 
 
 # ============================================
@@ -285,19 +275,25 @@ class BlockscoutClient:
         url = f"{self.api_base}{endpoint}"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": "PrimerVault/1.0", "Accept": "application/json"}
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            logger.warning(f"Blockscout API error {e.code}: {url}")
+            # Debug, not warning: Robinhood Chain's Blockscout answers 500 for an
+            # address with no on-chain history - the normal state of a wallet you
+            # just made - so the very first balance check of every new wallet
+            # would otherwise print what reads as an error. The caller handles the
+            # failure and shows the balance (or a contained "connection failed"),
+            # so this line is for diagnostics, not the user.
+            logger.debug(f"Blockscout API error {e.code}: {url}")
             raise
         except urllib.error.URLError as e:
-            logger.warning(f"Blockscout connection error: {e.reason}")
+            logger.debug(f"Blockscout connection error: {e.reason}")
             raise
         except json.JSONDecodeError as e:
-            logger.warning(f"Blockscout JSON parse error: {e}")
+            logger.debug(f"Blockscout JSON parse error: {e}")
             raise
 
     def get_native_balance(self, address: str) -> Balance:

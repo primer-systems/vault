@@ -20,75 +20,6 @@ You have access to the Vault payment authorization system. The Vault URL is prov
 
 When you encounter an HTTP 402 Payment Required response from any x402-enabled API, you can request payment authorization through Vault. The user will approve or deny the payment in their Vault desktop app. Your spending is controlled by the user's pay policies.
 
-## Discovering x402 Services
-
-Before making paid requests, you can discover available x402 services on **Agentic.Market**, the public marketplace operated by Coinbase. Nearly 500 services are listed across categories like Inference, Data, Search, Media, Social, Trading, and Infra — all payable per-request in USDC on Base with no API keys or accounts needed.
-
-### Search for services
-
-```bash
-# List all services (returns JSON with id, name, description, category, endpoints, pricing)
-curl https://api.agentic.market/v1/services?limit=500
-
-# Search by keyword
-curl "https://api.agentic.market/v1/services/search?q=weather"
-```
-
-### Response structure
-
-Each service has:
-- `name`, `description`, `category`, `domain`, `provider`
-- `networks` — typically `["Base"]`
-- `endpoints[]` — each with `url`, `method`, `description`, and `pricing.amount` (USDC)
-
-### Example: find and use a service
-
-```python
-import json, urllib.request
-
-# 1. Search for web search services
-url = "https://api.agentic.market/v1/services/search?q=web+search"
-data = json.loads(urllib.request.urlopen(url).read())
-
-for svc in data.get("services", []):
-    for ep in svc.get("endpoints", []):
-        price = ep.get("pricing", {}).get("amount", "?")
-        print(f"{svc['name']}: {ep['method']} {ep['url']} — ${price} USDC")
-
-# 2. Pick an endpoint and call it — you'll get HTTP 402
-# 3. Forward the Payment-Required header to Vault /sign (see below)
-# 4. Retry with the signed payment header
-```
-
-### Budget-aware discovery
-
-Combine marketplace search with your Vault mandate to filter services you can actually afford:
-
-```python
-# Get your spending limits from Vault
-mandate = fetch_mandate()  # POST /mandate (see below)
-remaining = mandate.get("remaining_today_micro", 0)
-per_req_max = mandate.get("policy", {}).get("per_request_max_micro")
-
-# Filter marketplace results by budget
-for svc in marketplace_results:
-    for ep in svc["endpoints"]:
-        cost_micro = int(float(ep["pricing"]["amount"]) * 1_000_000)
-        if per_req_max and cost_micro > per_req_max:
-            continue  # Exceeds per-request policy
-        if cost_micro > remaining:
-            continue  # Would blow daily budget
-        # This endpoint is within your limits — safe to call
-```
-
-### Other discovery resources
-
-- **Browse the marketplace**: https://agentic.market
-- **LLM-optimized summary**: `GET https://agentic.market/llms.txt`
-- **Full catalog as markdown**: `GET https://agentic.market/api/markdown`
-
----
-
 ## Step 1: Check Your Authentication Mode
 
 **Check your `PRIMER_VAULT_AUTH_MODE` environment variable.** Your config explicitly tells you which mode to use:
@@ -167,7 +98,7 @@ When you get an HTTP 402, you only need **one thing**: the `Payment-Required` he
 
 ```
 HTTP/1.1 402 Payment Required
-Payment-Required: eyJhY2NlcHRzIjpbeyJuZXR3b3JrIjoiYmFzZSIsLi4ufV19
+Payment-Required: eyJhY2NlcHRzIjpbeyJuZXR3b3JrIjoiZWlwMTU1OjQ2NjMiLC4uLn1dfQ==
 Content-Type: application/json
 
 {"error": "Payment required"}
@@ -329,7 +260,7 @@ result1_retry = sign_request(payment_required, idempotency_key="weather-query-1"
 ```json
 {
   "status": "error",
-  "id": "PAYMENT_ALREADY_SETTLED",
+  "code": "PAYMENT_ALREADY_SETTLED",
   "error": "This payment was already settled on-chain. Use idempotency_key for a fresh payment.",
   "previous_transaction_id": "abc123...",
   "hint": "Add 'idempotency_key': 'unique-string' to your request"
@@ -403,16 +334,35 @@ if result.get("status") == "pending":
 
 To retry a failed/interrupted request, resubmit the **exact same signed payload** you saved earlier. Don't call `sign_for_primer_vault()` again—that generates a new timestamp and signature, which Vault treats as a new purchase.
 
-**If denied** (status 400):
+**If refused**, the response is an error with a machine-readable `code`:
 ```json
 {
   "status": "error",
-  "error": "Exceeds daily limit",
-  "id": "EXCEEDS_DAILY_LIMIT"
+  "error": "Would exceed daily limit",
+  "code": "EXCEEDS_DAILY_LIMIT"
 }
 ```
 
-Inform the user that the payment was not authorized.
+## Error Codes
+
+The HTTP status tells you what to do: **400** fix your request, **401** fix
+authentication, **403** refused by policy — retrying unchanged cannot succeed,
+**409** stale — start a fresh request, **429** a limit that clears by itself —
+wait, **5xx** Vault-side problem — the request was fine, retry later.
+
+Codes where the right move isn't obvious:
+
+| Code | What to do |
+|------|-----------|
+| `WALLET_LOCKED` (503) | The user must unlock the wallet in the Vault app. Tell them, then retry; don't hammer |
+| `EXCEEDS_PER_REQUEST_MAX` (403) | Over the per-payment cap on every retry. Never resend as-is |
+| `EXCEEDS_DAILY_LIMIT` (429) | Daily budget used up; resets at the start of the calendar day. Inform the user |
+| `TOO_MANY_PENDING` (429) | Requests already await the user's approval. Wait for those; don't submit more |
+| `PAYMENT_ALREADY_SETTLED` (409) | This payment happened. Add a unique `idempotency_key` for a fresh one |
+| `REQUEST_EXPIRED` (409) | The approval window closed before the user acted. Submit a new request |
+| `DOMAIN_NOT_ALLOWED` / `X402_DISABLED` (403) | The policy forbids this payee/feature. Only the user can change that |
+| `AUTH_FAILED` (401) | Check the token, the exact signed-message shape, and clock skew |
+| `ALREADY_SIGNED` (on 200) | Not an error: the payment was signed earlier; the header is no longer cached |
 
 ## Endpoints Reference
 
@@ -521,7 +471,7 @@ per_request_max = limits.get("policy", {}).get("per_request_max_micro")
 
 # When comparing x402 options, skip ones that exceed your limits
 for option in x402_options:
-    cost = int(option["amount"])  # atomic units (6-decimal USDC)
+    cost = int(option["amount"])  # atomic units (6-decimal USDG)
     if per_request_max and cost > per_request_max:
         continue  # Would be rejected anyway
     if cost > remaining:
@@ -543,12 +493,25 @@ Content-Type: application/json
 
 {
   "agent_id": "${PRIMER_VAULT_AGENT_ID}",
+  "signature": "SIG:<timestamp>:<hmac>",
   "transaction_id": "<from sign response>",
   "event": "submitted" | "settled" | "failed",
   "tx_hash": "0x...",
   "error": "..."
 }
 ```
+
+The callback is authenticated like every other request: it writes the payment
+record, so Vault has to know it came from you. Sign over:
+
+```json
+{"agent_id": "...", "timestamp": 1707408000,
+ "callback": {"transaction_id": "...", "event": "settled", "tx_hash": "0x..."}}
+```
+
+serialised with sorted keys and no spaces, HMAC-SHA256 with your token. Bearer
+agents send their token as `signature` instead. `sign_callback()` in the helper
+script at `GET /sign/helper` builds this for you.
 
 Events:
 - `submitted`: Payment header sent to target API

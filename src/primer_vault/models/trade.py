@@ -14,7 +14,8 @@ This module is pure data (Qt-free), usable from the GUI, CLI, and headless daemo
 
 import re
 import uuid
-from dataclasses import dataclass, asdict, field
+from decimal import Decimal, InvalidOperation
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,6 +27,14 @@ _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 # V4 allows any uint24 value, so this is only enforced for V3.
 _VALID_V3_FEE_TIERS = (0, 100, 500, 3000, 10000)
 MAX_SLIPPAGE_BPS = 5000  # 50% — hard ceiling on what a request may even ask for
+
+# Largest amount_in a request may name, in human units.
+#
+# Not a policy limit - the policy caps value in dollars, which is the meaningful
+# ceiling. This only keeps absurd values out of the arithmetic: scaled by 18
+# decimals, 1e30 is still far inside a uint256, so nothing downstream has to cope
+# with a number the chain could not represent.
+MAX_AMOUNT_IN = Decimal("1e30")
 MAX_FEE_TIER = 1_000_000  # V4 allows any uint24, but cap at 100% for sanity
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
@@ -54,7 +63,10 @@ class TradeRequest:
     fee_tier: int            # V3: 100/500/3000/10000; V4: any uint24
     max_slippage_bps: int
     created_at: str
-    recipient: Optional[str] = None   # defaults to the agent's wallet at execution
+    # The address the trade is executed from and delivered to. Set by the
+    # service from the agent's commissioned address - never read from the
+    # request body, so an agent cannot name a different address.
+    wallet_address: Optional[str] = None
     deadline: Optional[int] = None    # unix seconds; None → engine default
     status: str = "pending"
     # V4-specific fields (presence implies V4 if dex_version not set)
@@ -65,7 +77,7 @@ class TradeRequest:
     @classmethod
     def create(cls, agent_id: str, token_in: str, token_out: str, amount_in: str,
                fee_tier: int, max_slippage_bps: int, chain_id: int = 4663,
-               recipient: Optional[str] = None, deadline: Optional[int] = None,
+               wallet_address: Optional[str] = None, deadline: Optional[int] = None,
                dex_version: Optional[str] = None, tick_spacing: Optional[int] = None,
                hooks: Optional[str] = None) -> "TradeRequest":
         return cls(
@@ -78,7 +90,7 @@ class TradeRequest:
             fee_tier=fee_tier,
             max_slippage_bps=max_slippage_bps,
             created_at=datetime.now(timezone.utc).isoformat(),
-            recipient=recipient,
+            wallet_address=wallet_address,
             deadline=deadline,
             dex_version=dex_version,
             tick_spacing=tick_spacing,
@@ -110,8 +122,8 @@ class TradeRequest:
         token_out_norm = ETH_ADDRESS if is_native_eth(self.token_out) else self.token_out.lower()
         if token_in_norm == token_out_norm:
             return False, "token_in and token_out are the same"
-        if self.recipient is not None and not is_address(self.recipient):
-            return False, f"recipient is not a valid address: {self.recipient}"
+        if self.wallet_address is not None and not is_address(self.wallet_address):
+            return False, f"wallet_address is not a valid address: {self.wallet_address}"
 
         # Validate dex_version if specified
         if self.dex_version is not None:
@@ -145,12 +157,27 @@ class TradeRequest:
             if self.fee_tier not in _VALID_V3_FEE_TIERS:
                 return False, f"fee_tier must be one of {_VALID_V3_FEE_TIERS}, got {self.fee_tier}"
 
+        # No whitespace: Decimal() ignores surrounding whitespace, so "1.5\n\n\n"
+        # parses as 1.5 - and that padding is then printed verbatim into the
+        # approval dialog, pushing the terms (and the "limits not checked"
+        # warning) off screen. A real amount carries none.
+        if any(c.isspace() for c in str(self.amount_in)):
+            return False, f"amount_in must not contain whitespace: {self.amount_in!r}"
+
+        # Decimal, not float: float() accepts "inf" and "nan", and both then pass
+        # a "> 0" test. Infinity reached the atomic conversion and raised an error
+        # the request handler does not catch, so it escaped as a crash rather than
+        # a refusal.
         try:
-            amt = float(self.amount_in)
-        except (TypeError, ValueError):
+            amt = Decimal(str(self.amount_in))
+        except (TypeError, ValueError, InvalidOperation):
             return False, f"amount_in is not a number: {self.amount_in}"
+        if not amt.is_finite():
+            return False, f"amount_in must be a finite number: {self.amount_in}"
         if amt <= 0:
             return False, "amount_in must be positive"
+        if amt > MAX_AMOUNT_IN:
+            return False, f"amount_in is implausibly large: {self.amount_in}"
         if not isinstance(self.max_slippage_bps, int) or self.max_slippage_bps < 0:
             return False, "max_slippage_bps must be a non-negative integer"
         if self.max_slippage_bps > MAX_SLIPPAGE_BPS:
@@ -162,17 +189,31 @@ class TradeRequest:
 
     @classmethod
     def from_dict(cls, data: dict) -> "TradeRequest":
+        """Build a request from an agent's payload.
+
+        `agent_id` and `wallet_address` are deliberately absent here: they are
+        facts about the caller that the service already knows from authenticating
+        it, and reading them from the body is what let an agent trade as someone
+        else, from an address it was never commissioned for.
+        """
+        # Name the missing field, so an agent gets "missing required field:
+        # max_slippage_bps" rather than a bare KeyError repr of the key.
+        required = ("token_in", "token_out", "amount_in", "fee_tier",
+                    "max_slippage_bps")
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise ValueError(
+                f"missing required field(s): {', '.join(missing)}")
         return cls(
-            id=data.get("id") or str(uuid.uuid4()),
-            agent_id=data["agent_id"],
+            id=str(uuid.uuid4()),
+            agent_id="",
             chain_id=int(data.get("chain_id", 4663)),
             token_in=data["token_in"],
             token_out=data["token_out"],
             amount_in=str(data["amount_in"]),
             fee_tier=int(data["fee_tier"]),
             max_slippage_bps=int(data["max_slippage_bps"]),
-            created_at=data.get("created_at") or datetime.now(timezone.utc).isoformat(),
-            recipient=data.get("recipient"),
+            created_at=datetime.now(timezone.utc).isoformat(),
             deadline=data.get("deadline"),
             dex_version=data.get("dex_version"),
             tick_spacing=int(data["tick_spacing"]) if data.get("tick_spacing") is not None else None,
@@ -195,6 +236,15 @@ class TradeQuote:
     effective_slippage_bps: int
     gas_estimate: int
     notional_usdg: Optional[float] = None # trade size valued in USDG, if priceable
+    #: How much worse this fill is than the pool's own rate, plus the fee, as a
+    #: percentage. Quote a dust amount to learn the rate without moving the
+    #: price, compare the real fill against it, and add the tier's fee.
+    #:
+    #: One number for "how bad is this trade", covering a pool too thin for the
+    #: size, a fee tier nobody uses, and a token whose only market is broken.
+    #:
+    #: None when it could not be measured. That is unknown, not fine.
+    price_impact_pct: Optional[float] = None
     symbol_in: Optional[str] = None       # token symbol for display
     symbol_out: Optional[str] = None      # token symbol for display
     dex_version: str = "v3"               # "v3" or "v4"
@@ -213,8 +263,15 @@ class TradeResult:
     status: str                   # executed | rejected | pending | simulated | failed
     reason: Optional[str] = None
     tx_hash: Optional[str] = None
+    #: What the swap actually delivered, read from the receipt. None means the
+    #: fill could not be read - never the quote standing in for it.
     amount_out: Optional[int] = None
+    #: What the quote predicted, kept alongside so the two can be compared.
+    amount_out_quoted: Optional[int] = None
     quote: Optional[TradeQuote] = None
+    #: Stable identifier for the failure, so a caller can branch on something
+    #: other than the wording of `reason`. Absent on success.
+    code: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)

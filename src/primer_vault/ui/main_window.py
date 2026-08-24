@@ -10,14 +10,12 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon, QStyle, QApplication, QDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal, QPoint
-from PyQt6.QtGui import QAction, QIcon, QFont, QPixmap, QMouseEvent
-from typing import Optional, TYPE_CHECKING
+from PyQt6.QtGui import QIcon, QFont, QPixmap, QMouseEvent
+from typing import Optional, Dict, Any, TYPE_CHECKING
+import queue
 from datetime import datetime
 
-from .theme import (
-    Theme, set_role, build_qss, LIGHT, DARK, FramelessDialog, FramelessMessageBox,
-    active, set_active, colored_span, refresh_theme_tree,
-)
+from .theme import Theme, set_role, build_qss, LIGHT, DARK, FramelessDialog, FramelessMessageBox, set_active, colored_span, refresh_theme_tree
 from .tabs import (
     PoliciesTab, AgentsTab, HistoryTab, WalletTab, LogTab
 )
@@ -27,11 +25,20 @@ from .tabs import (
 from .dialogs import SettingsDialog, NetworkSettingsDialog
 from ..services import SigningRequest
 from ..version import __version__
-from ..wallet import WalletInfo
 from ..networks import format_address
 from ..utils import get_app_dir, get_assets_dir
+# The one durable writer, shared with the policy store and the core settings -
+# see write_json_atomic's docstring for what it guarantees and why.
+from ..models.store import write_json_atomic
 if TYPE_CHECKING:
     from ..core import Vault
+
+
+# Applied when gui_settings.json exists but cannot be read, in place of the
+# 0 ("never lock") that an absent file gets. A damaged preferences file must
+# not be the reason an unlocked wallet stays unlocked; short enough to protect
+# an unattended machine, long enough not to interrupt someone working.
+FALLBACK_AUTO_LOCK_MINUTES = 15
 
 
 class GUIApprovalHandler(QObject):
@@ -94,6 +101,114 @@ class GUIApprovalHandler(QObject):
             dialog = self._pending_dialogs.pop(request_id)
             if dialog.isVisible():
                 dialog.close()
+
+
+class LedgerSignHandler(QObject):
+    """
+    Handler for Ledger hardware wallet signing requests.
+
+    Bridges signing requests from the HTTP server thread to the Qt main thread.
+    Shows a dialog for user confirmation and performs signing in a background thread.
+    """
+
+    # Signal to safely cross from HTTP thread to Qt main thread
+    # Args: typed_data (dict), device_path (str), expected_address (str), result_queue (Queue)
+    _sign_requested = pyqtSignal(object, str, str, object)
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__(parent=main_window)
+        self._main_window = main_window
+        self._sign_requested.connect(self._handle_sign_request)
+
+    def request_signature(self, typed_data: Dict[str, Any], device_path: str, expected_address: str) -> str:
+        """
+        Request a signature from the Ledger device.
+
+        Called from HTTP server thread. Blocks until signature is ready or cancelled.
+
+        Args:
+            typed_data: EIP-712 typed data dict to sign
+            device_path: Derivation path on the device (e.g., "m/44'/60'/0'/0/0")
+            expected_address: Expected address to verify against
+
+        Returns:
+            Signature as hex string
+
+        Raises:
+            Exception: If signing fails or is cancelled
+        """
+        result_holder = queue.Queue()
+
+        # Emit signal to move to Qt main thread
+        self._sign_requested.emit(typed_data, device_path, expected_address, result_holder)
+
+        # Block until we get a result (runs on HTTP thread)
+        result = result_holder.get()
+
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def _handle_sign_request(self, typed_data: dict, device_path: str, expected_address: str, result_holder: queue.Queue):
+        """Handle sign request on Qt main thread."""
+        self._main_window.show_ledger_sign_dialog(typed_data, device_path, expected_address, result_holder)
+
+
+class LedgerTxSignHandler(QObject):
+    """
+    Handler for Ledger transaction signing requests (the trading path).
+
+    Same thread-bridging pattern as LedgerSignHandler, but signs a whole
+    Ethereum transaction instead of EIP-712 typed data. A single trade can
+    call this twice (ERC-20 approval, then the swap), so each request carries
+    a description telling the user which step they are confirming.
+    """
+
+    # Args: tx_dict (dict), device_path (str), expected_address (str),
+    #       description (str), result_queue (Queue)
+    _sign_requested = pyqtSignal(object, str, str, str, object)
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__(parent=main_window)
+        self._main_window = main_window
+        self._sign_requested.connect(self._handle_sign_request)
+
+    def request_signature(self, tx_dict: Dict[str, Any], device_path: str,
+                          expected_address: str, description: str) -> str:
+        """
+        Request a signed transaction from the Ledger device.
+
+        Called from the HTTP server thread. Blocks until the device responds
+        or the user cancels.
+
+        Args:
+            tx_dict: Unsigned transaction dict
+            device_path: Derivation path on the device
+            expected_address: Expected address to verify against
+            description: Human-readable summary of what is being signed
+
+        Returns:
+            Raw signed transaction hex, ready to broadcast
+
+        Raises:
+            Exception: If signing fails or is cancelled
+        """
+        result_holder = queue.Queue()
+
+        self._sign_requested.emit(
+            tx_dict, device_path, expected_address, description, result_holder)
+
+        result = result_holder.get()
+
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def _handle_sign_request(self, tx_dict: dict, device_path: str, expected_address: str,
+                             description: str, result_holder: queue.Queue):
+        """Handle sign request on Qt main thread."""
+        self._main_window.show_ledger_tx_sign_dialog(
+            tx_dict, device_path, expected_address, description, result_holder)
 
 
 class MainWindow(QMainWindow):
@@ -163,6 +278,7 @@ class MainWindow(QMainWindow):
         self.wallet_tab.wallet_unlocked.connect(self.on_wallet_unlocked)
         self.wallet_tab.wallet_path_changed.connect(self.on_wallet_path_changed)
         self.wallet_tab.activity.connect(self.update_activity)
+        self.wallet_tab.activity_detail.connect(self.on_wallet_activity_detail)
         self.wallet_tab.set_agents_query_fn(self._get_agents_for_address)
         self.history_tab = HistoryTab(self.core)
         self.log_tab = LogTab()
@@ -241,15 +357,28 @@ class MainWindow(QMainWindow):
 
         # Load and apply settings
         # GUI-specific settings (window state, paths, etc.)
+        # Set before the load, which is what raises it.
+        self._settings_unreadable = False
         self._settings = self._load_settings()
         self.apply_theme(self._settings.get("theme", "light"))
 
-        # Load auto-lock timeout
-        auto_lock_minutes = self._settings.get("auto_lock_minutes", 0)
+        # Load auto-lock timeout.
+        #
+        # 0 means never lock, and it is the right default for a file that says
+        # nothing - a fresh install has no wallet to leave open. It is the
+        # wrong one for a file that could not be read: the user may well have
+        # set a timeout, and falling back to "never" turns a damaged
+        # preferences file into an unlocked wallet. There, lock.
+        if self._settings_unreadable:
+            auto_lock_minutes = FALLBACK_AUTO_LOCK_MINUTES
+        else:
+            auto_lock_minutes = self._settings.get("auto_lock_minutes", 0)
         self.wallet_tab.set_auto_lock_timeout(auto_lock_minutes)
 
-        # Load wallet path
-        wallet_path = self._settings.get("wallet_path", "")
+        # Load wallet path from the core, which records it whenever a wallet
+        # is opened or created (wallet_path.txt) - the single copy of that
+        # fact.
+        wallet_path = self.core.get_wallet_path()
         if wallet_path:
             self.wallet_tab.set_wallet_path(wallet_path)
 
@@ -286,10 +415,11 @@ class MainWindow(QMainWindow):
 
     def _auto_start_server(self):
         """Auto-start the server on launch."""
-        from .dialogs import DEFAULT_RHC_RPC
         from ..core.settings import DEFAULT_PORT
 
-        port = self._settings.get("server_port", DEFAULT_PORT) if self._settings.get("custom_port_enabled", False) else DEFAULT_PORT
+        # Both from the core, so the window and a headless run listen on the
+        # same port. DEFAULT_PORT is the fallback the core itself uses.
+        port = self.core.settings_manager.get_default_port() or DEFAULT_PORT
         allow_lan = self.core.settings_manager.get_allow_lan()
 
         try:
@@ -357,9 +487,13 @@ class MainWindow(QMainWindow):
             self.update_activity("Server stopped")
 
     def on_wallet_path_changed(self, path: str):
-        """Handle wallet path change - save to settings for persistence."""
-        self._settings["wallet_path"] = path
-        self._save_settings()
+        """A different wallet file is now the active one.
+
+        Nothing to persist: this fires after the core has opened or created the
+        wallet, and the core records the path itself (wallet_path.txt), which
+        is where startup reads it from.
+        """
+        self.update_status_indicators()
 
     def on_wallet_locked(self):
         """Handle wallet lock."""
@@ -422,30 +556,99 @@ class MainWindow(QMainWindow):
         Note: Shared settings (verify_settlements, networks, etc.) are now
         managed by Core's SettingsManager. This only loads GUI-specific
         settings like window state, wallet path, etc.
+
+        A file that cannot be read falls back to defaults, and says so. Silence
+        would be wrong here: the auto-lock timeout lives only in this file and
+        its default is 0, which means never lock. A wallet the user expects to
+        lock itself after five minutes would then stay open indefinitely, with
+        nothing on screen to say the setting was lost.
         """
         import json
         import logging
-        from ..utils import get_app_dir
         settings_path = get_app_dir() / "gui_settings.json"
         if settings_path.exists():
             try:
                 with open(settings_path, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
-                logging.getLogger(__name__).warning(f"Failed to load GUI settings: {e}")
+                message = (f"Could not read your display settings ({e}). Vault "
+                           f"has started with the defaults, locking the wallet "
+                           f"after {FALLBACK_AUTO_LOCK_MINUTES} minutes idle - "
+                           "check the auto-lock timeout and the server settings.")
+                logging.getLogger(__name__).warning(message)
+                self.update_activity(message, is_error=True)
+                # Distinct from an absent file: a setting the user chose is
+                # lost rather than never made, so auto-lock does not fall back
+                # to "never". Read where the timeout is applied.
+                self._settings_unreadable = True
         return {}
 
+    #: What may live in gui_settings.json - how this window looks and behaves,
+    #: and nothing else.
+    #:
+    #: Everything the daemon or the CLI also has to know belongs to the core's
+    #: settings.json instead, and is read from there: the server port, the
+    #: agent API's rate limit, the replay window, the admin API mode, the RPC
+    #: endpoint, and which wallet is open. Each of those was once kept here as
+    #: well, and each of the duplicates went wrong in its own way - a port the
+    #: window used but a headless run did not, a rate limit that reached
+    #: nothing, a replay window displayed as one value while another was
+    #: enforced.
+    #:
+    #: `auto_lock_minutes` is the one security setting that stays, because
+    #: auto-lock is a window that has been sitting idle; a daemon has no such
+    #: notion today. If it ever gets one, this moves to the core with it.
+    GUI_OWNED_SETTINGS = frozenset({
+        "theme",
+        "sound_enabled", "toast_enabled", "flash_taskbar",
+        "minimize_to_tray", "close_to_tray", "start_minimized",
+        "log_lines_on_startup", "log_retention_days",
+        "auto_lock_minutes",
+        "auto_start_server",
+    })
+
+    def _remember_gui_settings(self, new_settings: dict) -> None:
+        """Keep the GUI-owned part of a dialog's answer, and save it.
+
+        A dialog returns everything its rows produced, core-owned rows
+        included; the caller applies those to the core. Filtering here rather
+        than at each call site is what stops a copy of a core setting drifting
+        back into this file the next time a row is added.
+        """
+        self._settings.update({
+            key: value for key, value in new_settings.items()
+            if key in self.GUI_OWNED_SETTINGS
+        })
+        self._save_settings()
+
     def _save_settings(self):
-        """Save GUI-specific settings to disk."""
-        import json
+        """Save GUI-specific settings to disk.
+
+        Through the same atomic writer the policy store and the core settings
+        use - temporary file, fsync, rename - rather than opening the target
+        directly. Opening it directly truncates it before the new contents are
+        written, so a power loss or a full disk in that window leaves the file
+        empty - the same fault the settings.json writer exists to prevent.
+
+        The consequence of losing it is not cosmetic. This file holds the
+        auto-lock timeout and the agent server's auto-start switch, and the
+        defaults both fall back to are the less careful ones: no auto-lock, and
+        the server started.
+
+        A failed save is reported to the user rather than only logged. The
+        change is already live in the window, so the person who made it is the
+        one who needs to hear that it will not survive a restart.
+        """
         import logging
-        from ..utils import get_app_dir
         settings_path = get_app_dir() / "gui_settings.json"
         try:
-            with open(settings_path, 'w', encoding='utf-8') as f:
-                json.dump(self._settings, f, indent=2)
+            write_json_atomic(settings_path, self._settings)
         except Exception as e:
-            logging.getLogger(__name__).error(f"Failed to save GUI settings: {e}")
+            message = (f"Could not save your display settings ({e}). Your "
+                       "change is active now but will be lost when Vault "
+                       "restarts.")
+            logging.getLogger(__name__).error(message)
+            self.update_activity(message, is_error=True)
 
     def update_status(self):
         """Update status bar."""
@@ -518,6 +721,18 @@ class MainWindow(QMainWindow):
 
         # Logs tab gets detailed version if provided, otherwise same message
         self.log_tab.add_log(detail or message)
+
+    def on_wallet_activity_detail(self, summary, is_error: bool, detail):
+        """Activity carrying a separate header line and log line.
+
+        A summary of None means "log this, but keep it out of the header" -
+        used for high-volume events that would otherwise flush the six-line
+        pane, such as per-address balance fetches.
+        """
+        if summary is None:
+            self.log_tab.add_log(detail)
+        else:
+            self.update_activity(summary, is_error, detail=detail)
 
     def _render_activity(self):
         """Render the header activity log from the active palette."""
@@ -796,6 +1011,14 @@ class MainWindow(QMainWindow):
         self._approval_handler = GUIApprovalHandler(self)
         self.core.set_approval_handler(self._approval_handler)
 
+        # Register Ledger signing handlers for hardware wallet support:
+        # one for x402 payment authorizations (EIP-712), one for trade transactions.
+        self._ledger_sign_handler = LedgerSignHandler(self)
+        self.core.set_hardware_sign_handler(self._ledger_sign_handler.request_signature)
+
+        self._ledger_tx_sign_handler = LedgerTxSignHandler(self)
+        self.core.set_hardware_tx_sign_handler(self._ledger_tx_sign_handler.request_signature)
+
         # Settings are already loaded from Core in __init__
         # verify_settlements, allow_lan are persisted by Core
 
@@ -959,6 +1182,13 @@ class MainWindow(QMainWindow):
 
         self.show_approval_dialog(request)
 
+    @staticmethod
+    def _wrapped_address(address: str) -> str:
+        """A full address, split across two lines so it can be read and compared."""
+        if not address:
+            return "unknown"
+        return "  " + address[:22] + "\n  " + address[22:]
+
     def show_approval_dialog(self, request: SigningRequest):
         """Show dialog to approve/reject a payment request."""
         self.showNormal()
@@ -966,19 +1196,36 @@ class MainWindow(QMainWindow):
         self.raise_()
 
         amount_str = f"{request.amount_micro/1_000_000:.6f} USDG"
-        # Prefer request_url (full URL) over resource (often path-only)
-        if request.request_url:
-            resource_str = f"\nURL: {request.request_url}"
-        elif request.resource:
-            resource_str = f"\nResource: {request.resource}"
-        else:
-            resource_str = ""
+
+        # Show only the origin (scheme://host) of the payee/agent URL, never the
+        # raw string. These fields are attacker-controlled; rendered whole, a
+        # newline plus a fabricated "Amount:/Recipient:" block would print a
+        # second, convincing set of terms into this dialog beside the real one.
+        # A URL's host cannot contain a newline or those labels.
+        def _origin(url) -> str:
+            from urllib.parse import urlparse
+            try:
+                p = urlparse(str(url))
+                if p.scheme and p.netloc:
+                    return f"{p.scheme}://{p.netloc}"
+            except ValueError:
+                pass
+            return ""
+
+        origin = _origin(request.request_url) or _origin(request.resource)
+        resource_str = f"\nURL: {origin}" if origin else ""
 
         message = (
             f"Agent '{request.agent_name}' is requesting payment authorization.\n\n"
             f"Amount: {amount_str}\n"
             f"Network: {request.network}\n"
-            f"Recipient: {format_address(request.recipient)}"
+            # In full, and split so it stays readable. This is the one moment a
+            # person is asked to authorise a destination, and the README leans on
+            # it as the last line of defence. Truncated to 0x1234...5678 it is
+            # eight characters of forty, and matching four at each end is the
+            # standard setup for address poisoning — a lookalike address costs
+            # minutes to generate.
+            "Recipient:\n" + self._wrapped_address(request.recipient) +
             f"{resource_str}"
         )
 
@@ -1054,29 +1301,68 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
 
-        # Format trade details
-        sym_in = quote.symbol_in or format_address(request.token_in)
-        sym_out = quote.symbol_out or format_address(request.token_out)
+        # Format trade details. A symbol is free text returned by the token's
+        # own contract - untrusted. Strip control characters and cap the
+        # length so it cannot write lines of its own into this dialog, and
+        # never let it stand alone: the addresses below are the real identity.
+        def _display_symbol(symbol, address):
+            cleaned = "".join(
+                c for c in (symbol or "") if c.isprintable())[:16].strip()
+            return cleaned or format_address(address)
+
+        sym_in = _display_symbol(quote.symbol_in, request.token_in)
+        sym_out = _display_symbol(quote.symbol_out, request.token_out)
 
         # Calculate expected output in human-readable form
         expected_out = from_atomic(quote.amount_out_expected, quote.token_out_decimals)
         min_out = from_atomic(quote.amount_out_min, quote.token_out_decimals)
 
-        notional_str = f"${quote.notional_usdg:.2f}" if quote.notional_usdg else "Unknown"
+        # An unvalued trade is often why this dialog is open at all: without a
+        # dollar figure the policy limits cannot be applied to it, so the
+        # decision falls to the user. Say so plainly - someone reading a row of
+        # limits is entitled to know when none of them were checked.
+        if quote.notional_usdg:
+            notional_str = f"${quote.notional_usdg:.2f}"
+            unvalued_warning = ""
+        else:
+            notional_str = "Could not be valued"
+            unvalued_warning = (
+                "\n\nThis trade could not be priced, so your per-trade and daily "
+                "limits could NOT be checked against it. Approving means "
+                "accepting it on the numbers above alone."
+            )
         slippage_str = f"{quote.effective_slippage_bps / 100:.1f}%"
+
+        # Price impact is usually why this dialog is open, so it goes in the
+        # body rather than the detail list, and says what it means.
+        if quote.price_impact_pct is None:
+            impact_str = "Could not be measured"
+        elif quote.price_impact_pct >= 5:
+            impact_str = (f"{quote.price_impact_pct:.1f}% — this fill is well below "
+                          f"the pool's own rate")
+        else:
+            impact_str = f"{quote.price_impact_pct:.2f}%"
 
         # Fee tier as percentage
         fee_pct = request.fee_tier / 10000  # 3000 -> 0.30%
 
+        # The symbols above are whatever the contracts claim; the addresses
+        # are what the swap actually encodes. A counterfeit token can call
+        # itself WETH, so each address is shown whole, on one line, so it can
+        # be compared end to end.
         message = (
             f"Agent '{agent_name}' is requesting a trade.\n\n"
             f"Swap: {request.amount_in} {sym_in} → {sym_out}\n"
+            f"Selling {sym_in}:\n  {request.token_in}\n"
+            f"Buying {sym_out}:\n  {request.token_out}\n\n"
             f"Expected output: {expected_out:.6f} {sym_out}\n"
             f"Minimum output: {min_out:.6f} {sym_out}\n\n"
             f"Trade value: {notional_str}\n"
+            f"Price impact: {impact_str}\n"
             f"Max slippage: {slippage_str}\n"
             f"Pool fee: {fee_pct:.2f}%\n"
             f"Gas estimate: {quote.gas_estimate:,} units"
+            f"{unvalued_warning}"
         )
 
         # Use FramelessMessageBox with custom Approve/Reject buttons
@@ -1091,7 +1377,8 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
         if dlg.result_index() == 0:  # Approve
-            response = self.core.approve_trade(request.id)
+            response = self._execute_trade_with_progress(
+                request.id, f"{request.amount_in} {sym_in} → {sym_out}")
             if response.get("status") == "executed":
                 tx_hash = response.get("tx_hash", "")
                 short_hash = f"{tx_hash[:10]}..." if tx_hash else ""
@@ -1104,6 +1391,243 @@ class MainWindow(QMainWindow):
         else:
             self.core.reject_trade(request.id, "User rejected")
             self.update_activity(f"Trade rejected: {request.amount_in} {sym_in} → {sym_out}", is_warning=True)
+
+    def _execute_trade_with_progress(self, request_id: str, summary: str) -> dict:
+        """Run an approved trade on a worker thread, behind a progress dialog.
+
+        core.approve_trade() re-quotes, may submit an ERC-20 approval, simulates,
+        submits the swap, and waits for a confirmation after each transaction -
+        minutes of blocking work on a slow chain. Called from the Qt main thread
+        it would hold the event loop for all of it, so it goes to a worker, as
+        balances, market data and Ledger prompts already do.
+
+        Running off the main thread also keeps the Ledger trading path uniform:
+        the device prompt arrives by queued signal from a worker, exactly as it
+        does when a trade comes in over HTTP and is auto-approved.
+
+        Returns the TradeResult dict, or a failed result if the worker died.
+        """
+        from .dialogs import TradeProgressDialog
+        from .ledger_dialog import LedgerWorker
+
+        dialog = TradeProgressDialog(summary, self)
+        outcome = {}
+
+        def on_finished(result):
+            """Runs on the Qt main thread once the worker is done."""
+            outcome["result"] = result
+            dialog.allow_close()
+            dialog.accept()
+
+        worker = LedgerWorker(lambda: self.core.approve_trade(request_id))
+        worker.finished.connect(on_finished)
+        worker.start()
+
+        try:
+            dialog.exec()
+        finally:
+            # The dialog refuses to close until the worker reports back, so this
+            # should return at once. Bounded anyway rather than waiting forever,
+            # and never dropped while running - destroying a live QThread crashes Qt.
+            if worker.isRunning():
+                worker.wait(300000)
+
+        result = outcome.get("result")
+        if isinstance(result, BaseException):
+            # The worker already logged the traceback; this only names what it
+            # was, since the worker's own message says "Ledger operation".
+            import logging
+            logging.getLogger(__name__).error("Trade %s failed: %s", request_id, result)
+            return {"status": "failed", "reason": str(result)}
+        if result is None:
+            return {"status": "failed", "reason": "Trade did not report a result"}
+        return result
+
+    def show_ledger_sign_dialog(
+        self,
+        typed_data: dict,
+        device_path: str,
+        expected_address: str,
+        result_holder: queue.Queue
+    ):
+        """
+        Show the Ledger signing confirmation dialog.
+
+        Called from Qt main thread (via signal from LedgerSignHandler).
+        Runs the actual signing in a background thread while showing a "confirm on device" dialog.
+
+        Args:
+            typed_data: EIP-712 typed data dict
+            device_path: Derivation path on the device
+            expected_address: Address to verify against
+            result_holder: Queue to put the result (signature or Exception)
+        """
+        from .ledger_dialog import LedgerSignDialog
+        from ..wallet.ledger import LedgerDevice, LedgerError
+
+        # Build details string from typed_data
+        message = typed_data.get("message", {})
+        to_addr = message.get("to", "Unknown")
+        value = message.get("value", 0)
+        # Format as USDG (6 decimals)
+        value_usdg = value / 1_000_000 if isinstance(value, (int, float)) else 0
+        details = f"To: {to_addr[:10]}...{to_addr[-6:]}\nAmount: {value_usdg:.6f} USDG"
+
+        # Create and show dialog
+        dialog = LedgerSignDialog("Payment Authorization", details, self)
+
+        def do_sign():
+            """Perform the signing operation (runs in worker thread)."""
+            device = LedgerDevice.discover()
+            if device is None:
+                raise LedgerError(
+                    "No Ledger device found. Connect and unlock your Ledger, "
+                    "then open the Ethereum app."
+                )
+
+            # Confirm the connected device actually holds this address before
+            # asking the user to approve anything (guards against a wrong Ledger).
+            derived_addr = device.derive_address(device_path)
+            if derived_addr.lower() != expected_address.lower():
+                raise LedgerError(
+                    f"Wrong Ledger: this device derives {derived_addr[:10]}... at "
+                    f"{device_path}, but the address is {expected_address[:10]}..."
+                )
+
+            return device.sign_typed_data(device_path, typed_data)
+
+        self._run_ledger_operation(dialog, do_sign, result_holder)
+
+    def show_ledger_tx_sign_dialog(
+        self,
+        tx_dict: dict,
+        device_path: str,
+        expected_address: str,
+        description: str,
+        result_holder: queue.Queue
+    ):
+        """
+        Show the Ledger confirmation dialog for a whole transaction (trading).
+
+        Called from Qt main thread (via signal from LedgerTxSignHandler).
+
+        Args:
+            tx_dict: Unsigned transaction dict
+            device_path: Derivation path on the device
+            expected_address: Address to verify against
+            description: Human-readable summary of this step
+            result_holder: Queue to put the result (raw signed tx hex or Exception)
+        """
+        from .ledger_dialog import LedgerSignDialog
+        from ..wallet.ledger import LedgerDevice, LedgerError
+
+        details = self._format_tx_details(tx_dict)
+        dialog = LedgerSignDialog(description, details, self)
+
+        def do_sign():
+            """Perform the signing operation (runs in worker thread)."""
+            device = LedgerDevice.discover()
+            if device is None:
+                raise LedgerError(
+                    "No Ledger device found. Connect and unlock your Ledger, "
+                    "then open the Ethereum app."
+                )
+
+            derived_addr = device.derive_address(device_path)
+            if derived_addr.lower() != expected_address.lower():
+                raise LedgerError(
+                    f"Wrong Ledger: this device derives {derived_addr[:10]}... at "
+                    f"{device_path}, but the trade is from {expected_address[:10]}..."
+                )
+
+            return device.sign_transaction(device_path, tx_dict)
+
+        self._run_ledger_operation(dialog, do_sign, result_holder)
+
+    @staticmethod
+    def _format_tx_details(tx_dict: dict) -> str:
+        """Build the human-readable detail block for a transaction sign dialog.
+
+        Shows the contract being called and the maximum gas cost, so the user can
+        sanity-check the dialog against what the Ledger screen displays.
+        """
+        to_addr = tx_dict.get("to") or "Unknown"
+        lines = [f"To: {to_addr[:10]}...{to_addr[-6:]}" if len(to_addr) > 16 else f"To: {to_addr}"]
+
+        value = int(tx_dict.get("value", 0) or 0)
+        if value:
+            lines.append(f"Value: {value / 10**18:.6f} ETH")
+
+        gas = tx_dict.get("gas")
+        gas_price = tx_dict.get("maxFeePerGas") or tx_dict.get("gasPrice")
+        if gas and gas_price:
+            max_fee_eth = (int(gas) * int(gas_price)) / 10**18
+            lines.append(f"Max gas: {max_fee_eth:.6f} ETH")
+
+        return "\n".join(lines)
+
+    def _run_ledger_operation(self, dialog, do_work, result_holder: queue.Queue):
+        """
+        Run a blocking Ledger operation behind a confirmation dialog.
+
+        Shared by the payment and trading signing paths. The device call runs on
+        a worker thread while the dialog stays responsive; exactly one result
+        (value or Exception) is delivered to result_holder no matter how the
+        dialog closes, because the caller is blocked waiting on that queue.
+
+        Args:
+            dialog: A LedgerSignDialog to display
+            do_work: Zero-arg callable executed on the worker thread
+            result_holder: Queue receiving the result or an Exception
+        """
+        from .ledger_dialog import LedgerWorker
+
+        result_delivered = [False]
+
+        def deliver(result):
+            """Put a result exactly once."""
+            if result_delivered[0]:
+                return False
+            result_delivered[0] = True
+            result_holder.put(result)
+            return True
+
+        def on_finished(result):
+            """Handle completion (runs on Qt main thread)."""
+            if isinstance(result, BaseException):
+                if deliver(result):
+                    dialog.set_status(str(result), is_error=True)
+                    # Keep the dialog up briefly so the error is readable.
+                    QTimer.singleShot(2000, dialog.reject)
+            else:
+                if deliver(result):
+                    dialog.set_success()
+                    QTimer.singleShot(500, dialog.accept)
+
+        def on_cancelled():
+            """Handle user cancellation."""
+            deliver(Exception("Signing cancelled by user"))
+
+        worker = LedgerWorker(do_work)
+        worker.finished.connect(on_finished)
+        dialog.rejected.connect(on_cancelled)
+
+        # Bring window to front so the user sees the prompt.
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+        worker.start()
+        try:
+            dialog.exec()
+        finally:
+            # The dialog can close while the device call is still blocked (the
+            # user cancelled, or is ignoring the device). Deliver a result so the
+            # waiting thread is never stranded, then let the thread finish before
+            # dropping the reference - destroying a running QThread crashes Qt.
+            deliver(Exception("Signing dialog closed"))
+            if worker.isRunning():
+                worker.wait(30000)
 
     def setup_tray(self):
         """Set up system tray icon with context menu."""
@@ -1214,16 +1738,18 @@ class MainWindow(QMainWindow):
             get_wallet_fn=self.wallet_tab.get_unlocked_wallet,
             parent=self
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.update_activity("Keys exported", is_warning=True)
+        try:
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.update_activity("Keys exported", is_warning=True)
+        finally:
+            dialog.scrub()  # the revealed key/seed must not outlive the dialog
 
     def show_settings(self):
         """Show the settings dialog."""
         dialog = SettingsDialog(self._settings, core=self.core, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.has_changes():
             new_settings = dialog.get_settings()
-            self._settings.update(new_settings)
-            self._save_settings()
+            self._remember_gui_settings(new_settings)
 
             # Apply logging settings immediately
             self.log_tab.set_retention_days(new_settings.get("log_retention_days", 0))
@@ -1256,17 +1782,25 @@ class MainWindow(QMainWindow):
             # Persist core-managed settings
             self.core.settings_manager.set_allow_lan(new_settings.get("allow_lan", False))
             self.core.settings_manager.set_verify_settlements(new_settings.get("verify_settlements", True))
+            # The RPC endpoint belongs to the core: quoting, trading, sending
+            # and settlement verification all resolve through it. Stored only
+            # in the GUI's own settings file, this box tested the URL the user
+            # typed, reported it reachable, and then changed nothing.
+            from ..networks import DEFAULT_NETWORK
+            from ..core.settings import DEFAULT_PORT
+            self.core.settings_manager.set_rpc_endpoint(
+                DEFAULT_NETWORK, new_settings.get("rhc_rpc", "").strip() or None)
+            # The port and the rate limit are the core's too: the daemon serves
+            # the same agent API, and `vault config set port` writes the same
+            # value. The GUI kept its own copies, so the window could listen on
+            # one port while a headless run used another, and the rate limit
+            # typed here reached nothing at all.
+            self.core.settings_manager.set_default_port(
+                new_settings.get("server_port", DEFAULT_PORT))
+            self.core.settings_manager.set_rate_limit(new_settings.get("rate_limit", 300))
 
             # Persist GUI-managed settings
-            self._settings["custom_port_enabled"] = new_settings.get("custom_port_enabled", False)
-            self._settings["server_port"] = new_settings.get("server_port", 4663)
-            self._settings["auto_start_server"] = new_settings.get("auto_start_server", False)
-            self._settings["rhc_rpc"] = new_settings.get("rhc_rpc", "")
-            self._settings["rate_limit"] = new_settings.get("rate_limit", 300)
-            self._settings["uniswap_factory"] = new_settings.get("uniswap_factory", "")
-            self._settings["uniswap_quoter"] = new_settings.get("uniswap_quoter", "")
-            self._settings["uniswap_router"] = new_settings.get("uniswap_router", "")
-            self._save_settings()
+            self._remember_gui_settings(new_settings)
 
             # Update server state if server was toggled
             self.server_running = self.core.is_server_running()

@@ -36,11 +36,7 @@ _DROPDOWN_ARROW = (_ASSETS_DIR / "dropdown-arrow.svg").as_posix()
 # Pure color data + status/web helpers live in the Qt-free design_tokens
 # module so the services layer can share them. Re-exported here so UI code
 # keeps importing them from `.theme`.
-from ..design_tokens import (  # noqa: F401  (re-exported)
-    Theme, LIGHT, DARK, CONSOLE,
-    active, set_active, status_token, status_color, colored_span,
-    web_css_vars,
-)
+from ..design_tokens import Theme, LIGHT, DARK, CONSOLE, active, set_active, status_token, status_color, colored_span  # noqa: F401 - re-exported for the ui package
 
 
 # =============================================================================

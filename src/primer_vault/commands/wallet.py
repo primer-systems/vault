@@ -5,6 +5,7 @@ Wallet, Seed, and Address command implementations.
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from ..wallet.crypto import MIN_PASSWORD_LENGTH
 from .result import CommandResult
 
 if TYPE_CHECKING:
@@ -39,6 +40,9 @@ class WalletCommands:
         if subcmd == "status":
             return self._status()
         elif subcmd == "lock":
+            if "--help" in args or "-h" in args:
+                return CommandResult.ok(
+                    "wallet lock - Lock the wallet, clearing its keys from memory.")
             return self._lock()
         elif subcmd == "create":
             if "--help" in args or "-h" in args:
@@ -131,7 +135,7 @@ Arguments:
   <name>              Required. Name for the new wallet file.
 
 Options:
-  --password <pass>   Set password non-interactively (use "" for no password)
+  --password <pass>   Set password non-interactively (at least 8 characters)
 
 Creates a new wallet file in the wallets directory.
 Without --password you will be prompted to set a password.
@@ -199,7 +203,7 @@ A 12-word recovery phrase will be shown - save it!""")
             )
             return CommandResult.need_input(
                 "password",
-                "Enter password (or press Enter for none):",
+                f"Enter password (at least {MIN_PASSWORD_LENGTH} characters):",
                 step="password"
             )
 
@@ -266,7 +270,7 @@ Arguments:
   <name>              Required. Wallet name or path to open.
 
 Options:
-  --password <pass>   Unlock non-interactively (use "" for no password)
+  --password <pass>   Unlock non-interactively
 
 The name/path can be:
   - Wallet name (e.g., 'mywallet')
@@ -384,7 +388,7 @@ class SeedCommands:
                     idx = args.index("--words")
                     word_count = int(args[idx + 1])
                 except (IndexError, ValueError):
-                    return CommandResult.fail("Error: --words requires 12 or 24")
+                    return CommandResult.fail("--words requires 12 or 24")
             return self._create(word_count)
         elif subcmd == "import":
             if "--help" in args or "-h" in args:
@@ -663,10 +667,15 @@ Subcommands:
         for addr in addresses:
             seed_id = addr.get("seed_id")
             index = addr.get("index")
-            if seed_id is not None and index is not None:
+            is_hardware = addr.get("is_hardware", False)
+
+            if is_hardware:
+                derivation = f"  [{addr.get('device_label') or 'Hardware'}]"
+            elif seed_id is not None and index is not None:
                 derivation = f"  {seed_id}/#{index}"
             else:
                 derivation = "  (imported)"
+
             name = addr.get("name") or ""
             # Suppress the GUI's auto-generated default name (e.g. "S001 #0") — it
             # duplicates the derivation column in a different format.
@@ -909,6 +918,14 @@ Never share your private key with anyone!""")
         addr = self._find_address(identifier)
         if not addr:
             return CommandResult.fail(f"Address not found: {identifier}")
+
+        # Hardware addresses have no private key to export
+        if addr.get("is_hardware", False):
+            label = addr.get("device_label") or "hardware wallet"
+            return CommandResult.fail(
+                f"Cannot export private key for {label} address.\n"
+                "Hardware wallet keys never leave the device."
+            )
 
         # Fail before asking for confirmation if key export isn't supported in this mode
         try:

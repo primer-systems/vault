@@ -11,8 +11,6 @@ Any API changes require updating these tests.
 import tempfile
 import shutil
 from pathlib import Path
-from typing import List
-from unittest.mock import Mock, patch
 
 import pytest
 
@@ -31,11 +29,6 @@ def temp_data_dir():
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance with temporary data directory."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 @pytest.fixture

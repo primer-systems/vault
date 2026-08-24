@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 if TYPE_CHECKING:
     from ..services.signing import SigningRequest
+    from .vault import Vault
 
 
 @dataclass

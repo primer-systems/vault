@@ -162,7 +162,8 @@ Subcommands:
                 f"  Token In:   {getattr(match, 'symbol_in', '?')} ({getattr(match, 'token_in', '?')})",
                 f"  Amount In:  {getattr(match, 'amount_in', '?')}",
                 f"  Token Out:  {getattr(match, 'symbol_out', '?')} ({getattr(match, 'token_out', '?')})",
-                f"  Amount Out: {getattr(match, 'amount_out', '?') or 'pending'}",
+                f"  Out quoted: {getattr(match, 'amount_out_quoted', None) or '-'}",
+                f"  Out filled: {getattr(match, 'amount_out', None) or 'pending'}",
                 f"  Fee Tier:   {getattr(match, 'fee_tier', '?')} bps",
                 f"  Pool:       {getattr(match, 'pool', '?') or 'unknown'}",
             ])
@@ -243,9 +244,13 @@ Example:
             with open(filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
                 # Header
+                # 'In' is what the trade actually delivered; 'In (quoted)' is
+                # what it was predicted to. Both, so the difference survives the
+                # export - a spreadsheet showing only the quote would report an
+                # estimate as a settled fact.
                 writer.writerow([
-                    'ID', 'Type', 'Agent', 'Out', 'In', 'Status', 'Recipient',
-                    'Network', 'Timestamp', 'Tx Hash'
+                    'ID', 'Type', 'Agent', 'Out', 'In', 'In (quoted)', 'Status',
+                    'Recipient', 'Network', 'Timestamp', 'Tx Hash'
                 ])
                 # Data
                 for tx in txs:
@@ -260,8 +265,12 @@ Example:
                         out_val = f"{tx.amount_micro / 1_000_000:.6f} USDG"
 
                     # Format "In" column based on type
+                    quoted_val = ''
                     if tx_type == 'trade':
-                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {getattr(tx, 'symbol_out', '')}"
+                        sym_out = getattr(tx, 'symbol_out', '')
+                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {sym_out}"
+                        quoted = getattr(tx, 'amount_out_quoted', None)
+                        quoted_val = f"{quoted} {sym_out}" if quoted else ''
                     elif tx_type == 'transfer':
                         in_val = ""  # Transfers out don't receive anything
                     else:
@@ -273,6 +282,7 @@ Example:
                         getattr(tx, 'agent_name', '') or '',
                         out_val,
                         in_val,
+                        quoted_val,
                         tx.status,
                         getattr(tx, 'recipient', '') or '',
                         getattr(tx, 'network', '') or '',

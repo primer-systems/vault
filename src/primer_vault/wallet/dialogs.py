@@ -8,695 +8,25 @@ Provides dialogs for:
 - Wallet management
 """
 
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit, QWidget, QCheckBox,
-    QApplication, QComboBox, QSpinBox, QFrame, QGroupBox,
-    QListWidget, QListWidgetItem, QFormLayout
-)
+from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QTextEdit, QWidget, QCheckBox, QComboBox, QSpinBox, QFrame, QGroupBox, QListWidget, QListWidgetItem, QFormLayout
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
-from .crypto import Wallet, PrivateKeyWallet, load_wallet, VaultWallet, NO_PASSWORD_SENTINEL
+from .crypto import (VaultWallet, MIN_PASSWORD_LENGTH, WeakPasswordError,
+                     validate_wallet_password, CorruptedWalletFile,
+                     UnsupportedWalletVersion)
 from eth_account.hdaccount import generate_mnemonic
 
 # Import shared clipboard helper and frameless dialogs from ui module
-from ..ui.dialogs import copy_sensitive_to_clipboard, CLIPBOARD_CLEAR_TIMEOUT
+from ..ui.dialogs import copy_sensitive_to_clipboard
 from ..ui.theme import Theme, FramelessDialog, FramelessMessageBox, set_role
-
-
-# ============================================
-# Welcome Dialog (First Run)
-# ============================================
-
-class WelcomeDialog(FramelessDialog):
-    """Initial dialog for creating or importing a wallet."""
-
-    BUTTON_WIDTH = 200
-
-    def __init__(self, parent=None):
-        super().__init__("Welcome to Vault", parent)
-        self.setFixedWidth(350)
-
-        self.choice = None  # 'create' or 'import'
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        subtitle = QLabel("Secure payment authorization for AI agents")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(subtitle)
-
-        layout.addSpacing(16)
-
-        create_btn = QPushButton("Create New Wallet")
-        create_btn.setFixedWidth(self.BUTTON_WIDTH)
-        create_btn.setDefault(True)
-        create_btn.clicked.connect(self.on_create)
-        layout.addWidget(create_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        import_btn = QPushButton("Import Existing Wallet")
-        import_btn.setFixedWidth(self.BUTTON_WIDTH)
-        import_btn.clicked.connect(self.on_import)
-        layout.addWidget(import_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        layout.addStretch()
-
-        footer = QLabel("Your keys never leave this device.")
-        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(footer)
-
-    def on_create(self):
-        self.choice = 'create'
-        self.accept()
-
-    def on_import(self):
-        self.choice = 'import'
-        self.accept()
-
-
-# ============================================
-# Password Setup Dialog
-# ============================================
-
-class PasswordSetupDialog(FramelessDialog):
-    """Dialog for setting wallet password."""
-
-    # Sentinel value for no password (unencrypted storage)
-    NO_PASSWORD = "__NO_PASSWORD__"
-    BUTTON_WIDTH = 100
-
-    def __init__(self, parent=None, is_new: bool = True):
-        super().__init__("Set Password" if is_new else "Enter Password", parent)
-        self.setFixedWidth(400)
-
-        self.password = None
-        self.is_new = is_new
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        if is_new:
-            subtitle = QLabel("This password encrypts your wallet. If you forget it, use your seed phrase to recover.")
-            subtitle.setWordWrap(True)
-            layout.addWidget(subtitle)
-
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setPlaceholderText("Enter password")
-        layout.addWidget(self.password_input)
-
-        if is_new:
-            self.confirm_input = QLineEdit()
-            self.confirm_input.setEchoMode(QLineEdit.EchoMode.Password)
-            self.confirm_input.setPlaceholderText("Confirm password")
-            layout.addWidget(self.confirm_input)
-
-            # No password option
-            self.no_password_check = QCheckBox("No password (wallet will NOT be encrypted)")
-            self.no_password_check.toggled.connect(self._on_no_password_toggled)
-            layout.addWidget(self.no_password_check)
-
-            # Warning box - always visible but starts transparent to reserve space
-            self.no_password_warning = QLabel(
-                "Warning: Without a password, your private keys will be stored unencrypted. "
-                "Anyone with access to your computer can access your funds. "
-                "Only recommended for testnet use."
-            )
-            self.no_password_warning.setWordWrap(True)
-            self.no_password_warning.setFixedHeight(70)
-            self.no_password_warning.setObjectName("warningBox")
-            # Starts collapsed (invisible but space reserved) until "no password"
-            # is checked.
-            self.no_password_warning.setProperty("collapsed", True)
-            layout.addWidget(self.no_password_warning)
-
-        self.error_label = QLabel("")
-        self.error_label.setProperty("role", "error")
-        layout.addWidget(self.error_label)
-
-        layout.addStretch()
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setFixedWidth(self.BUTTON_WIDTH)
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        continue_btn = QPushButton("Continue" if is_new else "Unlock")
-        continue_btn.setFixedWidth(self.BUTTON_WIDTH)
-        continue_btn.setDefault(True)
-        continue_btn.clicked.connect(self.on_continue)
-        btn_layout.addWidget(continue_btn)
-
-        layout.addLayout(btn_layout)
-
-        self.password_input.returnPressed.connect(self.on_continue)
-        if is_new:
-            self.confirm_input.returnPressed.connect(self.on_continue)
-
-    def _on_no_password_toggled(self, checked: bool):
-        """Handle no password checkbox toggle."""
-        self.password_input.setEnabled(not checked)
-        self.confirm_input.setEnabled(not checked)
-        # Use stylesheet to show/hide warning while keeping layout stable
-        if checked:
-            set_role(self.no_password_warning, collapsed=False)
-            self.password_input.clear()
-            self.confirm_input.clear()
-            self.error_label.clear()
-        else:
-            set_role(self.no_password_warning, collapsed=True)
-
-    def on_continue(self):
-        # Check if no password option is selected
-        if self.is_new and hasattr(self, 'no_password_check') and self.no_password_check.isChecked():
-            self.password = self.NO_PASSWORD
-            self.accept()
-            return
-
-        password = self.password_input.text()
-
-        if not password:
-            self.error_label.setText("Please enter a password")
-            return
-
-        if self.is_new:
-            confirm = self.confirm_input.text()
-            if password != confirm:
-                self.error_label.setText("Passwords do not match")
-                return
-
-        self.password = password
-        self.accept()
-
-
-# ============================================
-# Import Choice Dialog
-# ============================================
-
-class ImportChoiceDialog(FramelessDialog):
-    """Dialog for choosing import method (seed phrase or private key)."""
-
-    BUTTON_WIDTH = 220
-
-    def __init__(self, parent=None):
-        super().__init__("Import Wallet", parent)
-        self.setFixedWidth(350)
-
-        self.choice = None  # 'seed' or 'pkey'
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        subtitle = QLabel("Choose how to import your wallet")
-        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(subtitle)
-
-        layout.addSpacing(12)
-
-        seed_btn = QPushButton("Seed Phrase (12 or 24 words)")
-        seed_btn.setFixedWidth(self.BUTTON_WIDTH)
-        seed_btn.setDefault(True)
-        seed_btn.clicked.connect(self.on_seed)
-        layout.addWidget(seed_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        pkey_btn = QPushButton("Private Key (hex)")
-        pkey_btn.setFixedWidth(self.BUTTON_WIDTH)
-        pkey_btn.clicked.connect(self.on_pkey)
-        layout.addWidget(pkey_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setFixedWidth(self.BUTTON_WIDTH)
-        cancel_btn.clicked.connect(self.reject)
-        layout.addWidget(cancel_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-    def on_seed(self):
-        self.choice = 'seed'
-        self.accept()
-
-    def on_pkey(self):
-        self.choice = 'pkey'
-        self.accept()
-
-
-# ============================================
-# Seed Phrase Import Dialog
-# ============================================
-
-class SeedImportDialog(FramelessDialog):
-    """Dialog for importing a wallet from seed phrase."""
-
-    # Derivation path templates - use {} as placeholder for account index
-    DERIVATION_TEMPLATES = [
-        ("Ethereum / Base (default)", "m/44'/60'/0'/0/{}"),
-        ("Ledger Live", "m/44'/60'/{}'/0/0"),
-        ("Custom...", "custom"),
-    ]
-
-    def __init__(self, parent=None):
-        super().__init__("Import from Seed Phrase", parent)
-        self.setMinimumWidth(450)
-
-        self.seed_phrase = None
-        self.derivation_path = "m/44'/60'/0'/0/0"
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        subtitle = QLabel("Enter your 12 or 24 word recovery phrase, separated by spaces.")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
-
-        self.seed_input = QTextEdit()
-        self.seed_input.setPlaceholderText("word1 word2 word3 ...")
-        self.seed_input.setFont(QFont("Consolas", 10))
-        self.seed_input.setMaximumHeight(80)
-        layout.addWidget(self.seed_input)
-
-        # Derivation path section
-        path_label = QLabel("Derivation Path:")
-        layout.addWidget(path_label)
-
-        # Template dropdown
-        self.path_combo = QComboBox()
-        for name, template in self.DERIVATION_TEMPLATES:
-            self.path_combo.addItem(name, template)
-        self.path_combo.currentIndexChanged.connect(self.on_template_changed)
-        layout.addWidget(self.path_combo)
-
-        # Account index row (template + spinner)
-        index_row = QHBoxLayout()
-        index_row.setSpacing(8)
-
-        self.path_preview = QLabel()
-        self.path_preview.setFont(QFont("Consolas", 10))
-        index_row.addWidget(self.path_preview)
-
-        index_row.addStretch()
-
-        index_label = QLabel("Account:")
-        index_row.addWidget(index_label)
-
-        self.account_spinner = QSpinBox()
-        self.account_spinner.setMinimum(0)
-        self.account_spinner.setMaximum(999)
-        self.account_spinner.setValue(0)
-        self.account_spinner.setFixedWidth(70)
-        self.account_spinner.valueChanged.connect(self.update_path_preview)
-        index_row.addWidget(self.account_spinner)
-
-        self.index_row_widget = QWidget()
-        self.index_row_widget.setLayout(index_row)
-        layout.addWidget(self.index_row_widget)
-
-        # Custom path input (hidden by default)
-        self.custom_path_input = QLineEdit()
-        self.custom_path_input.setPlaceholderText("m/44'/60'/0'/0/0")
-        self.custom_path_input.setFont(QFont("Consolas", 10))
-        self.custom_path_input.setVisible(False)
-        layout.addWidget(self.custom_path_input)
-
-        # Initialize preview
-        self.update_path_preview()
-
-        self.error_label = QLabel("")
-        self.error_label.setProperty("role", "error")
-        layout.addWidget(self.error_label)
-
-        layout.addStretch()
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        import_btn = QPushButton("Import")
-        import_btn.setDefault(True)
-        import_btn.clicked.connect(self.on_import)
-        btn_layout.addWidget(import_btn)
-
-        layout.addLayout(btn_layout)
-
-    def on_template_changed(self, index):
-        template = self.path_combo.currentData()
-        is_custom = (template == "custom")
-        self.index_row_widget.setVisible(not is_custom)
-        self.custom_path_input.setVisible(is_custom)
-        if not is_custom:
-            self.update_path_preview()
-
-    def update_path_preview(self):
-        template = self.path_combo.currentData()
-        if template and template != "custom":
-            account_index = self.account_spinner.value()
-            path = template.format(account_index)
-            self.path_preview.setText(path)
-
-    def get_derivation_path(self) -> str:
-        """Get the complete derivation path based on current selections."""
-        template = self.path_combo.currentData()
-        if template == "custom":
-            return self.custom_path_input.text().strip()
-        account_index = self.account_spinner.value()
-        return template.format(account_index)
-
-    def on_import(self):
-        seed = self.seed_input.toPlainText().strip().lower()
-        words = seed.split()
-
-        if len(words) not in [12, 24]:
-            self.error_label.setText(f"Expected 12 or 24 words, got {len(words)}")
-            return
-
-        from mnemonic import Mnemonic
-        mnemo = Mnemonic("english")
-        seed_phrase = " ".join(words)
-
-        if not mnemo.check(seed_phrase):
-            self.error_label.setText("Invalid seed phrase. Check for typos.")
-            return
-
-        path = self.get_derivation_path()
-        if path.startswith("custom") or not path.startswith("m/"):
-            self.error_label.setText("Invalid derivation path (should start with m/)")
-            return
-
-        self.seed_phrase = seed_phrase
-        self.derivation_path = path
-        self.accept()
-
-
-# ============================================
-# Private Key Import Dialog
-# ============================================
-
-class PrivateKeyImportDialog(FramelessDialog):
-    """Dialog for importing a wallet from private key."""
-
-    def __init__(self, parent=None):
-        super().__init__("Import from Private Key", parent)
-        self.setMinimumWidth(400)
-
-        self.private_key = None
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        subtitle = QLabel("Enter a 64-character hex private key (with or without 0x prefix).")
-        subtitle.setWordWrap(True)
-        layout.addWidget(subtitle)
-
-        warning = QLabel("Note: Private keys imported this way cannot derive additional addresses.")
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
-
-        self.pkey_input = QLineEdit()
-        self.pkey_input.setPlaceholderText("0x... or 64 hex characters")
-        self.pkey_input.setFont(QFont("Consolas", 10))
-        self.pkey_input.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addWidget(self.pkey_input)
-
-        self.show_check = QCheckBox("Show private key")
-        self.show_check.toggled.connect(self.toggle_visibility)
-        layout.addWidget(self.show_check)
-
-        self.error_label = QLabel("")
-        self.error_label.setProperty("role", "error")
-        layout.addWidget(self.error_label)
-
-        layout.addStretch()
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        import_btn = QPushButton("Import")
-        import_btn.setDefault(True)
-        import_btn.clicked.connect(self.on_import)
-        btn_layout.addWidget(import_btn)
-
-        layout.addLayout(btn_layout)
-
-    def toggle_visibility(self, checked):
-        if checked:
-            self.pkey_input.setEchoMode(QLineEdit.EchoMode.Normal)
-        else:
-            self.pkey_input.setEchoMode(QLineEdit.EchoMode.Password)
-
-    def on_import(self):
-        pkey = self.pkey_input.text().strip()
-
-        if pkey.startswith("0x") or pkey.startswith("0X"):
-            pkey = pkey[2:]
-
-        if len(pkey) != 64:
-            self.error_label.setText(f"Expected 64 hex characters, got {len(pkey)}")
-            return
-
-        try:
-            bytes.fromhex(pkey)
-        except ValueError:
-            self.error_label.setText("Invalid hex characters in private key")
-            return
-
-        try:
-            from eth_account import Account
-            Account.from_key(bytes.fromhex(pkey))
-            self.private_key = pkey
-            self.accept()
-        except Exception as e:
-            self.error_label.setText(f"Invalid private key: {str(e)}")
-
-
-# ============================================
-# Seed Phrase Backup Dialog
-# ============================================
-
-class SeedBackupDialog(FramelessDialog):
-    """Dialog showing seed phrase for backup."""
-
-    BUTTON_WIDTH = 150
-
-    def __init__(self, seed_phrase: str, parent=None):
-        super().__init__("Backup Your Seed Phrase", parent)
-        self.setFixedWidth(500)
-
-        self.seed_phrase = seed_phrase
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        warning = QLabel("WARNING: This is the ONLY way to recover your wallet. Store it safely offline. Never share it with anyone.")
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
-
-        words = seed_phrase.split()
-        formatted_words = []
-        for i, word in enumerate(words, 1):
-            formatted_words.append(f"{i:2}. {word}")
-
-        seed_text = ""
-        for i in range(0, len(formatted_words), 3):
-            row = formatted_words[i:i+3]
-            seed_text += "   ".join(f"{w:<12}" for w in row) + "\n"
-
-        seed_box = QLabel(seed_text.strip())
-        seed_box.setFont(QFont("Consolas", 11))
-        seed_box.setObjectName("seedBox")
-        layout.addWidget(seed_box)
-
-        copy_btn = QPushButton("Copy to Clipboard")
-        copy_btn.setFixedWidth(self.BUTTON_WIDTH)
-        copy_btn.clicked.connect(self.copy_seed)
-        layout.addWidget(copy_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-        layout.addStretch()
-
-        self.confirm_check = QCheckBox("I have written down my seed phrase")
-        layout.addWidget(self.confirm_check)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        continue_btn = QPushButton("Continue")
-        continue_btn.setFixedWidth(100)
-        continue_btn.setDefault(True)
-        continue_btn.clicked.connect(self.on_continue)
-        btn_layout.addWidget(continue_btn)
-        layout.addLayout(btn_layout)
-
-    def copy_seed(self):
-        copy_sensitive_to_clipboard(self.seed_phrase, self)
-
-    def on_continue(self):
-        if not self.confirm_check.isChecked():
-            FramelessMessageBox.show_warning(
-                self,
-                "Backup Required",
-                "Please confirm you have written down your seed phrase."
-            )
-            return
-        self.accept()
-
-
-# ============================================
-# Unlock Dialog
-# ============================================
-
-class UnlockDialog(FramelessDialog):
-    """Dialog for unlocking an existing wallet."""
-
-    def __init__(self, wallet_path: Path, parent=None):
-        super().__init__("Unlock Wallet", parent)
-
-        self.wallet_path = wallet_path
-        self.wallet = None
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        addr_label = QLabel(f"Wallet: {wallet_path.stem}")
-        layout.addWidget(addr_label)
-
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_input.setPlaceholderText("Enter password")
-        self.password_input.returnPressed.connect(self.on_unlock)
-        layout.addWidget(self.password_input)
-
-        self.error_label = QLabel("")
-        self.error_label.setProperty("role", "error")
-        layout.addWidget(self.error_label)
-
-        layout.addStretch()
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        unlock_btn = QPushButton("Unlock")
-        unlock_btn.setDefault(True)
-        unlock_btn.clicked.connect(self.on_unlock)
-        btn_layout.addWidget(unlock_btn)
-
-        layout.addLayout(btn_layout)
-
-    def on_unlock(self):
-        password = self.password_input.text()
-
-        if not password:
-            self.error_label.setText("Please enter your password")
-            return
-
-        try:
-            self.wallet = load_wallet(self.wallet_path, password)
-            self.accept()
-        except ValueError:
-            self.error_label.setText("Wrong password")
-            self.password_input.clear()
-            self.password_input.setFocus()
-
-
-# ============================================
-# Wallet Setup Flow
-# ============================================
-
-def run_wallet_setup(wallet_dir: Path, parent=None) -> Optional[Wallet | PrivateKeyWallet]:
-    """
-    Run the complete wallet setup flow.
-
-    Returns the unlocked wallet, or None if canceled.
-    """
-    wallet_path = wallet_dir / "default.json"
-
-    if wallet_path.exists():
-        dialog = UnlockDialog(wallet_path, parent)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return dialog.wallet
-        return None
-
-    welcome = WelcomeDialog(parent)
-    if welcome.exec() != QDialog.DialogCode.Accepted:
-        return None
-
-    if welcome.choice == 'import':
-        import_choice = ImportChoiceDialog(parent)
-        if import_choice.exec() != QDialog.DialogCode.Accepted:
-            return None
-
-        if import_choice.choice == 'seed':
-            seed_dialog = SeedImportDialog(parent)
-            if seed_dialog.exec() != QDialog.DialogCode.Accepted:
-                return None
-
-            password_dialog = PasswordSetupDialog(parent, is_new=True)
-            if password_dialog.exec() != QDialog.DialogCode.Accepted:
-                return None
-
-            deriv_path = seed_dialog.derivation_path
-            if deriv_path and '{}' not in deriv_path:
-                parts = deriv_path.rstrip('/').split('/')
-                if parts and parts[-1].isdigit():
-                    parts[-1] = '{}'
-                deriv_path = '/'.join(parts)
-
-            wallet = Wallet.restore(
-                seed_dialog.seed_phrase,
-                password_dialog.password,
-                deriv_path
-            )
-            wallet_dir.mkdir(parents=True, exist_ok=True)
-            wallet.save(wallet_path)
-            return wallet
-
-        else:  # pkey
-            pkey_dialog = PrivateKeyImportDialog(parent)
-            if pkey_dialog.exec() != QDialog.DialogCode.Accepted:
-                return None
-
-            password_dialog = PasswordSetupDialog(parent, is_new=True)
-            if password_dialog.exec() != QDialog.DialogCode.Accepted:
-                return None
-
-            wallet = PrivateKeyWallet.from_private_key(
-                pkey_dialog.private_key,
-                password_dialog.password
-            )
-            wallet_dir.mkdir(parents=True, exist_ok=True)
-            wallet.save(wallet_path)
-            return wallet
-
-    else:
-        password_dialog = PasswordSetupDialog(parent, is_new=True)
-        if password_dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-
-        wallet = Wallet.create(password_dialog.password, word_count=12)
-
-        backup_dialog = SeedBackupDialog(wallet.seed_phrase, parent)
-        if backup_dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-
-        wallet_dir.mkdir(parents=True, exist_ok=True)
-        wallet.save(wallet_path)
-        return wallet
+from ..utils import scrub_dialog
 
 
 # ============================================
@@ -712,6 +42,7 @@ class AddAddressDialog(FramelessDialog):
     2. Create new seed phrase
     3. Import seed phrase
     4. Import private key
+    5. Connect Ledger hardware wallet
     """
 
     BUTTON_WIDTH = 200
@@ -719,11 +50,14 @@ class AddAddressDialog(FramelessDialog):
     def __init__(self, wallet: VaultWallet, parent=None):
         super().__init__("Add Address", parent)
         self.setFixedWidth(450)
-        self.setMinimumHeight(320)
+        self.setMinimumHeight(380)  # Slightly taller for Ledger section
 
         self.wallet = wallet
-        self.choice = None  # 'existing_seed', 'new_seed', 'import_seed', 'import_pkey'
+        self.choice = None  # 'existing_seed', 'new_seed', 'import_seed', 'import_pkey', 'ledger'
         self.selected_seed_id = None
+        self.ledger_addresses = []  # List of (path, address, path_type, name) from Ledger
+        self.ledger_renames = {}    # address_id -> new name
+        self.ledger_removals = set()  # address_ids to remove
 
         layout = self.content_layout
         layout.setSpacing(12)
@@ -731,7 +65,7 @@ class AddAddressDialog(FramelessDialog):
 
         # Derive group (only if seeds exist)
         if wallet.seeds:
-            derive_group = QGroupBox("Derive")
+            derive_group = QGroupBox("Derive from Software Wallet")
             derive_layout = QVBoxLayout(derive_group)
             derive_layout.setSpacing(10)
             derive_layout.setContentsMargins(12, 16, 12, 12)
@@ -796,6 +130,18 @@ class AddAddressDialog(FramelessDialog):
 
         layout.addWidget(import_group)
 
+        # Hardware Wallet group
+        hw_group = QGroupBox("Hardware Wallet")
+        hw_layout = QVBoxLayout(hw_group)
+        hw_layout.setSpacing(10)
+        hw_layout.setContentsMargins(12, 16, 12, 12)
+
+        ledger_btn = QPushButton("Connect Ledger")
+        ledger_btn.clicked.connect(self.on_connect_ledger)
+        hw_layout.addWidget(ledger_btn)
+
+        layout.addWidget(hw_group)
+
         layout.addStretch()
 
         # Bottom buttons
@@ -823,6 +169,20 @@ class AddAddressDialog(FramelessDialog):
     def on_import_pkey(self):
         self.choice = 'import_pkey'
         self.accept()
+
+    def on_connect_ledger(self):
+        """Pick Ledger addresses and close, handing them to the wallet tab."""
+        result = run_ledger_address_picker(self.wallet, self)
+        if result is None:
+            return
+
+        self.ledger_addresses = result.addresses
+        self.ledger_renames = result.renames
+        self.ledger_removals = result.removals
+
+        if self.ledger_addresses or self.ledger_renames or self.ledger_removals:
+            self.choice = 'ledger'
+            self.accept()
 
 
 # ============================================
@@ -911,6 +271,59 @@ class SeedSelectionDialog(FramelessDialog):
 # Derivation Browser Dialog
 # ============================================
 
+from .address_source import AddressSource, SeedAddressSource, LedgerAddressSource  # noqa: E402
+
+
+@dataclass
+class LedgerPickResult:
+    """What the user chose in the Ledger address picker."""
+    addresses: list          # (path, address, path_type, name) tuples to add
+    renames: dict            # address_id -> new name
+    removals: set            # address_ids to remove
+
+
+def run_ledger_address_picker(wallet: VaultWallet, parent) -> Optional[LedgerPickResult]:
+    """
+    Connect a Ledger and pick addresses from it.
+
+    Two steps deliberately: LedgerConnectDialog only establishes the device and
+    derivation path, then the same DerivationBrowserDialog used for software
+    seeds does the picking, so both flows look identical.
+
+    Shared by "Add Address" on an existing wallet and the new-wallet wizard, so
+    there is exactly one Ledger setup path.
+
+    Args:
+        wallet: Wallet the addresses will join. For a wallet being created, pass
+            the empty wallet-in-progress - it is only read, to spot addresses
+            that are already present.
+        parent: Parent widget for the dialogs
+
+    Returns:
+        The user's selection, or None if they cancelled at either step.
+    """
+    from ..ui.ledger_dialog import LedgerConnectDialog
+
+    connect = LedgerConnectDialog(parent)
+    if not connect.exec() or not connect.device:
+        return None
+
+    source = LedgerAddressSource(
+        wallet, connect.device, connect.path_type, connect.custom_path)
+    browser = DerivationBrowserDialog(wallet, parent=parent, source=source)
+    if not browser.exec():
+        return None
+
+    return LedgerPickResult(
+        addresses=[
+            (source.path_for(index), address, connect.path_type.value, name)
+            for index, address, name in browser.get_selected_rows()
+        ],
+        renames=dict(browser.edited_existing),
+        removals=set(browser.removed_addresses),
+    )
+
+
 class DerivationBrowserDialog(FramelessDialog):
     """
     Dialog for browsing and selecting addresses from a seed.
@@ -932,8 +345,14 @@ class DerivationBrowserDialog(FramelessDialog):
 
     ADDRESSES_PER_PAGE = 10
 
-    def __init__(self, wallet: VaultWallet, seed_id: str, parent=None, creation_mode: bool = False):
-        title = "Select Addresses" if creation_mode else f"Derive Addresses from {seed_id}"
+    #: Delay before acting on a start-index change, so holding the spinner
+    #: arrows or typing a multi-digit index triggers one sweep, not several.
+    RELOAD_DEBOUNCE_MS = 350
+
+    def __init__(self, wallet: VaultWallet, seed_id: str = None, parent=None,
+                 creation_mode: bool = False, source: AddressSource = None):
+        self.source = source or SeedAddressSource(wallet, seed_id)
+        title = "Select Addresses" if creation_mode else self.source.title
         super().__init__(title, parent)
         self.creation_mode = creation_mode
         self.setMinimumWidth(600)
@@ -941,6 +360,15 @@ class DerivationBrowserDialog(FramelessDialog):
 
         self.wallet = wallet
         self.seed_id = seed_id
+        self._loader = None
+        self._load_error = None
+        self._reload_pending = False
+
+        # Coalesces rapid start-index changes into one device sweep.
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.timeout.connect(self.refresh_list)
+
         self.start_index = 0
         self.addresses_shown = self.ADDRESSES_PER_PAGE
         self.selected_addresses: dict[int, str] = {}  # index -> name (for new addresses)
@@ -950,17 +378,10 @@ class DerivationBrowserDialog(FramelessDialog):
 
         # In creation mode, pre-select first address
         if creation_mode:
-            default_name = f"{seed_id} #0"
-            self.selected_addresses[0] = default_name
-
-        # Find existing addresses for this seed
-        self.existing_indices = set()
-        for addr in wallet.get_addresses_for_seed(seed_id):
-            if addr.index is not None:
-                self.existing_indices.add(addr.index)
+            self.selected_addresses[0] = self.source.default_name(0)
 
         # Start at 0 to show existing addresses for editing
-        # (previously started after highest existing index, but that hid existing addresses)
+        # Start from zero so addresses already in the wallet stay visible.
 
         layout = self.content_layout
         layout.setSpacing(8)
@@ -970,8 +391,10 @@ class DerivationBrowserDialog(FramelessDialog):
 
         if creation_mode:
             title = QLabel("Choose which addresses to add to your wallet.")
-        else:
+        elif seed_id:
             title = QLabel(f"Add or edit addresses from seed {seed_id}")
+        else:
+            title = QLabel("Choose which addresses to add to your wallet.")
         header_layout.addWidget(title)
 
         header_layout.addStretch()
@@ -989,8 +412,6 @@ class DerivationBrowserDialog(FramelessDialog):
         layout.addLayout(header_layout)
 
         # Scrollable address list
-        from PyQt6.QtWidgets import QScrollArea, QFrame
-
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1019,7 +440,7 @@ class DerivationBrowserDialog(FramelessDialog):
         btn_layout.addStretch()
 
         # Delete seed button (management mode only)
-        if not creation_mode:
+        if not creation_mode and self.source.supports_delete:
             delete_seed_btn = QPushButton("Delete Seed")
             delete_seed_btn.setToolTip("Delete this seed and all its addresses")
             delete_seed_btn.setProperty("variant", "danger")
@@ -1046,51 +467,118 @@ class DerivationBrowserDialog(FramelessDialog):
         self.start_index = value
         self.addresses_shown = self.ADDRESSES_PER_PAGE
         self.selected_addresses.clear()
-        self.refresh_list()
+
+        # Debounce: the spinner fires per keystroke and per arrow click, and
+        # each refresh can mean a full sweep of the device. Typing "50" would
+        # otherwise kick off a sweep for 5 and another for 50.
+        self._reload_timer.start(self.RELOAD_DEBOUNCE_MS)
 
     def refresh_list(self):
-        # Clear existing items
+        """Render the visible range, fetching it first if the source is slow.
+
+        Local seed derivation is always ready, so this stays synchronous for
+        software wallets. A Ledger needs a USB sweep, which runs on a worker
+        thread behind a status row rather than freezing the dialog.
+        """
+        if self.source.is_ready(self.start_index, self.addresses_shown):
+            self._render_rows()
+            return
+
+        self._clear_rows()
+        self._show_status(self.source.loading_text)
+        self.load_more_btn.setEnabled(False)
+
+        # Never run two sweeps at once. The device is a single serial resource,
+        # so a second worker would just queue behind the first and re-render
+        # stale ranges; remember the request and run it when this one lands.
+        if self._loader is not None and self._loader.isRunning():
+            self._reload_pending = True
+            return
+
+        self._start_loader()
+
+    def _start_loader(self):
+        """Kick off a background fetch for the current range."""
+        from ..ui.ledger_dialog import LedgerWorker
+
+        self._reload_pending = False
+        self._loader = LedgerWorker(
+            self.source.prepare, self.start_index, self.addresses_shown)
+        self._loader.finished.connect(self._on_range_loaded)
+        self._loader.start()
+
+    def _on_range_loaded(self, result):
+        """Handle completion of a background address fetch."""
+        self.load_more_btn.setEnabled(True)
+
+        # The range moved while we were fetching - go again for the current one.
+        if self._reload_pending:
+            self._start_loader()
+            return
+
+        if isinstance(result, BaseException):
+            self._clear_rows()
+            self._show_status(str(result), is_error=True)
+            self.update_selection_label()
+            return
+
+        self._render_rows()
+
+    def _clear_rows(self):
+        """Remove all rows from the list."""
         while self.list_layout.count():
             item = self.list_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        # Add address rows
+    def _show_status(self, text: str, is_error: bool = False):
+        """Show a single status line where the rows would go."""
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setProperty("role", "error" if is_error else "muted")
+        set_role(label)
+        self.list_layout.addWidget(label)
+        self.list_layout.addStretch()
+
+    def _render_rows(self):
+        """Draw the address rows for the current range."""
+        self._clear_rows()
+
         for i in range(self.addresses_shown):
-            index = self.start_index + i
-            self.add_address_row(index)
+            self.add_address_row(self.start_index + i)
 
         self.list_layout.addStretch()
         self.update_selection_label()
 
     def add_address_row(self, index: int):
         """Add a single address row to the list."""
-        from PyQt6.QtWidgets import QFrame
-
         row = QFrame()
         row.setFrameShape(QFrame.Shape.StyledPanel)
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(8, 4, 8, 4)
 
+        # Derive first: whether the row is "already in the wallet" is decided by
+        # what the source finds for this address, not by the index alone.
+        try:
+            address = self.source.derive(index)
+        except Exception as e:
+            address = f"Error: {e}"
+
+        existing = self.source.existing_entry(index, address) if address.startswith("0x") else None
+
         # Checkbox
         checkbox = QCheckBox()
         checkbox.setProperty("index", index)
 
-        # Check if already exists in wallet
-        already_exists = index in self.existing_indices
-        if already_exists:
-            # Find the address_id for this existing address
-            addr_id = None
-            for addr in self.wallet.get_addresses_for_seed(self.seed_id):
-                if addr.index == index:
-                    addr_id = addr.id
-                    break
-            checkbox.setChecked(addr_id not in self.removed_addresses)
+        if existing:
+            checkbox.setChecked(existing.id not in self.removed_addresses)
             checkbox.setToolTip("Uncheck to remove from wallet")
-            checkbox.toggled.connect(lambda checked, aid=addr_id: self.on_existing_toggled(aid, checked))
+            checkbox.toggled.connect(
+                lambda checked, aid=existing.id: self.on_existing_toggled(aid, checked))
         else:
             checkbox.setChecked(index in self.selected_addresses)
-            checkbox.toggled.connect(lambda checked, idx=index: self.on_checkbox_toggled(idx, checked))
+            checkbox.toggled.connect(
+                lambda checked, idx=index: self.on_checkbox_toggled(idx, checked))
 
         row_layout.addWidget(checkbox)
 
@@ -1099,12 +587,6 @@ class DerivationBrowserDialog(FramelessDialog):
         index_label.setFixedWidth(50)
         index_label.setFont(QFont("Consolas", 10))
         row_layout.addWidget(index_label)
-
-        # Derive address
-        try:
-            address = self.wallet.derive_address_at_index(self.seed_id, index)
-        except Exception as e:
-            address = f"Error: {e}"
 
         # Address label (truncated)
         addr_display = f"{address[:10]}...{address[-8:]}" if len(address) > 20 else address
@@ -1115,18 +597,15 @@ class DerivationBrowserDialog(FramelessDialog):
 
         # Name input
         name_input = QLineEdit()
-        default_name = f"{self.seed_id} #{index}"
-        name_input.setPlaceholderText(default_name)
+        name_input.setPlaceholderText(self.source.default_name(index))
         name_input.setFixedWidth(150)
         name_input.setProperty("index", index)
 
-        if already_exists:
+        if existing:
             # Show existing name (editable)
-            for addr in self.wallet.get_addresses_for_seed(self.seed_id):
-                if addr.index == index:
-                    name_input.setText(addr.name)
-                    name_input.textChanged.connect(lambda text, aid=addr.id: self.on_existing_name_changed(aid, text))
-                    break
+            name_input.setText(existing.name)
+            name_input.textChanged.connect(
+                lambda text, aid=existing.id: self.on_existing_name_changed(aid, text))
         else:
             name_input.textChanged.connect(lambda text, idx=index: self.on_name_changed(idx, text))
             if index in self.selected_addresses:
@@ -1139,7 +618,7 @@ class DerivationBrowserDialog(FramelessDialog):
     def on_checkbox_toggled(self, index: int, checked: bool):
         if checked:
             # Get name from input field
-            name = f"{self.seed_id} #{index}"  # Default
+            name = self.source.default_name(index)  # Default
             # Find the name input for this index
             for i in range(self.list_layout.count()):
                 item = self.list_layout.itemAt(i)
@@ -1157,7 +636,18 @@ class DerivationBrowserDialog(FramelessDialog):
 
     def on_name_changed(self, index: int, text: str):
         if index in self.selected_addresses:
-            self.selected_addresses[index] = text or f"{self.seed_id} #{index}"
+            self.selected_addresses[index] = text or self.source.default_name(index)
+
+    def get_selected_rows(self) -> list[tuple[int, str, str]]:
+        """Newly selected addresses as (index, address, name).
+
+        Callers that need the address itself - hardware wallets, which have no
+        seed to re-derive from - use this instead of reading selected_addresses.
+        """
+        rows = []
+        for index, name in sorted(self.selected_addresses.items()):
+            rows.append((index, self.source.derive(index), name))
+        return rows
 
     def on_existing_name_changed(self, address_id: str, text: str):
         """Track name changes for existing addresses."""
@@ -1309,6 +799,20 @@ class NewSeedDialog(FramelessDialog):
         self.seed_phrase = self._generated_seed
         self.accept()
 
+    def scrub(self):
+        """Drop the generated phrase; see utils.scrub_dialog for why."""
+        scrub_dialog(self, attrs=("seed_phrase", "_generated_seed"))
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
+
 
 # ============================================
 # Import Seed Dialog (for new wallet system)
@@ -1374,6 +878,20 @@ class ImportSeedToWalletDialog(FramelessDialog):
 
         self.seed_phrase = seed_phrase
         self.accept()
+
+    def scrub(self):
+        """Drop the typed phrase; see utils.scrub_dialog for why."""
+        scrub_dialog(self, attrs=("seed_phrase",))
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
 
 
 # ============================================
@@ -1469,6 +987,20 @@ class ImportPrivateKeyToWalletDialog(FramelessDialog):
         except Exception as e:
             self.error_label.setText(f"Invalid private key: {str(e)}")
 
+    def scrub(self):
+        """Drop the typed key; see utils.scrub_dialog for why."""
+        scrub_dialog(self, attrs=("private_key",))
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
+
 
 # ============================================
 # Primer Wallet Unlock Dialog
@@ -1526,11 +1058,43 @@ class VaultWalletUnlockDialog(FramelessDialog):
 
         try:
             self.wallet = VaultWallet.load(self.wallet_path, password)
+            # The caller loads the same file again through the core and needs
+            # the password to do it; it reads this attribute after exec() and
+            # is responsible for scrubbing the dialog once it has.
+            self.password = password
             self.accept()
+        except (CorruptedWalletFile, UnsupportedWalletVersion) as e:
+            # Both subclass ValueError but neither is a password problem, so
+            # they must not fall into "Wrong password" below - retyping the
+            # password cannot fix either, and saying so sends the user after
+            # the wrong problem.
+            self.error_label.setText(f"This wallet file cannot be read: {e}")
         except ValueError:
             self.error_label.setText("Wrong password")
             self.password_input.clear()
             self.password_input.setFocus()
+
+    def scrub(self):
+        """Lock and drop the second decrypted wallet this dialog holds.
+
+        self.wallet is a complete unlocked VaultWallet, separate from the copy
+        the core holds - Vault.lock_wallet() can never reach it, so it has to
+        be locked here or the seed phrases stay decrypted in memory for the
+        rest of the session.
+        """
+        if getattr(self, "wallet", None) is not None:
+            self.wallet.lock()
+        scrub_dialog(self, attrs=("wallet", "password"))
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
 
 
 # ============================================
@@ -1570,7 +1134,8 @@ class CreateWalletWizard(FramelessDialog):
         self.seed_phrase = None
         self.private_key = None
         self.derivation_path = "m/44'/60'/0'/0/{}"
-        self.method = None  # 'new_seed', 'import_seed', 'import_pkey'
+        self.method = None  # 'new_seed', 'import_seed', 'import_pkey', 'ledger'
+        self.ledger_addresses = []  # (path, address, path_type, name) tuples
         self.selected_indices = [0]  # Default to first address
         self.selected_names: dict[int, str] = {}  # index -> custom name
 
@@ -1643,20 +1208,9 @@ class CreateWalletWizard(FramelessDialog):
         self.pw_confirm_input.returnPressed.connect(self._go_next)
         layout.addWidget(self.pw_confirm_input)
 
-        self.pw_no_password_check = QCheckBox("No password (NOT recommended)")
-        self.pw_no_password_check.toggled.connect(self._on_no_password_toggled)
-        layout.addWidget(self.pw_no_password_check)
-
-        # Warning - always present but transparent when unchecked
-        self.pw_warning = QLabel(
-            "Warning: Without a password, your private keys will be stored unencrypted. "
-            "Only recommended for testnet use."
-        )
-        self.pw_warning.setWordWrap(True)
-        self.pw_warning.setFixedHeight(50)
-        self.pw_warning.setObjectName("warningBox")
-        self.pw_warning.setProperty("collapsed", True)
-        layout.addWidget(self.pw_warning)
+        pw_hint = QLabel(f"At least {MIN_PASSWORD_LENGTH} characters.")
+        pw_hint.setProperty("role", "muted")
+        layout.addWidget(pw_hint)
 
         layout.addStretch()
         self.stack.addWidget(page)
@@ -1708,6 +1262,16 @@ class CreateWalletWizard(FramelessDialog):
         import_pkey_desc = QLabel("Import a single address from a hex private key")
         import_pkey_desc.setProperty("role", "hint")
         layout.addWidget(import_pkey_desc)
+
+        layout.addSpacing(8)
+
+        self.method_ledger = QRadioButton("Connect Ledger")
+        self.method_group.addButton(self.method_ledger, 3)
+        layout.addWidget(self.method_ledger)
+
+        ledger_desc = QLabel("Use addresses from a Ledger device — keys never leave it")
+        ledger_desc.setProperty("role", "hint")
+        layout.addWidget(ledger_desc)
 
         layout.addStretch()
         self.stack.addWidget(page)
@@ -1823,17 +1387,6 @@ class CreateWalletWizard(FramelessDialog):
         layout.addStretch()
         self.stack.addWidget(page)
 
-    def _on_no_password_toggled(self, checked: bool):
-        """Handle no password checkbox toggle."""
-        self.pw_password_input.setEnabled(not checked)
-        self.pw_confirm_input.setEnabled(not checked)
-        if checked:
-            set_role(self.pw_warning, collapsed=False)
-            self.pw_password_input.clear()
-            self.pw_confirm_input.clear()
-        else:
-            set_role(self.pw_warning, collapsed=True)
-
     def _update_nav_buttons(self):
         """Update navigation button visibility and text."""
         current = self.stack.currentIndex()
@@ -1878,6 +1431,12 @@ class CreateWalletWizard(FramelessDialog):
             elif self.method_import_seed.isChecked():
                 self.method = 'import_seed'
                 self.stack.setCurrentIndex(self.PAGE_IMPORT_SEED)
+            elif self.method_ledger.isChecked():
+                # No wizard page of its own: the Ledger flow has its own dialogs,
+                # and finishing them completes the wizard.
+                self.method = 'ledger'
+                if self._pick_ledger_addresses():
+                    self.accept()
             else:
                 self.method = 'import_pkey'
                 self.stack.setCurrentIndex(self.PAGE_IMPORT_PKEY)
@@ -1900,10 +1459,6 @@ class CreateWalletWizard(FramelessDialog):
 
     def _validate_password(self) -> bool:
         """Validate password page."""
-        if self.pw_no_password_check.isChecked():
-            self.password = NO_PASSWORD_SENTINEL
-            return True
-
         password = self.pw_password_input.text()
         confirm = self.pw_confirm_input.text()
 
@@ -1913,6 +1468,14 @@ class CreateWalletWizard(FramelessDialog):
 
         if password != confirm:
             self.error_label.setText("Passwords do not match")
+            return False
+
+        # Same check the wallet itself enforces; run here so the message appears
+        # on the page rather than as a failure after the wizard finishes.
+        try:
+            validate_wallet_password(password)
+        except WeakPasswordError as e:
+            self.error_label.setText(str(e))
             return False
 
         self.password = password
@@ -1994,6 +1557,24 @@ class CreateWalletWizard(FramelessDialog):
 
         return len(self.selected_indices) > 0
 
+    def _pick_ledger_addresses(self) -> bool:
+        """Run the shared Ledger picker. Returns True if addresses were chosen.
+
+        The wallet passed in is an empty stand-in: at this point the real wallet
+        does not exist yet, and the picker only reads it to spot addresses that
+        are already present.
+        """
+        result = run_ledger_address_picker(VaultWallet.create(self.password), self)
+        if result is None:
+            return False
+
+        if not result.addresses:
+            self.error_label.setText("Select at least one address to continue")
+            return False
+
+        self.ledger_addresses = result.addresses
+        return True
+
     def _validate_import_pkey(self) -> bool:
         """Validate import private key page."""
         pkey = self.ip_pkey_input.text().strip()
@@ -2019,6 +1600,23 @@ class CreateWalletWizard(FramelessDialog):
         except Exception as e:
             self.error_label.setText(f"Invalid private key: {str(e)}")
             return False
+
+    def scrub(self):
+        """Drop the chosen password, generated/typed seed and imported key;
+        see utils.scrub_dialog for why. The caller reads these after exec()
+        and calls this once the wallet is created."""
+        scrub_dialog(self, attrs=("password", "seed_phrase", "private_key",
+                                  "_generated_seed"))
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
 
 
 # ============================================
@@ -2288,6 +1886,7 @@ class WalletSettingsDialog(FramelessDialog):
             parent=self
         )
         result = dialog.exec()
+        dialog.scrub()  # the typed passwords must not outlive the dialog
         logger.debug(f"Change password dialog returned: {result}")
         if result == QDialog.DialogCode.Accepted:
             logger.debug("Password change accepted, updating state...")
@@ -2368,10 +1967,9 @@ class ChangePasswordDialog(FramelessDialog):
         self.confirm_input.setPlaceholderText("Confirm new password")
         new_layout.addWidget(self.confirm_input)
 
-        # No password option
-        self.no_password_check = QCheckBox("No password (wallet will NOT be encrypted)")
-        self.no_password_check.toggled.connect(self._on_no_password_toggled)
-        new_layout.addWidget(self.no_password_check)
+        new_hint = QLabel(f"At least {MIN_PASSWORD_LENGTH} characters.")
+        new_hint.setProperty("role", "muted")
+        new_layout.addWidget(new_hint)
 
         layout.addWidget(new_group)
 
@@ -2396,14 +1994,6 @@ class ChangePasswordDialog(FramelessDialog):
 
         layout.addLayout(btn_layout)
 
-    def _on_no_password_toggled(self, checked: bool):
-        """Handle no-password checkbox toggle."""
-        self.new_input.setEnabled(not checked)
-        self.confirm_input.setEnabled(not checked)
-        if checked:
-            self.new_input.clear()
-            self.confirm_input.clear()
-
     def _on_save(self):
         """Validate and save new password."""
         self.error_label.setText("")
@@ -2415,41 +2005,27 @@ class ChangePasswordDialog(FramelessDialog):
                 self.error_label.setText("Please enter your current password")
                 return
 
-            # Test current password by trying to decrypt something
-            # The wallet is already unlocked, so we just verify the password matches
-            if current != self.wallet._password:
+            if not self.wallet.verify_password(current):
                 self.error_label.setText("Current password is incorrect")
                 return
 
         # Get new password
-        if self.no_password_check.isChecked():
-            new_password = NO_PASSWORD_SENTINEL
-        else:
-            new_password = self.new_input.text()
-            confirm = self.confirm_input.text()
+        new_password = self.new_input.text()
+        confirm = self.confirm_input.text()
 
-            if not new_password:
-                self.error_label.setText("Please enter a new password")
-                return
+        if not new_password:
+            self.error_label.setText("Please enter a new password")
+            return
 
-            if new_password != confirm:
-                self.error_label.setText("Passwords do not match")
-                return
+        if new_password != confirm:
+            self.error_label.setText("Passwords do not match")
+            return
 
-        # Warn about removing encryption
-        if new_password == NO_PASSWORD_SENTINEL and self.wallet.is_encrypted:
-            confirmed = FramelessMessageBox.ask_question(
-                self,
-                "Remove Encryption?",
-                "You are about to remove password protection.\n\n"
-                "Your private keys will be stored in plaintext. "
-                "Anyone with access to this file can steal your funds.\n\n"
-                "Are you sure?",
-                yes_text="Remove",
-                no_text="Cancel"
-            )
-            if not confirmed:
-                return
+        try:
+            validate_wallet_password(new_password)
+        except WeakPasswordError as e:
+            self.error_label.setText(str(e))
+            return
 
         # Change password
         try:
@@ -2463,3 +2039,20 @@ class ChangePasswordDialog(FramelessDialog):
         except Exception as e:
             logger.exception("Failed to change password")
             self.error_label.setText(f"Failed to change password: {e}")
+
+    def scrub(self):
+        """Blank the three password fields; see utils.scrub_dialog for why.
+
+        self.wallet is the core's own wallet, not a private copy - it must
+        stay usable, so only the widgets are cleared."""
+        scrub_dialog(self)
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)

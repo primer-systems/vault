@@ -11,9 +11,11 @@ Provides endpoints for:
 NOTE: This module has NO Qt dependencies.
 """
 
-import hashlib
+import html
 import json
+import os
 import re
+import socket
 import threading
 import time
 from collections import defaultdict
@@ -22,6 +24,8 @@ from socketserver import ThreadingMixIn
 from typing import Optional, Callable, TYPE_CHECKING
 
 from ..design_tokens import web_css_vars, status_color, DARK
+from ..utils import is_browser_request, is_rebound_host
+from ..version import __version__
 
 if TYPE_CHECKING:
     from .signing import SigningService
@@ -29,7 +33,15 @@ if TYPE_CHECKING:
 
 
 class ServerStats:
-    """Track server statistics for current session."""
+    """What this server has done since it started.
+
+    Payments and trades are counted separately because they are separate
+    products, and a total that merges them answers neither question - someone
+    using Vault only to trade should see their trades move the counter.
+
+    Session-only and deliberately so - the durable record is the transaction
+    history, and these reset with the server.
+    """
 
     def __init__(self):
         self.reset()
@@ -37,6 +49,8 @@ class ServerStats:
     def reset(self):
         self.signed = 0
         self.rejected = 0
+        self.traded = 0
+        self.trade_rejected = 0
         self.started_at: Optional[str] = None
 
     def start(self):
@@ -55,13 +69,11 @@ _trading_service: Optional["TradingService"] = None
 
 
 class RateLimiter:
-    """
-    LOAD-01: Simple rate limiter to prevent abuse.
+    """Per-IP request ceiling, applied per minute.
 
-    Limits requests per IP per minute.
-
-    Note: Duplicate request detection is now handled by signature-based
-    idempotency in SigningService, not by this class.
+    Bounds how fast any one caller can drive the agent API. Duplicate requests
+    are a separate concern, handled by signature-based idempotency in
+    SigningService rather than here.
     """
 
     def __init__(self, requests_per_minute: int = 300):
@@ -70,12 +82,28 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def is_rate_limited(self, client_ip: str) -> bool:
-        """Check if client has exceeded rate limit."""
+        """Check if client has exceeded rate limit.
+
+        A ceiling of 0 means no ceiling, which is what the setting has always
+        said it means. Without this line the comparison below is `>= 0` on an
+        empty window, so 0 would refuse every request instead of allowing them
+        all - the setting would lock the user out of their own agent API.
+        """
+        if self.requests_per_minute <= 0:
+            return False
+
         now = time.time()
         window_start = now - 60
 
         with self._lock:
-            # Clean old entries
+            # Drop callers with nothing left in the window. Without this the map
+            # keeps a key for every address ever seen, which on a daemon exposed
+            # to a LAN grows for as long as the process runs.
+            for ip in [k for k, times in self._request_times.items()
+                       if not times or times[-1] <= window_start]:
+                del self._request_times[ip]
+
+            # Clean old entries for this caller
             self._request_times[client_ip] = [
                 t for t in self._request_times[client_ip]
                 if t > window_start
@@ -103,8 +131,20 @@ class RateLimiter:
 rate_limiter = RateLimiter()
 
 
-# Map error codes to appropriate HTTP status codes
+# Map error codes to appropriate HTTP status codes.
+#
+# This is the complete directory of every code the Vault emits, across the
+# agent API (this file, signing.py, trading.py), the admin API
+# (daemon/admin_api.py), and the bundled client (client/core_client.py).
+# Endpoints that pick their status another way (an explicit status argument,
+# or the status field of a service result) do not consult this map for those
+# responses, but every code still gets an entry here so the directory stays
+# authoritative. Unknown codes fall back to 400 via get_http_status_for_error.
 ERROR_CODE_TO_HTTP_STATUS = {
+    # 200/202 - informational codes that ride along on non-error responses
+    "ALREADY_SIGNED": 200,       # accompanies status "success"
+    "APPROVAL_REQUIRED": 202,    # accompanies status "pending"
+
     # 400 Bad Request - client errors, malformed request
     "INVALID_X402_FORMAT": 400,
     "INVALID_X402_RESPONSE": 400,
@@ -117,44 +157,113 @@ ERROR_CODE_TO_HTTP_STATUS = {
     "INVALID_EVENT": 400,
     "MISSING_TX_HASH": 400,
     "INVALID_TX_HASH": 400,
+    "BAD_REQUEST": 400,
+    "ERROR": 400,                # generic fallback code
+    "INVALID_JSON": 400,
+    "INVALID_CONTENT_LENGTH": 400,
+    "INVALID_REQUEST_ID": 400,
+    "INVALID_TRANSACTION_ID": 400,
+    "MISSING_AGENT_ID": 400,
+    "MISSING_SIGNATURE": 400,
+    "MISSING_TRADE": 400,
+    "MISSING_TRANSACTION_ID": 400,
+    "MISSING_REQUEST_ID": 400,
+    "MISSING_EVENT": 400,
+    "FIELD_NOT_PERMITTED": 400,
+    # Admin API validation and operation failures (admin_api.py sends these
+    # with an explicit 400; listed here so the directory is complete)
+    "MISSING_NAME": 400,
+    "MISSING_FIELDS": 400,
+    "UNKNOWN_SETTING": 400,
+    "NOT_COMMISSIONED": 400,
+    "APPROVAL_FAILED": 400,
+    "TRADE_FAILED": 400,
+    "CREATE_FAILED": 400,
+    "IMPORT_FAILED": 400,
+    "DELETE_FAILED": 400,
+    "DERIVE_FAILED": 400,
+    "RENAME_FAILED": 400,
+    "UPDATE_FAILED": 400,
+    "MANDATE_FAILED": 400,
+    "SET_MANDATE_FAILED": 400,
+    "UPLOAD_FAILED": 400,
 
     # 401 Unauthorized - authentication failure
     "AUTH_FAILED": 401,
+    "UNLOCK_FAILED": 401,
 
     # 403 Forbidden - authenticated but not allowed
     "NETWORK_DISABLED": 403,
+    "NETWORK_NOT_ALLOWED_BY_POLICY": 403,
     "DOMAIN_NOT_ALLOWED": 403,
+    "UNSUPPORTED_ASSET": 403,
     "DOMAIN_URL_REQUIRED": 403,
     "AGENT_SUSPENDED": 403,
     "AGENT_NOT_COMMISSIONED": 403,
+    "ADDRESS_NOT_COMMISSIONED": 403,
     "UNAUTHORIZED": 403,
+    "X402_DISABLED": 403,
+    "POLICY_REJECTED": 403,
+    "FOREIGN_HOST_REJECTED": 403,
+    "BROWSER_ORIGIN_REJECTED": 403,
+    "GUI_ONLY_MODE": 403,
+    "LEDGER_REJECTED": 403,      # the human declined on the device
+    # Permanent: this request is larger than the policy allows and will be on
+    # every retry. 429 would tell a standard client to back off and try again,
+    # which can only fail.
+    "EXCEEDS_PER_REQUEST_MAX": 403,
 
     # 404 Not Found - resource doesn't exist
     "AGENT_NOT_FOUND": 404,
+    "UNKNOWN_AGENT": 404,
     "POLICY_NOT_FOUND": 404,
     "TRANSACTION_NOT_FOUND": 404,
     "REQUEST_NOT_FOUND": 404,
     "ADDRESS_NOT_FOUND": 404,
     "AGENT_OR_POLICY_MISSING": 404,
+    "NOT_FOUND": 404,
+
+    # 405 Method Not Allowed
+    "METHOD_NOT_ALLOWED": 405,
 
     # 409 Conflict - request conflicts with current state
     "REQUEST_ALREADY_PROCESSED": 409,
     "PAYMENT_ALREADY_SETTLED": 409,
+    "REQUEST_EXPIRED": 409,          # approval window closed; submit a new request
+    "PRICE_MOVED": 409,              # market moved past tolerance; re-quote and resubmit
+    "TRADE_NO_LONGER_VALID": 409,
 
-    # 429 Too Many Requests - rate/limit exceeded
+    # 413 Payload Too Large
+    "PAYLOAD_TOO_LARGE": 413,
+
+    # 429 Too Many Requests - the caller may succeed later without changing
+    # anything. A daily limit clears at midnight, so waiting is the remedy and
+    # a client's automatic backoff is doing the right thing.
     "RATE_LIMIT_EXCEEDED": 429,
     "LIMIT_REACHED": 429,
     "EXCEEDS_DAILY_LIMIT": 429,
-    "EXCEEDS_PER_REQUEST_MAX": 429,
+    "TOO_MANY_PENDING": 429,
+    "TOO_MANY_ATTEMPTS": 429,
 
     # 500 Internal Server Error - server-side issues
     "NO_WALLET_PROVIDER": 500,
+    "NO_WALLET": 500,
+    "NO_WALLET_ADDRESS": 500,
     "SDK_NOT_FOUND": 500,
     "SIGNING_ERROR": 500,
+    "INTERNAL_ERROR": 500,
+    "EXECUTION_ERROR": 500,
+    "REQUOTE_FAILED": 500,
+    "LEDGER_ERROR": 500,
+    "LEDGER_NO_SIGNATURE": 500,
+    "HTTP_ERROR": 500,           # client-side synthetic (core_client.py), never sent by the server
 
-    # 503 Service Unavailable - temporary, retryable
+    # 503 Service Unavailable - temporary, retryable (often user-fixable in the app)
     "SERVICE_NOT_READY": 503,
     "WALLET_LOCKED": 503,
+    "WALLET_ADDRESS_NOT_FOUND": 503,  # wrong/locked wallet open; user can fix
+    "LEDGER_DISCONNECTED": 503,
+    "LEDGER_SIGN_NOT_AVAILABLE": 503,
 }
 
 
@@ -166,108 +275,39 @@ def get_http_status_for_error(error_code: str) -> int:
 # Maximum request body size (1MB - sufficient for x402 payloads)
 MAX_CONTENT_LENGTH = 1 * 1024 * 1024
 
+# Ceiling on concurrently served connections. Agents are a handful of local
+# processes, so this is generous for real use and still bounds a runaway caller.
+MAX_WORKER_THREADS = 32
+
+# How long a connection may go silent mid-request before it is dropped.
+#
+# Bounds the time one caller can hold a worker. A caller that announces a body
+# and then stops sending would otherwise keep its thread for the life of the
+# process, and enough of those exhaust the pool above - after which agents get
+# no answer at all, with nothing in the window to say why. This happens by
+# accident more than by intent: a machine that sleeps or a link that drops mid
+# request never closes the socket, so there is nothing for the server to notice.
+#
+# This is silence on the socket, not time spent working. A trade that waits
+# minutes on block confirmations is not idle and is unaffected.
+SOCKET_TIMEOUT_SECONDS = 30
+
 # Validation patterns for path/query parameters
 UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
 TX_HASH_PATTERN = re.compile(r'^0x[0-9a-fA-F]{64}$')
-AGENT_ID_PATTERN = re.compile(r'^[A-Z0-9]{3,8}$')
 
 
 def get_signing_helper() -> str:
-    """Return a Python script that agents can use to sign requests."""
-    return '''#!/usr/bin/env python3
-"""
-Vault Signing Helper - Sign x402 payment requests for Vault.
+    """Return the signing helper script agents fetch from /sign/helper.
 
-Uses HMAC-SHA256 for signing (stdlib only, no extra dependencies).
-
-Usage:
-    python vault_sign.py <agent_id> <agent_token> <payment_required_header>
-
-Or import and use directly:
-    from vault_sign import sign_request, send_to_primer_vault
-"""
-
-import hmac
-import hashlib
-import json
-import sys
-import time
-import urllib.request
-
-
-def sign_request(agent_id: str, agent_token: str, payment_required: str, request_url: str = None) -> dict:
+    Read from the skill folder rather than kept as a second inline copy. The
+    helper and the server have to agree on every signed field name exactly, so
+    there is one file and both sides read it.
     """
-    Sign a request for Vault using HMAC-SHA256.
-
-    Args:
-        agent_id: Your agent ID (e.g., "ABC123")
-        agent_token: Your agent token (e.g., "AT_abc123...")
-        payment_required: The Payment-Required header value from the 402 response
-        request_url: Optional URL you fetched (for domain verification)
-
-    Returns:
-        The signed request ready to POST to Vault's /sign endpoint
-    """
-    # Extract shared secret from token (strip "AT_" prefix)
-    shared_secret = bytes.fromhex(agent_token[3:])
-
-    # Create message to sign
-    timestamp = int(time.time())
-    message_data = {
-        "agent_id": agent_id,
-        "timestamp": timestamp,
-        "payment_required": payment_required
-    }
-    if request_url:
-        message_data["request_url"] = request_url
-    message = json.dumps(message_data, separators=(',', ':'), sort_keys=True).encode()
-
-    # Sign with HMAC-SHA256
-    sig = hmac.new(shared_secret, message, hashlib.sha256).hexdigest()
-
-    result = {
-        "agent_id": agent_id,
-        "signature": f"SIG:{timestamp}:{sig}",
-        "payment_required": payment_required
-    }
-    if request_url:
-        result["request_url"] = request_url
-    return result
-
-
-def send_to_primer_vault(signed_request: dict, primer_vault_url: str = "http://localhost:4663") -> dict:
-    """
-    Send a signed request to Vault and get the payment header.
-
-    Returns the Vault response with payment header on success.
-    """
-    url = f"{primer_vault_url}/sign"
-    data = json.dumps(signed_request).encode()
-
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"}
-    )
-
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read().decode())
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: python primer_sign.py <agent_id> <agent_token> <payment_required_header> [request_url]")
-        sys.exit(1)
-
-    agent_id = sys.argv[1]
-    agent_token = sys.argv[2]
-    payment_required = sys.argv[3]
-    request_url = sys.argv[4] if len(sys.argv) > 4 else None
-
-    signed = sign_request(agent_id, agent_token, payment_required, request_url)
-    result = send_to_primer_vault(signed)
-    print(json.dumps(result, indent=2))
-'''
+    path = _skill_file("vault-x402-payment/scripts/primer_sign.py")
+    if path is None:
+        return "# Error: signing helper script not found in this installation.\n"
+    return path.read_text(encoding="utf-8")
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -281,8 +321,12 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _load_skill(skill_name: str) -> Optional[str]:
-    """Load a skill's SKILL.txt (frontmatter stripped), or None if not found."""
+def _skill_file(relative: str):
+    """Resolve a path inside the skills folder, or None if it is not there.
+
+    Frozen builds extract skills to _MEIPASS/skills; pip and dev runs keep them
+    inside the package.
+    """
     import sys
     from pathlib import Path
 
@@ -292,10 +336,18 @@ def _load_skill(skill_name: str) -> Optional[str]:
     bases.append(Path(__file__).parent.parent / "skills")  # pip / dev
 
     for base in bases:
-        path = base / skill_name / "SKILL.txt"
+        path = base.joinpath(*relative.split("/"))
         if path.exists():
-            return _strip_frontmatter(path.read_text(encoding="utf-8"))
+            return path
     return None
+
+
+def _load_skill(skill_name: str) -> Optional[str]:
+    """Load a skill's SKILL.txt (frontmatter stripped), or None if not found."""
+    path = _skill_file(f"{skill_name}/SKILL.txt")
+    if path is None:
+        return None
+    return _strip_frontmatter(path.read_text(encoding="utf-8"))
 
 
 def get_agent_instructions() -> str:
@@ -351,7 +403,6 @@ def get_branded_html(port: int) -> str:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Vault - Agent Link</title>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     {web_css_vars()}
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -473,7 +524,7 @@ def get_branded_html(port: int) -> str:
       </div>
       <div class="stat">
         <span class="stat-label">Version: </span>
-        <span class="stat-value">0.1.0</span>
+        <span class="stat-value">{__version__}</span>
       </div>
       <div class="stat">
         <span class="stat-label">{server_stats.signed}</span>
@@ -482,6 +533,14 @@ def get_branded_html(port: int) -> str:
       <div class="stat">
         <span class="stat-label">{server_stats.rejected}</span>
         <span class="stat-value warning"> rejected</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">{server_stats.traded}</span>
+        <span class="stat-value"> traded</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">{server_stats.trade_rejected}</span>
+        <span class="stat-value warning"> refused</span>
       </div>
     </div>
 
@@ -492,7 +551,8 @@ def get_branded_html(port: int) -> str:
         <span class="panel-name">FUNCTION</span>
       </div>
       <div class="panel-body">
-        <p>This server accepts x402 payment requests from your local AI agents, presents them for user approval in the Vault desktop app, and returns signed authorizations. Your keys never leave the app; agent spending is controlled by your pay policies.</p>
+        <p>This server takes requests from your local AI agents and answers them under the policy you set. Two kinds: <strong>trades</strong> on Uniswap v3 and v4, and <strong>x402 payment authorizations</strong>. Anything above your auto-approve threshold is held for you to approve in the Vault desktop app.</p>
+        <p style="margin-top: 12px;">Your keys never leave the app. Agents receive a code and a token that let them <em>ask</em> for a signature; every signature is produced here.</p>
       </div>
     </div>
 
@@ -534,9 +594,49 @@ def get_branded_html(port: int) -> str:
               <td>Health check for agents</td>
             </tr>
             <tr>
+              <td><code>/ping</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>Whether an agent is known and able to work</td>
+            </tr>
+            <tr>
+              <td><code>/mandate</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>An agent&#39;s policy limits and Intent Mandate (signed)</td>
+            </tr>
+            <tr>
+              <td><code>/trade</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>Submit a swap</td>
+            </tr>
+            <tr>
+              <td><code>/trade/status/{{id}}</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>Poll for a trade result</td>
+            </tr>
+            <tr>
               <td><code>/sign</code></td>
               <td><span class="method method-post">POST</span></td>
-              <td>Submit x402 request for signing</td>
+              <td>Submit an x402 request for signing</td>
+            </tr>
+            <tr>
+              <td><code>/sign/status/{{id}}</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>Poll for a signing result</td>
+            </tr>
+            <tr>
+              <td><code>/sign/helper</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>Download the Python signing helper</td>
+            </tr>
+            <tr>
+              <td><code>/callback</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>Report a settled transaction</td>
+            </tr>
+            <tr>
+              <td><code>/receipt/{{id}}</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>AP2 receipt, by transaction id</td>
             </tr>
           </tbody>
         </table>
@@ -563,12 +663,12 @@ def get_branded_html(port: int) -> str:
     </div>
 
     <div class="footer">
-      <span>&copy; 2025 Primer Systems</span>
+      <span>&copy; 2026 Primer Systems</span>
       <span style="color: var(--dim);">dev@primer.systems</span>
       <div>
-        <a href="https://x.com/primersystems">X</a>
-        <a href="https://t.me/primersystems">TG</a>
-        <a href="https://github.com/primersystems">GIT</a>
+        <a href="https://x.com/primer_systems">X</a>
+        <a href="https://t.me/primer_HQ">TG</a>
+        <a href="https://github.com/primer-systems">GIT</a>
       </div>
     </div>
   </div>
@@ -579,6 +679,9 @@ def get_branded_html(port: int) -> str:
 class AgentRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for agent x402 signing requests."""
 
+    # Drop a connection that stalls rather than holding a worker on it.
+    timeout = SOCKET_TIMEOUT_SECONDS
+
     def log_message(self, format, *args):
         """Suppress default logging."""
         pass
@@ -587,27 +690,36 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         """Send a JSON response."""
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
-    def _send_html_response(self, status: int, html: str):
-        """Send an HTML response."""
+    def _send_html_response(self, status: int, body: str):
+        """Send an HTML response.
+
+        Carries a policy forbidding script, objects and framing. These pages are
+        rendered from values Vault did not author - a merchant chooses the
+        resource description on a receipt - so the escaping below is the fix and
+        this header is the backstop for anywhere it is missed.
+        """
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+            "font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(body.encode())
 
     def _send_text_response(self, status: int, text: str, content_type: str = "text/plain"):
         """Send a plain text response."""
         self.send_response(status)
         self.send_header("Content-Type", f"{content_type}; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(text.encode())
 
-    # EP-02/EP-03: Define which endpoints accept which methods
+    # Which endpoints accept which methods, so a wrong verb gets a 405 naming
+    # the right one rather than a bare 404.
     # Note: /sign/status/{id} and /receipt/{id} are dynamic paths handled separately
     GET_ENDPOINTS = frozenset(["/", "/agent", "/sign/helper", "/status", "/health"])
     POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade"])
@@ -616,7 +728,6 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         """Send 405 Method Not Allowed response."""
         self.send_response(405)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Allow", ", ".join(allowed_methods))
         self.end_headers()
         self.wfile.write(json.dumps({
@@ -633,7 +744,6 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         """
         self.send_response(503)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Retry-After", str(retry_after))
         self.end_headers()
         response = {**data, "retry_after": retry_after}
@@ -648,6 +758,54 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     def _get_client_ip(self) -> str:
         """Get the client IP address."""
         return self.client_address[0]
+
+    def _reject_if_browser(self) -> bool:
+        """Refuse requests a web page initiated. True if the request may proceed.
+
+        This server signs payments and executes trades, so a blind write from a
+        page is enough to do damage even though same-origin rules stop it
+        reading the reply. Dropping the CORS headers alone would not stop that.
+
+        Two headers decide it. `Origin` catches the ordinary case. `Host`
+        catches DNS rebinding, where the page has made itself same-origin with
+        us and so sends no Origin at all - see utils.is_rebound_host.
+        """
+        if is_rebound_host(self.headers, self.server.server_address[0]):
+            import logging
+            logging.getLogger(__name__).warning(
+                "Agent API rejected a request for host %r; this socket is "
+                "loopback-only", self.headers.get("Host")
+            )
+            self._drain_request_body()
+            self._send_json_response(403, {
+                "status": "error",
+                "code": "FOREIGN_HOST_REJECTED",
+                "error": "Requests for a host other than localhost are not accepted.",
+            })
+            return False
+
+        if not is_browser_request(self.headers):
+            return True
+        self._drain_request_body()
+        self._send_json_response(403, {
+            "status": "error",
+            "code": "BROWSER_ORIGIN_REJECTED",
+            "error": "Requests from web pages are not accepted by the agent API.",
+        })
+        return False
+
+    def _drain_request_body(self):
+        """Consume any request body before refusing, so the client sees the 403
+        rather than a connection reset."""
+        try:
+            remaining = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
 
     def _check_rate_limit(self) -> bool:
         """Check rate limit and send 429 if exceeded. Returns True if request should proceed."""
@@ -665,7 +823,20 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         return True
 
     def _render_receipt_html(self, receipt: dict) -> str:
-        """Render an AP2 receipt as a branded HTML page."""
+        """Render an AP2 receipt as a branded HTML page.
+
+        Every value below goes through `esc`. Most of them Vault did not author:
+        the resource description comes from whoever issued the payment request,
+        and agent and policy names are free text. Pasting those into markup
+        unescaped let a merchant put script on a page served from Vault's own
+        origin.
+        """
+        def esc(value) -> str:
+            """Render any value as text that cannot become markup."""
+            if value is None:
+                return ""
+            return html.escape(str(value), quote=True)
+
         status = receipt.get("status", "unknown")
         status_bg = status_color(status, DARK)
 
@@ -679,15 +850,16 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
         settlement_html = ""
         if settlement:
-            tx_hash = settlement.get("txHash", "")
+            tx_hash = str(settlement.get("txHash", ""))
             verification = settlement.get("verification", {})
+            short_hash = f"{tx_hash[:20]}...{tx_hash[-8:]}" if len(tx_hash) > 28 else tx_hash
             settlement_html = f'''
             <div class="panel">
               <div class="panel-header">SETTLEMENT</div>
               <div class="panel-body">
-                <div class="field"><span class="label">TX Hash:</span> <code>{tx_hash[:20]}...{tx_hash[-8:]}</code></div>
-                <div class="field"><span class="label">Settled At:</span> {settlement.get("settledAt", "N/A")}</div>
-                <div class="field"><span class="label">Verification:</span> {verification.get("status", "unverified") if verification else "unverified"}</div>
+                <div class="field"><span class="label">TX Hash:</span> <code>{esc(short_hash)}</code></div>
+                <div class="field"><span class="label">Settled At:</span> {esc(settlement.get("settledAt") or "N/A")}</div>
+                <div class="field"><span class="label">Verification:</span> {esc((verification or {}).get("status") or "unverified")}</div>
               </div>
             </div>'''
 
@@ -696,8 +868,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AP2 Receipt - {receipt.get("transactionId", "")[:8]}</title>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <title>AP2 Receipt - {esc(str(receipt.get("transactionId", ""))[:8])}</title>
   <style>
     {web_css_vars()}
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -708,7 +879,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     .title {{ color: var(--dim); font-size: 11px; letter-spacing: 2px; margin-bottom: 8px; }}
     h1 {{ font-size: 16px; font-weight: 400; color: var(--accent); margin-bottom: 4px; }}
     .tx-id {{ color: var(--muted); font-size: 11px; }}
-    .status {{ display: inline-block; padding: 4px 12px; border-radius: 2px; font-size: 11px; font-weight: 600; background: {status_bg}; color: var(--bg); margin: 16px 0; }}
+    .status {{ display: inline-block; padding: 4px 12px; border-radius: 2px; font-size: 11px; font-weight: 600; background: {esc(status_bg)}; color: var(--bg); margin: 16px 0; }}
     .panel {{ background: var(--accent-tint); border: 1px solid var(--line); margin-bottom: 16px; }}
     .panel-header {{ padding: 10px 14px; border-bottom: 1px solid var(--line); color: var(--dim); font-size: 11px; letter-spacing: 1px; }}
     .panel-body {{ padding: 14px; }}
@@ -726,34 +897,34 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     </div>
 
     <div class="title">TRANSACTION</div>
-    <h1>{payment.get("amount", {}).get("formatted", "$0.00")} Payment</h1>
-    <div class="tx-id">ID: {receipt.get("transactionId", "N/A")}</div>
-    <div class="status">{status.upper()}</div>
+    <h1>{esc(payment.get("amount", {}).get("formatted") or "$0.00")} Payment</h1>
+    <div class="tx-id">ID: {esc(receipt.get("transactionId") or "N/A")}</div>
+    <div class="status">{esc(str(status).upper())}</div>
 
     <div class="panel">
       <div class="panel-header">INTENT (AUTHORIZATION)</div>
       <div class="panel-body">
-        <div class="field"><span class="label">Policy:</span> {intent.get("policyName", "N/A")}</div>
-        <div class="field"><span class="label">Agent:</span> {intent.get("agent", {}).get("name", "N/A")} (<code>{intent.get("agent", {}).get("code", "N/A")}</code>)</div>
+        <div class="field"><span class="label">Policy:</span> {esc(intent.get("policyName") or "N/A")}</div>
+        <div class="field"><span class="label">Agent:</span> {esc(intent.get("agent", {}).get("name") or "N/A")} (<code>{esc(intent.get("agent", {}).get("code") or "N/A")}</code>)</div>
         <div class="field"><span class="label">Approval:</span> {"Auto-approved by policy" if auth.get("method") == "auto" else "Manually approved"}</div>
-        <div class="field"><span class="label">Authorized At:</span> {auth.get("authorizedAt", "N/A")}</div>
+        <div class="field"><span class="label">Authorized At:</span> {esc(auth.get("authorizedAt") or "N/A")}</div>
       </div>
     </div>
 
     <div class="panel">
       <div class="panel-header">PAYMENT</div>
       <div class="panel-body">
-        <div class="field"><span class="label">Amount:</span> <code>{payment.get("amount", {}).get("formatted", "$0.00")}</code> ({payment.get("amount", {}).get("cents", 0)} cents)</div>
-        <div class="field"><span class="label">Network:</span> {payment.get("network", "N/A")}</div>
-        <div class="field"><span class="label">Recipient:</span> <code>{payment.get("recipient", "N/A")[:20]}...</code></div>
-        <div class="field"><span class="label">Resource:</span> {payment.get("resource", "N/A") or "N/A"}</div>
+        <div class="field"><span class="label">Amount:</span> <code>{esc(payment.get("amount", {}).get("formatted") or "$0.00")}</code> ({esc(payment.get("amount", {}).get("micro", 0))} micro-USDG)</div>
+        <div class="field"><span class="label">Network:</span> {esc(payment.get("network") or "N/A")}</div>
+        <div class="field"><span class="label">Recipient:</span> <code>{esc(str(payment.get("recipient") or "N/A")[:20])}...</code></div>
+        <div class="field"><span class="label">Resource:</span> {esc(payment.get("resource") or "N/A")}</div>
       </div>
     </div>
 
     {settlement_html}
 
     <div class="footer">
-      Generated by Vault &middot; AP2 Protocol v0.1 &middot; {receipt.get("timestamp", "")}
+      Generated by Vault &middot; AP2 Protocol v0.1 &middot; {esc(receipt.get("timestamp") or "")}
     </div>
   </div>
 </body>
@@ -761,13 +932,16 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests."""
-        # LOAD-01: Check rate limit
+        if not self._reject_if_browser():
+            return
+
+        # Rate limit
         if not self._check_rate_limit():
             return
 
         base_path = self._get_base_path()
 
-        # EP-02: Check if this is a POST-only endpoint accessed with GET
+        # A POST-only endpoint reached with GET
         if base_path in self.POST_ENDPOINTS:
             self._send_method_not_allowed(["POST"])
             return
@@ -776,18 +950,18 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             port = self.server.server_address[1]
             self._send_html_response(200, get_branded_html(port))
         elif self.path.startswith("/agent"):
-            port = self.server.server_address[1]
-            # Parse query params for agent_code
             self._send_text_response(200, get_agent_instructions(), "text/plain")
         elif self.path == "/sign/helper":
             self._send_text_response(200, get_signing_helper(), "text/x-python")
         elif self.path == "/status":
             self._send_json_response(200, {
                 "service": "Vault",
-                "version": "1.0.0",
+                "version": __version__,
                 "status": "ready",
                 "signed": server_stats.signed,
                 "rejected": server_stats.rejected,
+                "traded": server_stats.traded,
+                "trade_rejected": server_stats.trade_rejected,
                 "started_at": server_stats.started_at
             })
         elif self.path == "/health":
@@ -825,7 +999,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 return
             if _trading_service:
                 result = _trading_service.get_trade_status(request_id)
-                if result.get("code") == "UNKNOWN_REQUEST":
+                if result.get("code") == "REQUEST_NOT_FOUND":
                     self._send_json_response(404, result)
                 elif result.get("status") == "pending":
                     self._send_json_response(202, result)
@@ -839,9 +1013,24 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             if not tx_id:
                 self._send_json_response(400, {"status": "error", "error": "Missing transaction ID", "code": "MISSING_TRANSACTION_ID"})
                 return
-            # Accept either UUID or tx_hash format
-            if not UUID_PATTERN.match(tx_id) and not TX_HASH_PATTERN.match(tx_id):
-                self._send_json_response(400, {"status": "error", "error": "Invalid transaction ID format", "code": "INVALID_TRANSACTION_ID"})
+            # The UUID only, deliberately.
+            #
+            # This endpoint carries no authentication, and the receipt behind it
+            # holds the agent name, the policy name, the wallet address, the
+            # recipient, the resource and the amount. Accepting an on-chain hash
+            # meant anyone watching the chain held a lookup key for all of that -
+            # hashes are public by definition. A transaction id is a random UUID
+            # that only ever went to the agent that made the payment, so it is a
+            # secret in a way a hash can never be.
+            #
+            # Hash lookup is still available on the Admin API, which is behind
+            # the gui_only gate.
+            if not UUID_PATTERN.match(tx_id):
+                self._send_json_response(400, {
+                    "status": "error",
+                    "error": "Receipts are looked up by transaction id, not by "
+                             "on-chain hash",
+                    "code": "INVALID_TRANSACTION_ID"})
                 return
 
             if _signing_service:
@@ -865,18 +1054,36 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests - signing and ping requests."""
-        # LOAD-01: Check rate limit
+        if not self._reject_if_browser():
+            return
+
+        # Rate limit
         if not self._check_rate_limit():
             return
 
         base_path = self._get_base_path()
 
-        # EP-03: Check if this is a GET-only endpoint accessed with POST
+        # A GET-only endpoint reached with POST
         if base_path in self.GET_ENDPOINTS:
             self._send_method_not_allowed(["GET"])
             return
 
-        content_length = int(self.headers.get("Content-Length", 0))
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_json_response(400, {
+                "status": "error",
+                "error": "Invalid Content-Length header",
+                "code": "INVALID_CONTENT_LENGTH"
+            })
+            return
+        if content_length < 0:
+            self._send_json_response(400, {
+                "status": "error",
+                "error": "Invalid Content-Length header",
+                "code": "INVALID_CONTENT_LENGTH"
+            })
+            return
         if content_length > MAX_CONTENT_LENGTH:
             self._send_json_response(413, {
                 "status": "error",
@@ -884,7 +1091,11 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 "code": "PAYLOAD_TOO_LARGE"
             })
             return
-        body = self.rfile.read(content_length).decode() if content_length > 0 else "{}"
+        # Decoding outside the JSON guard meant a body that was not UTF-8 raised
+        # before any handler ran, and the caller got a reset instead of an error.
+        # Anything undecodable is not JSON either, so let the parse below say so.
+        raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        body = raw.decode("utf-8", errors="replace")
 
         try:
             request_data = json.loads(body) if body else {}
@@ -988,8 +1199,17 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                 elif error_code == "WALLET_LOCKED":
                     self._send_service_unavailable(result)
                     return
-                elif status in ("rejected", "failed"):
+                elif status == "rejected":
+                    # The request was understood and refused - policy, shape, or
+                    # a pool that will not quote. Changing the request is what
+                    # helps, so this is the caller's to fix.
                     status_code = 400
+                elif status == "failed":
+                    # Accepted, then something went wrong on this side or on the
+                    # chain. The request was fine; resending it unchanged is a
+                    # reasonable thing for the caller to do, and a 400 would tell
+                    # it to go and fix a request that had nothing wrong with it.
+                    status_code = 500
                 else:
                     status_code = get_http_status_for_error(error_code) if error_code else 200
                 self._send_json_response(status_code, result)
@@ -999,8 +1219,13 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         elif self.path == "/callback":
             # Agent callback to report transaction status
             agent_id = request_data.get("agent_id")
+            signature = request_data.get("signature")
             transaction_id = request_data.get("transaction_id")
             event = request_data.get("event")  # submitted | settled | failed
+
+            if not signature:
+                self._send_json_response(400, {"status": "error", "error": "Missing signature", "code": "MISSING_SIGNATURE"})
+                return
 
             if not agent_id:
                 self._send_json_response(400, {"status": "error", "error": "Missing agent_id", "code": "MISSING_AGENT_ID"})
@@ -1026,7 +1251,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             if _signing_service:
                 tx_hash = request_data.get("tx_hash")
                 error = request_data.get("error")
-                result = _signing_service.handle_callback(agent_id, transaction_id, event, tx_hash, error)
+                result = _signing_service.handle_callback(
+                    agent_id, transaction_id, event, tx_hash, error, signature=signature)
                 if result.get("status") == "ok":
                     status_code = 200
                 else:
@@ -1061,22 +1287,72 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_json_response(404, {"status": "error", "error": "Not found", "code": "NOT_FOUND"})
 
-    def do_OPTIONS(self):
-        """Handle CORS preflight."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
-
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     """HTTP server that handles each request in a separate thread.
 
-    This prevents concurrent connections from blocking each other.
-    LOAD-02: Fixes crash under concurrent load by using ThreadingMixIn.
+    Connections are served independently, so one slow caller does not hold up
+    the others.
+
+    Threads are capped: a thread per connection with no ceiling lets any local
+    process exhaust the process by opening sockets. Beyond the cap, connections
+    wait in the listen backlog rather than each claiming a thread, which is the
+    behaviour a caller can actually cope with.
+
+    The cap is enforced with a semaphore rather than by setting `max_children`.
+    That attribute belongs to ForkingMixIn; ThreadingMixIn never reads it, so
+    setting it here looked like a ceiling and was not one.
+
+    Address reuse is POSIX-only, deliberately, and for the same reason the admin
+    server makes the same split. On POSIX, SO_REUSEADDR only permits rebinding
+    past TIME_WAIT remnants after a restart. On Windows it also lets a second
+    socket bind a port that is actively in use, so any local process could bind
+    over a running agent API and take agent traffic - x402 payment requests and
+    trades, carrying the tokens agents authenticate with. Windows instead gets
+    SO_EXCLUSIVEADDRUSE, which refuses that. HTTPServer defaults this on, so it
+    has to be turned off explicitly rather than simply left unset.
     """
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True  # Don't block shutdown waiting for threads
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(MAX_WORKER_THREADS)
+
+    def server_bind(self):
+        if os.name == "nt":
+            try:
+                self.socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass  # non-Windows Python without the constant, or an odd stack
+        super().server_bind()
+
+    def process_request(self, request, client_address):
+        """Claim a slot before handing the connection to a thread."""
+        self._slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def shutdown_request(self, request):
+        """Give the slot back. Called once per handled connection, in the worker."""
+        try:
+            super().shutdown_request(request)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        """Log a dropped connection instead of printing a traceback.
+
+        A caller that goes quiet is hung up on by the socket timeout, and one
+        that disconnects mid-request is ordinary besides. Neither is a fault
+        worth a stack trace in the activity log, where it reads like a crash.
+        """
+        import logging
+        logging.getLogger(__name__).debug(
+            "Agent API connection from %s ended early", client_address, exc_info=True)
 
 
 class AgentServer:
@@ -1146,7 +1422,7 @@ class AgentServer:
             self._running = True
             server_stats.reset()
             server_stats.start()
-            rate_limiter.reset()  # LOAD-01: Reset rate limiter on server start
+            rate_limiter.reset()  # Each run starts with a clean window
             if self._on_started:
                 self._on_started(port)
             return True

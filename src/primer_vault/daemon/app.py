@@ -11,8 +11,11 @@ import sys
 import threading
 from pathlib import Path
 
+from ..core.settings import ADMIN_API_MODE_OPEN
 from ..core import Vault
 from ..core.interfaces import HeadlessApprovalHandler
+from ..instance_lock import InstanceAlreadyRunning
+from ..utils import DataDirectoryError
 
 logger = logging.getLogger(__name__)
 
@@ -32,9 +35,11 @@ class Daemon:
         data_dir: Path = None,
         admin_port: int = 4664,
         agent_port: int = 4663,
-        allow_lan: bool = False
+        allow_lan: bool = False,
+        admin_open: bool = False
     ):
         self._data_dir = data_dir
+        self._admin_open = admin_open
         self._admin_port = admin_port
         self._agent_port = agent_port
         self._allow_lan = allow_lan
@@ -50,6 +55,13 @@ class Daemon:
 
         # Initialize core with headless approval handler
         self._core = Vault(data_dir=self._data_dir)
+
+        # There is no window here to enable the Admin API from, so a daemon
+        # started with --admin-open records the choice now. Without it the
+        # operator can start the daemon and then find that the queued approvals
+        # below have no channel to be approved through.
+        if self._admin_open:
+            self._core.settings_manager.set_admin_api_mode(ADMIN_API_MODE_OPEN)
         # Queue requests rather than auto-rejecting — operator can approve/reject via CLI or admin API
         self._core.set_approval_handler(HeadlessApprovalHandler(self._core, auto_reject=False))
 
@@ -58,8 +70,23 @@ class Daemon:
         self._admin_server = AdminAPIServer(self._core, port=self._admin_port)
         self._admin_server.start()
 
-        # Start agent HTTP server
-        self._core.start_server(self._agent_port, self._allow_lan)
+        # Start agent HTTP server. start_server returns False on a bind failure
+        # (the port is taken) rather than raising, so it has to be checked - the
+        # daemon must not announce an agent API that never opened, since a
+        # headless operator has no window to notice the difference and their
+        # agents would be talking to whatever else holds the port.
+        if not self._core.start_server(self._agent_port, self._allow_lan):
+            logger.error(
+                "Agent API could not bind port %d - it is already in use. The "
+                "daemon has not started; free the port or use a different "
+                "--agent-port.", self._agent_port)
+            if self._admin_server:
+                try:
+                    self._admin_server.stop()
+                except Exception:
+                    pass
+                self._admin_server = None
+            return
 
         self._running = True
         logger.info(f"Daemon started - Admin API on :{self._admin_port}, Agent API on :{self._agent_port}")
@@ -80,6 +107,7 @@ class Daemon:
         # Lock wallet on shutdown
         if self._core:
             self._core.lock_wallet()
+            self._core.release_instance_lock()
 
         self._shutdown_event.set()
         logger.info("Daemon stopped")
@@ -101,16 +129,21 @@ def run_daemon(
     interactive: bool = True,
     startup_wallet: str = None,
     startup_password: str = None,
+    admin_open: bool = False,
 ):
     """
     Run the daemon.
 
     Args:
-        data_dir: Data directory (defaults to ~/.primer_vault/)
+        data_dir: Data directory (defaults to the standard location for this
+            build - see utils.get_app_dir)
         admin_port: Port for admin API (default 4664)
         agent_port: Port for agent API (default 4663)
         allow_lan: Allow LAN access to agent API
         interactive: If True, prompt for wallet password
+        admin_open: Allow local processes to drive the Admin API. There is no
+            window here to enable it from, so a headless operator who wants CLI
+            control has to say so at startup or beforehand.
     """
     from ..services.logging import configure_logging
     configure_logging()
@@ -119,7 +152,8 @@ def run_daemon(
         data_dir=data_dir,
         admin_port=admin_port,
         agent_port=agent_port,
-        allow_lan=allow_lan
+        allow_lan=allow_lan,
+        admin_open=admin_open,
     )
 
     # Handle shutdown signals
@@ -132,6 +166,15 @@ def run_daemon(
 
     try:
         daemon.start()
+
+        # start() returns without raising when the agent port is taken; it logs
+        # the reason but does not mark itself running. Do not go on to announce a
+        # daemon that is not up.
+        if not daemon.is_running():
+            print(f"Could not start the agent API: port {agent_port} is already "
+                  f"in use. Free it or pass a different --agent-port.",
+                  file=sys.stderr)
+            sys.exit(1)
 
         # Auto-unlock wallet if credentials provided
         if startup_wallet and startup_password is not None:
@@ -150,13 +193,28 @@ def run_daemon(
                     print(f"  Wallet: failed to unlock '{startup_wallet}' — {result.get('error')}")
 
         if interactive:
-            print(f"\nVault daemon running")
+            print("\nVault daemon running")
             print(f"  Admin API: http://localhost:{admin_port}")
             print(f"  Agent API: http://localhost:{agent_port}")
-            print(f"\nPress Ctrl+C to stop\n")
+            print("\nPress Ctrl+C to stop\n")
 
         daemon.wait()
 
+    except InstanceAlreadyRunning as e:
+        print(e.user_message(), file=sys.stderr)
+        sys.exit(1)
+    except DataDirectoryError as e:
+        print(e.user_message(), file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        # A port bind failure (most often the admin port already in use). The
+        # GUI handles the same fault by carrying on without the admin API;
+        # headless has no window to fall back to, so it stops - but with a
+        # sentence naming the ports, not a raw traceback.
+        print(f"Could not start Vault's servers: {e}. A port may already be in "
+              f"use - the admin API uses --admin-port ({admin_port}) and the "
+              f"agent API uses --agent-port ({agent_port}).", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     finally:
@@ -169,7 +227,8 @@ def main():
     parser.add_argument(
         "--data-dir",
         type=Path,
-        help="Data directory (default: ~/.primer_vault/)"
+        help="Data directory (default: beside the executable for a downloaded "
+             "build, or the platform-standard location for a pip install)"
     )
     parser.add_argument(
         "--admin-port",

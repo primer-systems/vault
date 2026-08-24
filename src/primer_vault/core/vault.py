@@ -16,9 +16,13 @@ from .settings import SettingsManager, AppSettings
 if TYPE_CHECKING:
     from ..models import PolicyStore, Agent, SpendPolicy, Transaction, TradingRules
     from ..wallet import VaultWallet
-    from ..services.signing import SigningService, SigningRequest
 
 logger = logging.getLogger(__name__)
+
+#: Daily spend a policy gets when the caller does not name one. Matches the
+#: default the CLI documents for `policy create --day`, so the Admin API, the
+#: GUI and the CLI all land on the same number.
+DEFAULT_DAILY_LIMIT_MICRO = 100_000_000  # 100 USDG
 
 
 class Vault:
@@ -27,8 +31,9 @@ class Vault:
 
     Owns:
     - PolicyStore (agents, policies, transactions)
-    - WalletManager (wallet files)
+    - the unlocked VaultWallet, and the path it came from
     - SigningService (payment signing)
+    - TradingService (swaps)
     - AgentServer (HTTP server for agents)
     - EventBus (notifications)
 
@@ -44,7 +49,9 @@ class Vault:
         Initialize Vault.
 
         Args:
-            data_dir: Directory for data files. Defaults to ~/.primer_vault/
+            data_dir: Directory for data files. Defaults to get_app_dir():
+                beside the executable for a frozen build, the platform-standard
+                location for a pip install.
             approval_handler: Handler for manual approvals. If None, uses HeadlessApprovalHandler.
         """
         from ..models import PolicyStore
@@ -52,14 +59,31 @@ class Vault:
         from ..services.trading import TradingService
         from ..services.server import AgentServer
         from ..utils import get_app_dir
+        from ..instance_lock import InstanceLock
 
         self._data_dir = data_dir or get_app_dir()
+
+        # One live core per data directory. Every save below writes a whole
+        # file from this process's memory, so a second core on the same
+        # directory would silently erase this one's records - including spend
+        # against daily limits, and the wallet itself. Acquired here, before
+        # anything touches a file, so every entry point is covered; raises
+        # InstanceAlreadyRunning, which the GUI, CLI and daemon each surface
+        # in their own way. The OS drops the lock on process death, so a
+        # crashed instance never blocks the next start.
+        self._instance_lock = InstanceLock(self._data_dir)
+        self._instance_lock.acquire()
+
         self._event_bus = EventBus()
 
-        # Initialize settings manager with file watching
+        # Initialize settings manager with file watching. A failed save is
+        # surfaced as an error activity: the change stays live in memory, so
+        # the person who made it is the one who must hear it will not survive
+        # a restart.
         self._settings_manager = SettingsManager(
             self._data_dir,
-            on_change=self._on_settings_changed
+            on_change=self._on_settings_changed,
+            on_save_error=lambda msg: self._event_bus.emit_activity(msg, True)
         )
 
         # Initialize stores
@@ -73,6 +97,7 @@ class Vault:
         self._signing_service.set_stores(self._policy_store)
         self._signing_service.set_wallet_provider(self.get_wallet_for_address)
         self._signing_service.set_wallet_status_checker(self.is_wallet_unlocked)
+        self._signing_service.set_rpc_resolver(self.get_rpc_url)
         self._setup_signing_callbacks()
 
         # Apply persisted settings to signing service
@@ -85,6 +110,9 @@ class Vault:
         self._trading_service.set_wallet_provider(self.get_wallet_for_address)
         self._trading_service.set_wallet_status_checker(self.is_wallet_unlocked)
         self._trading_service.set_auth_verifier(self._signing_service.verify_agent_signature)
+        self._trading_service.set_rpc_resolver(self.get_rpc_url)
+        self._signing_service.set_reserved_volume_provider(
+            self._trading_service.reserved_volume_for)
         self._trading_service.set_callbacks(
             on_approval_needed=self._on_trade_approval_needed,
             on_activity=lambda msg, is_error=False, detail=None: self._event_bus.emit_activity(msg, is_error, detail),
@@ -103,7 +131,6 @@ class Vault:
 
         # Wallet state
         self._unlocked_wallet: Optional["VaultWallet"] = None
-        self._wallet_password: Optional[str] = None
         self._wallet_path: Optional[str] = None
 
         # Restore wallet path from persisted state so standalone processes
@@ -200,6 +227,17 @@ class Vault:
             except ValueError:
                 logger.warning(f"Invalid chain ID in settings: {chain_id_str}")
 
+    def _apply_rate_limit(self) -> None:
+        """Push the configured per-caller ceiling onto the live rate limiter.
+
+        The limiter is a module-level object shared by every request handler, so
+        it has to be told; it has no way to read settings itself. Applied on
+        every server start and whenever the setting changes, which covers the
+        GUI, the CLI and the daemon without any of them having to remember.
+        """
+        from ..services.server import rate_limiter
+        rate_limiter.configure(self._settings_manager.get_rate_limit())
+
     def _on_settings_changed(self, settings: AppSettings) -> None:
         """Handle settings change from file watcher."""
         logger.info("Settings changed, applying to signing service")
@@ -208,6 +246,7 @@ class Vault:
         # Update local server settings cache
         self._server_port = settings.server.default_port
         self._allow_lan = settings.server.allow_lan
+        self._apply_rate_limit()
 
         # Emit settings changed event
         self._event_bus.emit(Event(
@@ -220,10 +259,39 @@ class Vault:
         """Get the data directory for this instance."""
         return self._data_dir
 
+    def release_instance_lock(self) -> None:
+        """Release this process's exclusive claim on the data directory.
+
+        For orderly shutdowns (the daemon calls this) and for tests. Not
+        required for correctness: the OS releases the lock when the process
+        exits, however it exits.
+        """
+        self._instance_lock.release()
+
     @property
     def settings_manager(self) -> SettingsManager:
         """Get the settings manager for direct access."""
         return self._settings_manager
+
+    def get_rpc_url(self, chain_id: int) -> Optional[str]:
+        """The RPC endpoint to use for a chain: the user's, or the built-in one.
+
+        Every path that talks to a chain resolves its endpoint here. The setting
+        was previously read only where balances are displayed, so a custom
+        endpoint moved the balance pane and left quoting, trading, sending and
+        on-chain verification pointed at the default - the opposite of what
+        someone running their own node is asking for, and silent about it.
+
+        Returns None only for a chain that has no configuration at all, which
+        every caller already has to handle.
+        """
+        from ..networks import NETWORKS
+
+        custom = self._settings_manager.get_rpc_endpoint(chain_id)
+        if custom:
+            return custom
+        network = NETWORKS.get(chain_id)
+        return network.rpc_url if network else None
 
     @property
     def event_bus(self) -> EventBus:
@@ -263,6 +331,9 @@ class Vault:
             Tuple of (agent, secret/token)
             For HMAC: secret is the shared secret to give to agent
             For Bearer: secret is the bearer token to give to agent
+
+        Raises:
+            ValueError: if no wallet is open
         """
         from ..models import Agent
         from ..models.agent import (
@@ -270,25 +341,41 @@ class Vault:
             encrypt_agent_secret, hash_bearer_token
         )
 
+        # An agent belongs to a wallet: its credential is encrypted under that
+        # wallet's master key, and it cannot be commissioned or sign without an
+        # address from it. So the wallet is a precondition, enforced here rather
+        # than in each interface - the GUI, the CLI and the Admin API all arrive
+        # through this method.
+        if not self.is_wallet_unlocked():
+            raise ValueError(
+                "A wallet must be open before registering an agent. "
+                "Agent credentials are encrypted with the wallet's key."
+            )
+
         # Generate the token (same format for both modes)
         agent_token, shared_secret = generate_agent_token()
 
-        if auth_mode == "hmac":
-            # HMAC mode: encrypt the shared secret with wallet password
-            # Pre-generate agent ID for AAD (binds ciphertext to this specific agent)
-            agent_id = generate_agent_id()
+        # The short id is drawn from ~17.5M values with no uniqueness
+        # guarantee. Lookups return the first match, so a colliding second
+        # agent could never authenticate. Regenerate until unused.
+        def _unused_agent_id() -> str:
+            while True:
+                candidate = generate_agent_id()
+                if self._policy_store.get_agent_by_id(candidate) is None:
+                    return candidate
 
-            # Use wallet password if available, otherwise use a temporary password
-            # Agent will need to be re-commissioned with proper password later
-            password = self._wallet_password or "temporary_password"
-            encrypted, iv, tag, salt = encrypt_agent_secret(shared_secret, password, agent_id)
+        if auth_mode == "hmac":
+            # HMAC mode: encrypt the shared secret under the wallet's master key.
+            # Pre-generate agent ID for AAD (binds ciphertext to this specific agent)
+            agent_id = _unused_agent_id()
+            encrypted, iv, tag = encrypt_agent_secret(
+                shared_secret, self._unlocked_wallet.data_key, agent_id)
 
             agent = Agent.create(
                 name=name,
                 encrypted_auth_key=encrypted,
                 auth_key_iv=iv,
                 auth_key_tag=tag,
-                auth_key_salt=salt,
                 auth_mode="hmac",
                 agent_id=agent_id
             )
@@ -298,7 +385,8 @@ class Vault:
             agent = Agent.create(
                 name=name,
                 encrypted_auth_key=token_hash,
-                auth_mode="bearer"
+                auth_mode="bearer",
+                agent_id=_unused_agent_id()
             )
 
         self._policy_store.add_agent(agent)
@@ -332,27 +420,10 @@ class Vault:
             raise ValueError(f"Agent not found: {agent_code}")
 
         if agent.auth_mode == "hmac":
-            # Try multiple passwords - agent may have been created with different wallet state
-            from ..wallet.crypto import NO_PASSWORD_SENTINEL
-            passwords_to_try = []
-            if self._wallet_password:
-                passwords_to_try.append(self._wallet_password)
-            if NO_PASSWORD_SENTINEL not in passwords_to_try:
-                passwords_to_try.append(NO_PASSWORD_SENTINEL)
-            if "temporary_password" not in passwords_to_try:
-                passwords_to_try.append("temporary_password")
-
-            for password in passwords_to_try:
-                try:
-                    secret_hex = agent.decrypt_auth_key(password)
-                    # Reconstruct the full token with AT_ prefix
-                    token = f"AT_{secret_hex}"
-                    return (agent.id, token, agent.auth_mode)
-                except Exception:
-                    continue
-
-            # All passwords failed
-            return (agent.id, None, agent.auth_mode)
+            if not self.is_wallet_unlocked():
+                return (agent.id, None, agent.auth_mode)
+            secret_hex = agent.decrypt_auth_key(self._unlocked_wallet.data_key)
+            return (agent.id, f"AT_{secret_hex}", agent.auth_mode)
 
         return (agent.id, None, agent.auth_mode)
 
@@ -700,8 +771,23 @@ class Vault:
         trading_rules: Optional["TradingRules"] = None,
         x402_enabled: bool = True
     ) -> "SpendPolicy":
-        """Create a new spend policy."""
+        """Create a new spend policy.
+
+        A daily limit is required by the model but optional in this signature,
+        because the Admin API and the GUI both reach it with whatever the caller
+        supplied. Omitting it lands on the same default the CLI documents rather
+        than on None, which is not a limit and which the store cannot read back.
+
+        Raises:
+            ValueError: if a supplied limit is not a non-negative integer.
+        """
         from ..models import SpendPolicy
+        from ..networks import DEFAULT_NETWORK
+
+        if daily_limit_micro is None:
+            daily_limit_micro = DEFAULT_DAILY_LIMIT_MICRO
+        if networks is None:
+            networks = [DEFAULT_NETWORK]
 
         policy = SpendPolicy.create(
             name=name,
@@ -799,7 +885,6 @@ class Vault:
         if self._unlocked_wallet:
             self._unlocked_wallet.lock()
             self._unlocked_wallet = None
-            self._wallet_password = None
 
             self._event_bus.emit(Event(type=EventType.WALLET_LOCKED, data={}))
             self._event_bus.emit_activity("Wallet locked")
@@ -823,8 +908,12 @@ class Vault:
                 "id": addr.id,
                 "address": addr.address,
                 "name": addr.name,
-                "seed_id": getattr(addr, "seed_id", None),
-                "index": getattr(addr, "index", None),
+                "seed_id": addr.seed_id,
+                "index": addr.index,
+                "wallet_type": addr.wallet_type,
+                "is_hardware": addr.is_hardware,
+                "device_path": addr.device_path,
+                "device_label": addr.device_label,
             }
             for addr in self._unlocked_wallet.addresses
         ]
@@ -852,6 +941,7 @@ class Vault:
         derivation_path: str = "m/44'/60'/0'/0/{}",
         address_indices: Optional[list[int]] = None,
         address_names: Optional[dict[int, str]] = None,
+        hardware_addresses: Optional[list[tuple]] = None,
         unlock: bool = True
     ) -> dict:
         """
@@ -865,6 +955,9 @@ class Vault:
             derivation_path: HD derivation path template (default: Ethereum)
             address_indices: List of address indices to derive (default: [0])
             address_names: Optional dict mapping index -> custom name
+            hardware_addresses: Addresses from a hardware wallet as
+                (path, address, path_type, name) tuples. Produces a wallet with
+                no seed and no private key - the device holds every key.
             unlock: If True, sets this as the current unlocked wallet
 
         Returns:
@@ -882,9 +975,14 @@ class Vault:
             # Create wallet
             wallet = VaultWallet.create(password)
 
-            if private_key:
+            if hardware_addresses:
+                # Hardware-only wallet: no seed, no private key, nothing to back up.
+                for path_str, address, path_type, name in hardware_addresses:
+                    wallet.add_hardware_address(address, path_str, path_type, name)
+                result_seed = None
+            elif private_key:
                 # Import private key
-                addr_id = wallet.add_imported_key(private_key)
+                wallet.add_imported_key(private_key)
                 result_seed = None
             else:
                 # Seed-based wallet
@@ -916,7 +1014,6 @@ class Vault:
             # Optionally unlock (set as current wallet)
             if unlock:
                 self._unlocked_wallet = wallet
-                self._wallet_password = password
                 self._wallet_path = str(path)
                 self._persist_wallet_path(str(path))
 
@@ -937,7 +1034,10 @@ class Vault:
             }
 
         except Exception as e:
-            logger.error(f"Failed to create wallet: {e}")
+            # debug, not error: the failure is returned below and the caller
+            # surfaces it. In CLI mode (no log handler) an error-level line would
+            # also print to stderr, doubling the message the user sees.
+            logger.debug(f"Failed to create wallet: {e}")
             return {"success": False, "error": str(e)}
 
     def get_wallet_dir(self) -> Path:
@@ -952,17 +1052,17 @@ class Vault:
 
         Args:
             wallet_path: Path to wallet file
-            password: Wallet password (use NO_PASSWORD_SENTINEL for unencrypted)
+            password: Wallet password (pass NO_PASSWORD_SENTINEL when opening
+                a legacy unencrypted file; new wallets are always encrypted)
 
         Returns:
             Dict with success status and wallet info
         """
-        from ..wallet import VaultWallet
+        from ..wallet import CorruptedWalletFile, UnsupportedWalletVersion, VaultWallet
 
         try:
             wallet = VaultWallet.load(wallet_path, password)
             self._unlocked_wallet = wallet
-            self._wallet_password = password
             self._wallet_path = wallet_path
             self._persist_wallet_path(wallet_path)
 
@@ -979,10 +1079,37 @@ class Vault:
                     for addr in wallet.addresses
                 ]
             }
-        except ValueError as e:
-            return {"success": False, "error": "Wrong password"}
+        except UnsupportedWalletVersion as e:
+            # Distinct from a bad password: no password will ever open this file,
+            # so saying "wrong password" sends the user after the wrong problem.
+            # The code carries that distinction to callers, because the message
+            # cannot: an interface that tells these apart by searching the text
+            # for "password" finds it in the damaged-file message too, which is
+            # exactly how the unlock screen went on saying "Wrong password".
+            return {"success": False, "error": str(e),
+                    "code": "UNSUPPORTED_WALLET_VERSION"}
+        except CorruptedWalletFile as e:
+            # Also distinct, for the same reason - and the harm is worse: a
+            # user told "Wrong password" for a damaged file retries passwords,
+            # concludes they forgot theirs, and may abandon a recoverable
+            # wallet. Name the real fault and every recovery path that exists.
+            previous = Path(wallet_path).with_name(Path(wallet_path).name + ".previous")
+            hint = (f" A copy saved just before the last change exists at "
+                    f"{previous}." if previous.exists() else "")
+            return {
+                "success": False,
+                "code": "WALLET_DAMAGED",
+                "error": (f"This wallet file is damaged and cannot be read - "
+                          f"{e}. Your password may well be correct; the file "
+                          f"is the problem.{hint} Restore a backup or "
+                          "re-import your seed phrase.")
+            }
+        except ValueError:
+            return {"success": False, "error": "Wrong password",
+                    "code": "WRONG_PASSWORD"}
         except FileNotFoundError:
-            return {"success": False, "error": "Wallet file not found"}
+            return {"success": False, "error": "Wallet file not found",
+                    "code": "WALLET_NOT_FOUND"}
         except Exception as e:
             logger.error(f"Failed to load wallet: {e}")
             return {"success": False, "error": str(e)}
@@ -1001,6 +1128,31 @@ class Vault:
             logger.error(f"Failed to save wallet: {e}")
             return False
 
+    def _wallet_save_failed(self, change: str, still_on_disk: bool = False) -> dict:
+        """The honest answer when a wallet mutation could not be written.
+
+        Every method that changes the wallet must return this instead of
+        success when save_wallet() fails: a seed the user is told was created
+        but never reached disk is gone at the next start - with any funds sent
+        to it - and a seed the user is told was removed but is still in the
+        file comes back. The in-memory change is deliberately left in place
+        (reverting live key material has its own failure modes); the message
+        says exactly what state disk and session are in.
+        """
+        if still_on_disk:
+            detail = (f"{change}, but the wallet file on disk could NOT be "
+                      "rewritten, so it is STILL in the file and will load "
+                      "again the next time this wallet is opened.")
+        else:
+            detail = (f"{change}, but the wallet file on disk could NOT be "
+                      "rewritten. It exists in this session only and will be "
+                      "LOST when Vault closes. Do not send funds to it.")
+        msg = (f"{detail} Free disk space or close any program holding the "
+               "wallet file, then retry until Vault reports success.")
+        self._event_bus.emit_activity(f"Wallet save FAILED: {detail}",
+                                      is_error=True)
+        return {"success": False, "error": msg, "code": "WALLET_SAVE_FAILED"}
+
     def detach_wallet(self) -> bool:
         """
         Detach (unload) the current wallet without deleting the file.
@@ -1016,7 +1168,6 @@ class Vault:
         if self._unlocked_wallet:
             self._unlocked_wallet.lock()
             self._unlocked_wallet = None
-            self._wallet_password = None
 
         self._wallet_path = None
         self._persist_wallet_path(None)
@@ -1040,22 +1191,22 @@ class Vault:
             self._unlocked_wallet.lock()
             self._unlocked_wallet = None
 
-        self._wallet_password = None
         self._wallet_path = None
 
         try:
             if wallet_path.exists():
                 wallet_path.unlink()
+            # Deleting a wallet means deleting its keys - the automatic
+            # previous-version copy must not outlive them.
+            previous = wallet_path.with_name(wallet_path.name + ".previous")
+            if previous.exists():
+                previous.unlink()
             self._event_bus.emit(Event(type=EventType.WALLET_LOCKED, data={}))
             self._event_bus.emit_activity(f"Deleted wallet: {wallet_path.name}")
             return True
         except Exception as e:
             logger.error(f"Failed to delete wallet file: {e}")
             return False
-
-    def get_wallet_path(self) -> Optional[str]:
-        """Get the current wallet path."""
-        return self._wallet_path
 
     def set_wallet_path(self, path: str) -> None:
         """Set the wallet path (for persistence)."""
@@ -1108,7 +1259,8 @@ class Vault:
 
         try:
             seed_id = self._unlocked_wallet.add_seed(seed_phrase, derivation_path)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed(f"Seed {seed_id} was added")
 
             self._event_bus.emit_activity(f"Added seed: {seed_id}")
             return {"success": True, "seed_id": seed_id}
@@ -1142,7 +1294,8 @@ class Vault:
 
             seed_phrase = generate_mnemonic(num_words=word_count, lang="english")
             seed_id = self._unlocked_wallet.add_seed(seed_phrase, derivation_path)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed(f"Seed {seed_id} was generated")
 
             self._event_bus.emit_activity(f"Created new seed: {seed_id}")
             return {"success": True, "seed_id": seed_id, "seed_phrase": seed_phrase}
@@ -1172,7 +1325,10 @@ class Vault:
                     removed_addresses.append(addr.address)
 
             self._unlocked_wallet.remove_seed(seed_id, remove_addresses)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed(
+                    f"Seed {seed_id} was removed from this session",
+                    still_on_disk=True)
 
             self._event_bus.emit_activity(f"Removed seed: {seed_id}")
             return {"success": True, "removed_addresses": removed_addresses}
@@ -1202,7 +1358,9 @@ class Vault:
 
         try:
             addr_id = self._unlocked_wallet.add_address_from_seed(seed_id, index, name)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed(
+                    f"An address was derived from {seed_id}")
 
             # Get the new address info
             addr = None
@@ -1238,7 +1396,8 @@ class Vault:
 
         try:
             addr_id = self._unlocked_wallet.add_imported_key(private_key, name)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed("The private key was imported")
 
             # Get the new address info
             addr = None
@@ -1256,6 +1415,53 @@ class Vault:
             }
         except Exception as e:
             logger.error(f"Failed to import key: {e}")
+            return {"success": False, "error": str(e)}
+
+    def add_hardware_address(
+        self,
+        address: str,
+        path: str,
+        path_type: str,
+        name: Optional[str] = None
+    ) -> dict:
+        """
+        Add a Ledger hardware wallet address.
+
+        No private key is stored - the Ledger device holds the keys.
+
+        Args:
+            address: The 0x address from the Ledger
+            path: Full derivation path (e.g., "m/44'/60'/0'/0/0")
+            path_type: Path type ("ledger_live", "bip44", "legacy_mew", "custom")
+            name: Optional display name
+
+        Returns:
+            Dict with address info
+        """
+        if not self._unlocked_wallet:
+            return {"success": False, "error": "No wallet unlocked"}
+
+        try:
+            addr_id = self._unlocked_wallet.add_hardware_address(address, path, path_type, name)
+            if not self.save_wallet():
+                return self._wallet_save_failed("The Ledger address was added")
+
+            # Get the new address info
+            addr = None
+            for a in self._unlocked_wallet.addresses:
+                if a.id == addr_id:
+                    addr = a
+                    break
+
+            self._event_bus.emit_activity(f"Added Ledger address: {addr.address[:10]}..." if addr else "Added Ledger address")
+            return {
+                "success": True,
+                "address_id": addr_id,
+                "address": addr.address if addr else None,
+                "name": addr.name if addr else None
+            }
+        except Exception as e:
+            logger.error(f"Failed to add Ledger address: {e}")
             return {"success": False, "error": str(e)}
 
     def remove_address(self, address_id: str) -> dict:
@@ -1291,7 +1497,10 @@ class Vault:
             decommissioned = self.decommission_agents_for_address(removed_address)
 
             self._unlocked_wallet.remove_address(address_id)
-            self.save_wallet()
+            if not self.save_wallet():
+                return self._wallet_save_failed(
+                    f"Address {removed_address[:10]}... was removed from this "
+                    "session", still_on_disk=True)
 
             self._event_bus.emit_activity(f"Removed address: {removed_address[:10]}...")
             return {
@@ -1349,6 +1558,42 @@ class Vault:
     def set_approval_handler(self, handler: ApprovalHandler) -> None:
         """Set the approval handler (GUI provides its own)."""
         self._approval_handler = handler
+
+    def set_hardware_sign_handler(self, handler: "Callable[[dict, str, str], str]") -> None:
+        """Set the Ledger signing handler (GUI provides this for hardware wallet signing).
+
+        The handler is called when a payment needs to be signed with a Ledger device.
+
+        Args:
+            handler: Callable(typed_data, device_path, expected_address) -> signature_hex
+                - typed_data: EIP-712 typed data dict
+                - device_path: Derivation path (e.g., "m/44'/60'/0'/0/0")
+                - expected_address: Address to verify against
+                Returns: Signature hex string
+                Raises: Exception on error or cancellation
+        """
+        if self._signing_service:
+            self._signing_service.set_callbacks(on_hardware_sign_needed=handler)
+
+    def set_hardware_tx_sign_handler(self, handler: "Callable[[dict, str, str, str], str]") -> None:
+        """Set the Ledger transaction signing handler (GUI provides this).
+
+        Used by the trading path, which signs whole Ethereum transactions on the
+        device rather than EIP-712 payment authorizations. A single trade may
+        invoke this twice: once for the ERC-20 approval, once for the swap.
+
+        Args:
+            handler: Callable(tx_dict, device_path, expected_address, description)
+                -> raw signed transaction hex
+                - tx_dict: Unsigned transaction dict (to/value/gas/nonce/chainId/data)
+                - device_path: Derivation path (e.g., "m/44'/60'/0'/0/0")
+                - expected_address: Address to verify against before signing
+                - description: Human-readable summary shown in the dialog
+                Returns: Raw signed transaction hex, ready to broadcast
+                Raises: Exception on error or cancellation
+        """
+        if self._trading_service:
+            self._trading_service.set_hardware_tx_signer(handler)
 
     def approve_request(self, request_id: str) -> dict:
         """Approve a pending signing request."""
@@ -1464,6 +1709,7 @@ class Vault:
         if self._agent_server.is_running:
             return True
 
+        self._apply_rate_limit()
         success = self._agent_server.start(port, allow_lan)
         if success:
             self._server_running = True

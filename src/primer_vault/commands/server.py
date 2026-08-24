@@ -58,6 +58,8 @@ class ServerCommands:
                 )
             return self._start(port)
         elif subcmd == "stop":
+            if "--help" in args or "-h" in args:
+                return CommandResult.ok("server stop - Stop the agent HTTP server.")
             return self._stop()
         elif subcmd == "status":
             return self._status()

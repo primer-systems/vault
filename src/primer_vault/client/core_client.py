@@ -1,7 +1,9 @@
 """
 CoreClient - HTTP client for the daemon admin API.
 
-Used by GUI and Console to interact with the Vault core.
+Used by a separate CLI process to reach a Vault core running in another process
+(a GUI instance or the headless daemon). The GUI and its Console tab hold the
+core object directly and do not go through this client.
 """
 
 import json
@@ -10,7 +12,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
@@ -41,9 +43,10 @@ class GUIOnlyModeError(CoreClientError):
 
     def __init__(self):
         super().__init__(
-            "Vault is running in GUI-only mode. External access from CLI and other tools "
-            "is disabled. To enable CLI access, open Vault GUI and go to "
-            "Settings > Network > Security and set Admin API to 'Open'.",
+            "Vault is running in GUI-only mode, so the CLI cannot drive it. "
+            "Manage it from the Vault window instead - Settings > Security there "
+            "also lets you allow CLI access. A headless server has no window: "
+            "restart it with --admin-open.",
             code="GUI_ONLY_MODE",
             status=403
         )
@@ -115,45 +118,6 @@ class CoreClient:
                 return None
             raise
 
-    def create_agent(self, name: str, auth_mode: str = "hmac") -> tuple[dict, str]:
-        """
-        Create a new agent.
-
-        Returns:
-            Tuple of (agent_dict, secret)
-        """
-        result = self._post("/agents", {"name": name, "auth_mode": auth_mode})
-        return result["agent"], result["secret"]
-
-    def commission_agent(
-        self,
-        agent_id: str,
-        policy_id: str,
-        wallet_address: str,
-        intent_mandate: Optional[dict] = None
-    ) -> dict:
-        """Commission an agent."""
-        payload = {
-            "policy_id": policy_id,
-            "wallet_address": wallet_address,
-        }
-        if intent_mandate:
-            payload["intent_mandate"] = intent_mandate
-        return self._post(f"/agents/{agent_id}/commission", payload)
-
-    def suspend_agent(self, agent_id: str) -> dict:
-        """Suspend an agent."""
-        return self._post(f"/agents/{agent_id}/suspend", {})
-
-    def activate_agent(self, agent_id: str) -> dict:
-        """Activate an agent."""
-        return self._post(f"/agents/{agent_id}/activate", {})
-
-    def delete_agent(self, agent_id: str) -> bool:
-        """Delete an agent."""
-        self._delete(f"/agents/{agent_id}")
-        return True
-
     # -------------------------------------------------------------------------
     # Policies
     # -------------------------------------------------------------------------
@@ -163,60 +127,6 @@ class CoreClient:
         result = self._get("/policies")
         return result.get("policies", [])
 
-    def get_policy(self, policy_id: str) -> Optional[dict]:
-        """Get a policy by ID."""
-        try:
-            return self._get(f"/policies/{policy_id}")
-        except CoreClientError as e:
-            if e.code == "NOT_FOUND":
-                return None
-            raise
-
-    def create_policy(
-        self,
-        name: str,
-        daily_limit_micro: Optional[int] = None,
-        per_request_max_micro: Optional[int] = None,
-        auto_approve_below_micro: Optional[int] = None,
-        allowed_domains: Optional[list[str]] = None,
-        blocked_domains: Optional[list[str]] = None,
-        networks: Optional[list[int]] = None,
-        trading_rules: Optional[dict] = None,
-        x402_enabled: Optional[bool] = None
-    ) -> dict:
-        """Create a new policy."""
-        data = {"name": name}
-        if daily_limit_micro is not None:
-            data["daily_limit_micro"] = daily_limit_micro
-        if per_request_max_micro is not None:
-            data["per_request_max_micro"] = per_request_max_micro
-        if auto_approve_below_micro is not None:
-            data["auto_approve_below_micro"] = auto_approve_below_micro
-        if allowed_domains is not None:
-            data["allowed_domains"] = allowed_domains
-        if blocked_domains is not None:
-            data["blocked_domains"] = blocked_domains
-        if networks is not None:
-            data["networks"] = networks
-        if trading_rules is not None:
-            # Convert TradingRules object to dict if needed
-            if hasattr(trading_rules, 'to_dict'):
-                data["trading_rules"] = trading_rules.to_dict()
-            else:
-                data["trading_rules"] = trading_rules
-        if x402_enabled is not None:
-            data["x402_enabled"] = x402_enabled
-
-        return self._post("/policies", data)
-
-    def update_policy(self, policy_id: str, updates: dict) -> dict:
-        """Update a policy."""
-        return self._put(f"/policies/{policy_id}", updates)
-
-    def delete_policy(self, policy_id: str) -> dict:
-        """Delete a policy."""
-        return self._delete(f"/policies/{policy_id}")
-
     # -------------------------------------------------------------------------
     # Wallet
     # -------------------------------------------------------------------------
@@ -225,10 +135,6 @@ class CoreClient:
         """Get wallet status."""
         return self._get("/wallet/status")
 
-    def is_wallet_unlocked(self) -> bool:
-        """Check if wallet is unlocked."""
-        status = self.get_wallet_status()
-        return status.get("unlocked", False)
 
     def get_addresses(self) -> list[dict]:
         """Get wallet addresses."""
@@ -242,10 +148,6 @@ class CoreClient:
             "password": password
         })
 
-    def lock_wallet(self) -> dict:
-        """Lock the wallet."""
-        return self._post("/wallet/lock", {})
-
     # -------------------------------------------------------------------------
     # Transactions
     # -------------------------------------------------------------------------
@@ -254,23 +156,6 @@ class CoreClient:
         """Get recent transactions."""
         result = self._get(f"/transactions?limit={limit}")
         return result.get("transactions", [])
-
-    # -------------------------------------------------------------------------
-    # Approvals
-    # -------------------------------------------------------------------------
-
-    def get_pending_requests(self) -> list[dict]:
-        """Get pending approval requests."""
-        result = self._get("/pending")
-        return result.get("pending", [])
-
-    def approve_request(self, request_id: str) -> dict:
-        """Approve a pending request."""
-        return self._post(f"/approve/{request_id}", {})
-
-    def reject_request(self, request_id: str, reason: str = "User rejected") -> dict:
-        """Reject a pending request."""
-        return self._post(f"/reject/{request_id}", {"reason": reason})
 
     # -------------------------------------------------------------------------
     # Trade Approvals
@@ -288,18 +173,6 @@ class CoreClient:
     def reject_trade(self, request_id: str, reason: str = "Rejected by user") -> dict:
         """Reject a pending trade."""
         return self._post(f"/trades/reject/{request_id}", {"reason": reason})
-
-    # -------------------------------------------------------------------------
-    # Server
-    # -------------------------------------------------------------------------
-
-    def start_server(self, port: int = 4663, allow_lan: bool = False) -> dict:
-        """Start the agent server."""
-        return self._post("/server/start", {"port": port, "allow_lan": allow_lan})
-
-    def stop_server(self) -> dict:
-        """Stop the agent server."""
-        return self._post("/server/stop", {})
 
     # -------------------------------------------------------------------------
     # Events
@@ -378,7 +251,7 @@ class CoreClient:
                         e.code
                     )
                 except json.JSONDecodeError:
-                    raise CoreClientError(str(e), "HTTP_ERROR", e.code)
+                    raise CoreClientError(str(e), "HTTP_ERROR", e.code) from e
 
             except URLError as e:
                 last_error = e
@@ -995,6 +868,14 @@ class TradingRulesProxy:
     def max_slippage_percent(self, value: float):
         self._data["max_slippage_percent"] = value
 
+    @property
+    def max_price_impact_percent(self) -> float:
+        return self._data.get("max_price_impact_percent", 5.0)
+
+    @max_price_impact_percent.setter
+    def max_price_impact_percent(self, value: float):
+        self._data["max_price_impact_percent"] = value
+
     def to_dict(self) -> dict:
         return self._data.copy()
 
@@ -1097,6 +978,14 @@ class TransactionProxy:
     def created_at(self) -> Optional[str]:
         return self._data.get("created_at")
 
+    @property
+    def tx_hash(self) -> Optional[str]:
+        return self._data.get("tx_hash")
+
+    @property
+    def wallet_address(self) -> Optional[str]:
+        return self._data.get("wallet_address")
+
 
 # =============================================================================
 # Settings proxy — maps core.settings_manager interface to /settings API
@@ -1115,6 +1004,7 @@ class _SettingsData:
         def __init__(self, d: dict):
             self.default_port = d.get("default_port", 4663)
             self.allow_lan = d.get("allow_lan", False)
+            self.rate_limit_per_minute = d.get("rate_limit_per_minute", 300)
 
     class _Display:
         def __init__(self, d: dict):
@@ -1124,11 +1014,16 @@ class _SettingsData:
         def __init__(self, d: dict):
             self.endpoints = d.get("endpoints", {})
 
+    class _Security:
+        def __init__(self, d: dict):
+            self.admin_api_mode = d.get("admin_api_mode", "gui_only")
+
     def __init__(self, data: dict):
         self.signing = self._Signing(data.get("signing", {}))
         self.server = self._Server(data.get("server", {}))
         self.display = self._Display(data.get("display", {}))
         self.rpc = self._Rpc(data.get("rpc", {}))
+        self.security = self._Security(data.get("security", {}))
 
 
 class SettingsManagerProxy:
@@ -1189,3 +1084,19 @@ class SettingsManagerProxy:
 
     def set_rpc_endpoint(self, chain_id: int, url: Optional[str]) -> None:
         self._client._patch("/settings", {"key": "rpc_endpoint", "chain_id": chain_id, "value": url})
+
+    def get_admin_api_mode(self) -> str:
+        return self.settings.security.admin_api_mode
+
+    def set_admin_api_mode(self, mode: str) -> None:
+        # Deliberately not proxied. Opening the Admin API is what lets a local
+        # process drive a running instance, so it must not be doable *through* a
+        # running instance over that same API - that would defeat the gui_only
+        # default. It is changed from the Vault window (Settings > Security), or
+        # for a headless daemon by restarting with --admin-open.
+        raise CoreClientError(
+            "The Admin API mode cannot be changed from the CLI while Vault is "
+            "running. Change it in the Vault window under Settings > Security, "
+            "or restart a headless daemon with --admin-open.",
+            code="GUI_ONLY_MODE",
+        )

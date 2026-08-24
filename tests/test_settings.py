@@ -7,7 +7,6 @@ Run with: pytest tests/test_settings.py -v
 import json
 import pytest
 import sys
-import time
 from pathlib import Path
 
 # Add src to path
@@ -31,11 +30,6 @@ def settings_manager(temp_data_dir):
     return SettingsManager(temp_data_dir)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Core instance with temp directory."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 @pytest.fixture

@@ -4,10 +4,115 @@ Shared utility functions for Vault.
 Contains path helpers and common utilities used across packages.
 """
 
+import os
 import sys
 from pathlib import Path
 
 from platformdirs import user_data_dir
+
+
+# ============================================
+# Durable writes
+# ============================================
+
+
+def fsync_dir(directory: Path) -> None:
+    """Flush a directory-entry change - a rename - all the way to disk.
+
+    os.replace makes a rename atomic, but atomic is not durable: the new
+    directory entry sits in the filesystem journal until its next commit, and
+    a power loss before then reboots to the previous file. For most files
+    that is a harmless few-seconds rollback; for the spend ledger it can
+    revive allowance whose signed authorization is already in an agent's
+    hands. Fsyncing the directory after the rename
+    closes that window. A process crash never needs this - only power loss
+    does.
+
+    POSIX only. Windows cannot fsync a directory handle this way; there,
+    os.replace plus the file-content fsync the writers already do is the
+    ceiling, and NTFS's own metadata journaling is the remaining guarantee.
+
+    Best effort by design: the rename has already succeeded when this runs,
+    so a filesystem that refuses the directory open (some network mounts do)
+    costs only the durability nicety, never the write.
+    """
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+# ============================================
+# HTTP request origin
+# ============================================
+
+
+def is_browser_request(headers) -> bool:
+    """True if a web page told the browser to send this request.
+
+    Vault's servers listen on loopback, where a request from a browser tab and
+    one from a local program look identical at the socket. But a browser stamps
+    `Origin` on anything a page initiates, and Vault's own callers never do:
+    agents use ordinary HTTP clients, the CLI uses urlopen, and the GUI holds
+    the core directly. So the header separates the two reliably here.
+
+    Both servers refuse these. Without that, a site the user has open could
+    drive Vault in the background - and against endpoints that move money or
+    write the payment record, a request that succeeds is damaging even if the
+    page is never allowed to read the reply.
+    """
+    return bool(headers.get("Origin"))
+
+
+# Loopback names a request may legitimately arrive under. Anything else, on a
+# loopback-bound socket, did not resolve here by accident.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def is_rebound_host(headers, bound_address: str) -> bool:
+    """True if the Host header names something that is not this machine.
+
+    `is_browser_request` closes the ordinary browser route, but not DNS
+    rebinding: a page on attacker.tld whose DNS is re-pointed at 127.0.0.1
+    becomes same-origin with the server, and a same-origin GET carries no
+    `Origin` header at all. The Host header is what still gives it away -
+    the browser sends the name the user typed, and that name is not ours.
+
+    Judged against the address the socket is actually bound to, so the two
+    cannot drift apart:
+
+    - Bound to loopback: only loopback names are legitimate. Reject the rest.
+    - Bound to 0.0.0.0 (`--allow-lan`): the request is meant to arrive under
+      this machine's LAN address or name, which Vault does not know and cannot
+      enumerate. There is nothing to check against, so this returns False and
+      the operator's other protections carry it.
+
+    A missing Host is allowed through: HTTP/1.0 clients may omit it, and no
+    browser does - so demanding one would only break Vault's own callers.
+    """
+    if bound_address not in _LOOPBACK_HOSTS:
+        return False
+
+    host = (headers.get("Host") or "").strip().lower()
+    if not host:
+        return False
+
+    # Strip the port. Bracketed IPv6 ("[::1]:4663") keeps its brackets so it
+    # matches the set above; a bare IPv6 host has no port to strip.
+    if host.startswith("["):
+        host = host.split("]")[0] + "]"
+    elif host.count(":") == 1:
+        host = host.split(":")[0]
+
+    return host not in _LOOPBACK_HOSTS
 
 
 # ============================================
@@ -94,28 +199,88 @@ def agent_config_snippet(agent_id: str, token: str, auth_mode: str,
     )
 
 
+class DataDirectoryError(RuntimeError):
+    """The data directory could not be created, or cannot be written to.
+
+    Carries a message written for the user rather than for a log, because the
+    interfaces surface it directly: the GUI in a dialog, the CLI on stderr.
+    """
+
+    def __init__(self, path: Path, reason: str):
+        self.path = Path(path)
+        self.reason = reason
+        super().__init__(self.user_message())
+
+    def user_message(self) -> str:
+        """The full explanation shown to the user."""
+        portable = getattr(sys, 'frozen', False)
+        where = (
+            "Vault keeps its data next to the application, so it can run from a "
+            "USB stick or any folder without installing."
+            if portable else
+            "Vault keeps its data in the standard location for your platform."
+        )
+        advice = (
+            "Move Vault to a folder you can write to - your Desktop or Documents "
+            "folder will work - and start it again."
+            if portable else
+            "Check that you have permission to write to that folder."
+        )
+        return (
+            f"Vault cannot write to its data folder, so it cannot start.\n\n"
+            f"Folder:  {self.path}\n"
+            f"Problem: {self.reason}\n\n"
+            f"{where}\n\n{advice}"
+        )
+
+
 def get_app_dir() -> Path:
-    """Get the application data directory."""
+    """Get the application data directory, creating it if needed.
+
+    Two locations, deliberately:
+
+    - Frozen builds keep data in `data/` beside the executable. Nothing was
+      installed, so nothing is left behind on the machine, and the whole thing
+      travels on a USB stick. The path is resolved at run time, so the drive
+      letter does not matter.
+    - Pip installs use the platform-standard directory, which is what someone
+      who ran an installer expects.
+
+    Raises:
+        DataDirectoryError: if the folder cannot be created or written to. This
+            is called during startup, before any window exists, and a windowed
+            build has no console to print to - so the failure has to arrive as
+            something an interface can show, not as a bare OSError.
+    """
     if getattr(sys, 'frozen', False):
         # Running as compiled (PyInstaller) — keep data next to the executable
         app_dir = Path(sys.executable).parent / "data"
     else:
         # Pip-installed or dev mode — use platform-standard location
-        # Windows: %APPDATA%/Primer/Vault, Linux: ~/.local/share/Primer/Vault, macOS: ~/Library/Application Support/Primer/Vault
+        # Windows: %LOCALAPPDATA%/Primer/Vault, Linux: ~/.local/share/Primer/Vault, macOS: ~/Library/Application Support/Primer/Vault
         app_dir = Path(user_data_dir("Vault", appauthor="Primer"))
 
-    app_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        app_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise DataDirectoryError(app_dir, e.strerror or str(e)) from e
+
+    # Creating the folder does not prove it can be written to: it may already
+    # exist as read-only, or sit on a mount that rejects writes. The wallet is
+    # written on the very next step, so find out now, with a path to name.
+    probe = app_dir / ".write-test"
+    try:
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        raise DataDirectoryError(app_dir, e.strerror or str(e)) from e
+
     return app_dir
 
 
 def get_wallet_dir() -> Path:
     """Get the wallet storage directory."""
     return get_app_dir() / "wallets"
-
-
-def get_default_wallet_path() -> Path:
-    """Get path to default wallet file."""
-    return get_wallet_dir() / "default.json"
 
 
 def get_assets_dir() -> Path:
@@ -126,12 +291,10 @@ def get_assets_dir() -> Path:
             return Path(sys._MEIPASS) / "assets"
         # Onedir mode - assets next to exe
         return Path(sys.executable).parent / "assets"
-    # Installed as pip package — assets bundled inside package
-    pkg_assets = Path(__file__).parent / "assets"
-    if pkg_assets.exists():
-        return pkg_assets
-    # Dev mode fallback (running directly from repo without installing)
-    return Path(__file__).parent.parent.parent / "assets"
+    # Assets live inside the package, so this is the same path whether Vault was
+    # pip-installed or is running from a clone. One copy, one path - a second
+    # location with a fallback between them is how the two drift apart.
+    return Path(__file__).parent / "assets"
 
 
 def get_settings_path() -> Path:
@@ -144,3 +307,53 @@ def get_logs_dir() -> Path:
     logs_dir = get_app_dir() / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir
+
+
+def scrub_dialog(dialog, attrs: tuple = ()) -> None:
+    """Blank every text-bearing widget in a closed dialog, None the named
+    attributes, and schedule the dialog for destruction.
+
+    Qt keeps a parented dialog alive for as long as its parent lives, and the
+    wallet dialogs are parented to widgets that live for the whole session -
+    so a seed phrase, private key or password left in a widget or attribute
+    survives close() and outlives lock(). Locking the wallet cannot reach
+    these copies; the dialog has to drop them itself.
+
+    Call it from the dialog's closeEvent (covers the user closing the window)
+    AND from the caller after exec() returns and the needed values were read
+    (accept()/reject() do not send a closeEvent). Safe to call twice.
+
+    Python cannot zero immutable strings, so this drops references and clears
+    widget buffers - the same limit lock() itself has.
+    """
+    from PyQt6.QtWidgets import QLabel, QLineEdit, QPlainTextEdit, QTextEdit
+
+    for w in dialog.findChildren(QLineEdit):
+        w.clear()
+    for w in dialog.findChildren(QTextEdit):
+        w.clear()
+    for w in dialog.findChildren(QPlainTextEdit):
+        w.clear()
+    for w in dialog.findChildren(QLabel):
+        w.setText("")
+    for name in attrs:
+        if hasattr(dialog, name):
+            setattr(dialog, name, None)
+    dialog.deleteLater()
+
+
+def redact_urls(text: str) -> str:
+    """Strip any endpoint reference from `text` with a placeholder.
+
+    Error text from web3 / requests names the RPC endpoint that failed, and a
+    hosted node's URL carries the account's API key. That text reaches API
+    responses (a failed trade's reason, a settlement receipt), so it must be
+    stripped before it crosses the process boundary. Local logs keep the
+    original - it is the user's own endpoint and useful for debugging there.
+
+    Two shapes are redacted: a full `http(s)://…` URL, and urllib3's
+    `url: <target>` form, which prints only the path (`url: /v2/<key>`) because
+    it names the host separately - so the key can appear without an `http://`.
+    """
+    import re
+    return re.sub(r"https?://\S+|\burl:\s*\S+", "[endpoint removed]", str(text))

@@ -489,7 +489,7 @@ class TestDomainEdgeCases:
 
     def test_dot_prefix_in_allowlist(self):
         """Domain entry starting with dot should work."""
-        policy = SpendPolicy.create(
+        SpendPolicy.create(
             name="DotPrefix",
             networks=[4663],
             daily_limit_micro=1000000,

@@ -4,8 +4,35 @@ Policy command implementations.
 
 from typing import TYPE_CHECKING
 
+import math
+
 from .result import CommandResult
 from ..models.policy import TradingRules
+
+
+def _parse_limit_float(s: str) -> float:
+    """Parse a CLI numeric limit, rejecting NaN/Infinity - a non-finite
+    limit would silently disable the cap it sets. Raises ValueError, which
+    each option's handler turns into "Invalid value for --flag"."""
+    v = float(s)
+    if not math.isfinite(v):
+        raise ValueError(f"not a finite number: {s}")
+    return v
+
+
+def _parse_domain_list(args: list[str], i: int) -> tuple[list[str], int]:
+    """Parse the value of a --allow-domains / --block-domains flag at args[i].
+
+    Returns (domains, next_i). Naming domains sets the list; an empty value, a
+    missing value (the flag is last), or a value that is itself another flag all
+    clear it. An empty allow list means "any domain", an empty block list means
+    "block none" - so clearing is how the user opens a list back up, and there
+    is no magic word for it.
+    """
+    if i + 1 < len(args) and not args[i + 1].startswith("--"):
+        return [d.strip() for d in args[i + 1].split(",") if d.strip()], i + 2
+    return [], i + 1
+
 
 if TYPE_CHECKING:
     from ..core import Vault
@@ -152,8 +179,9 @@ allowed/blocked domains, and network restrictions.""")
                 lines.append(f"  Daily Volume:     ${tr.daily_volume_limit_usd:.2f}")
                 auto_str = f"${tr.auto_approve_below_usd:.2f}" if tr.auto_approve_below_usd else "Manual only"
                 lines.append(f"  Auto-approve:     {auto_str}")
-                lines.append(f"  Min ETH Reserve:  {tr.min_reserve_eth:.6f} ETH")
+                lines.append(f"  Min ETH Balance:  {tr.min_reserve_eth:.6f} ETH")
                 lines.append(f"  Max Slippage:     {tr.max_slippage_percent:.1f}%")
+                lines.append(f"  Max Price Impact: {tr.max_price_impact_percent:.1f}%")
         else:
             lines.append("")
             lines.append("Trading:            Disabled")
@@ -178,6 +206,7 @@ allowed/blocked domains, and network restrictions.""")
                 "auto_approve_below_usd": tr.auto_approve_below_usd,
                 "min_reserve_eth": tr.min_reserve_eth,
                 "max_slippage_percent": tr.max_slippage_percent,
+                "max_price_impact_percent": tr.max_price_impact_percent,
             }
 
         return CommandResult.ok("\n".join(lines), data={"policy": policy_data})
@@ -195,16 +224,17 @@ x402 Payment Options:
   --txn <amount>           Per-transaction maximum in USD (default: 10)
   --auto <amount>          Auto-approve threshold in USD (default: none)
   --networks <ids>         Comma-separated chain IDs (default: all)
-  --allow-domains <list>   Comma-separated allowed domains (default: all)
-  --block-domains <list>   Comma-separated blocked domains
+  --allow-domains <list>   Comma-separated allowed domains (empty = allow any)
+  --block-domains <list>   Comma-separated blocked domains (empty = block none)
 
 Trading Options:
   --trading                Enable trading for this policy
   --trade-max <amount>     Per-trade maximum in USD (default: 100)
   --trade-daily <amount>   Daily trading volume limit in USD (default: 500)
   --trade-auto <amount>    Auto-approve trades below this USD amount
-  --min-eth <amount>       Minimum ETH reserve for gas (default: 0.0001)
+  --min-eth <amount>       Halt trading below this ETH balance (default: 0.0001)
   --max-slip <percent>     Maximum slippage percent (default: 3.0)
+  --max-impact <percent>   Max price impact incl. fee (default: 5.0)
 
 Examples:
   policy create standard
@@ -235,12 +265,13 @@ Examples:
         trade_auto = None
         min_eth = 0.0001
         max_slip = 3.0
+        max_impact = 5.0
 
         i = 1
         while i < len(args):
             if args[i] == "--day" and i + 1 < len(args):
                 try:
-                    daily_limit = float(args[i + 1])
+                    daily_limit = _parse_limit_float(args[i + 1])
                     if daily_limit < 0:
                         return CommandResult.fail(f"Daily limit cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -248,7 +279,7 @@ Examples:
                 i += 2
             elif args[i] == "--txn" and i + 1 < len(args):
                 try:
-                    per_request_max = float(args[i + 1])
+                    per_request_max = _parse_limit_float(args[i + 1])
                     if per_request_max < 0:
                         return CommandResult.fail(f"Per-transaction max cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -256,7 +287,7 @@ Examples:
                 i += 2
             elif args[i] == "--auto" and i + 1 < len(args):
                 try:
-                    auto_approve = float(args[i + 1])
+                    auto_approve = _parse_limit_float(args[i + 1])
                     if auto_approve < 0:
                         return CommandResult.fail(f"Auto-approve threshold cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -268,12 +299,10 @@ Examples:
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
                 i += 2
-            elif args[i] == "--allow-domains" and i + 1 < len(args):
-                allow_domains = [d.strip() for d in args[i + 1].split(",") if d.strip()]
-                i += 2
-            elif args[i] == "--block-domains" and i + 1 < len(args):
-                block_domains = [d.strip() for d in args[i + 1].split(",") if d.strip()]
-                i += 2
+            elif args[i] == "--allow-domains":
+                allow_domains, i = _parse_domain_list(args, i)
+            elif args[i] == "--block-domains":
+                block_domains, i = _parse_domain_list(args, i)
             # x402 options
             elif args[i] == "--x402":
                 x402_enabled = True
@@ -287,7 +316,7 @@ Examples:
                 i += 1
             elif args[i] == "--trade-max" and i + 1 < len(args):
                 try:
-                    trade_max = float(args[i + 1])
+                    trade_max = _parse_limit_float(args[i + 1])
                     if trade_max < 0:
                         return CommandResult.fail(f"Trade max cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -295,7 +324,7 @@ Examples:
                 i += 2
             elif args[i] == "--trade-daily" and i + 1 < len(args):
                 try:
-                    trade_daily = float(args[i + 1])
+                    trade_daily = _parse_limit_float(args[i + 1])
                     if trade_daily < 0:
                         return CommandResult.fail(f"Trade daily limit cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -303,7 +332,7 @@ Examples:
                 i += 2
             elif args[i] == "--trade-auto" and i + 1 < len(args):
                 try:
-                    trade_auto = float(args[i + 1])
+                    trade_auto = _parse_limit_float(args[i + 1])
                     if trade_auto < 0:
                         return CommandResult.fail(f"Trade auto-approve cannot be negative: {args[i + 1]}")
                 except ValueError:
@@ -311,19 +340,27 @@ Examples:
                 i += 2
             elif args[i] == "--min-eth" and i + 1 < len(args):
                 try:
-                    min_eth = float(args[i + 1])
+                    min_eth = _parse_limit_float(args[i + 1])
                     if min_eth < 0:
-                        return CommandResult.fail(f"Min ETH reserve cannot be negative: {args[i + 1]}")
+                        return CommandResult.fail(f"Minimum ETH balance cannot be negative: {args[i + 1]}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --min-eth: {args[i + 1]}")
                 i += 2
             elif args[i] == "--max-slip" and i + 1 < len(args):
                 try:
-                    max_slip = float(args[i + 1])
+                    max_slip = _parse_limit_float(args[i + 1])
                     if max_slip < 0 or max_slip > 100:
                         return CommandResult.fail(f"Max slippage must be 0-100%: {args[i + 1]}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --max-slip: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--max-impact" and i + 1 < len(args):
+                try:
+                    max_impact = _parse_limit_float(args[i + 1])
+                    if max_impact < 0 or max_impact > 100:
+                        return CommandResult.fail(f"Max price impact must be 0-100%: {args[i + 1]}")
+                except ValueError:
+                    return CommandResult.fail(f"Invalid value for --max-impact: {args[i + 1]}")
                 i += 2
             elif args[i].startswith("--"):
                 return CommandResult.fail(
@@ -343,6 +380,7 @@ Examples:
                 auto_approve_below_usd=trade_auto,
                 min_reserve_eth=min_eth,
                 max_slippage_percent=max_slip,
+                max_price_impact_percent=max_impact,
             )
 
         try:
@@ -375,16 +413,17 @@ x402 Payment Options:
   --txn <amount>           Per-transaction maximum in USD
   --auto <amount>          Auto-approve threshold in USD
   --networks <ids>         Comma-separated chain IDs
-  --allow-domains <list>   Comma-separated allowed domains (use 'all' to clear)
-  --block-domains <list>   Comma-separated blocked domains (use 'none' to clear)
+  --allow-domains <list>   Comma-separated allowed domains (empty to clear = allow any)
+  --block-domains <list>   Comma-separated blocked domains (empty to clear = block none)
 
 Trading Options:
   --trading <on|off>       Enable or disable trading
   --trade-max <amount>     Per-trade maximum in USD
   --trade-daily <amount>   Daily trading volume limit in USD
   --trade-auto <amount>    Auto-approve trades below this USD amount (use 'off' to disable)
-  --min-eth <amount>       Minimum ETH reserve for gas
+  --min-eth <amount>       Halt trading below this ETH balance
   --max-slip <percent>     Maximum slippage percent
+  --max-impact <percent>   Max price impact incl. fee
 
 Only specified options will be changed.
 
@@ -404,35 +443,39 @@ Examples:
             return CommandResult.fail(f"Policy not found: {name}")
 
         changes = []
-        trading_changes = []  # Track if we need to create/update trading rules
+        # Parsed changes are collected, not applied, until the whole
+        # command validates - so a bad option leaves the policy untouched
+        # rather than half-edited (it is the live store object).
+        policy_changes = []       # (attr, value) on the policy itself
+        trading_changes = []      # (attr, value) on its trading rules
         i = 1
         while i < len(args):
             if args[i] == "--day" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
                         return CommandResult.fail(f"Daily limit cannot be negative: {args[i + 1]}")
-                    policy.daily_limit_micro = int(value * 1_000_000)
+                    policy_changes.append(("daily_limit_micro", int(value * 1_000_000)))
                     changes.append(f"daily limit: ${value:.2f}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --day: {args[i + 1]}")
                 i += 2
             elif args[i] == "--txn" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
                         return CommandResult.fail(f"Per-transaction max cannot be negative: {args[i + 1]}")
-                    policy.per_request_max_micro = int(value * 1_000_000)
+                    policy_changes.append(("per_request_max_micro", int(value * 1_000_000)))
                     changes.append(f"per-txn max: ${value:.2f}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --txn: {args[i + 1]}")
                 i += 2
             elif args[i] == "--auto" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
                         return CommandResult.fail(f"Auto-approve threshold cannot be negative: {args[i + 1]}")
-                    policy.auto_approve_below_micro = int(value * 1_000_000)
+                    policy_changes.append(("auto_approve_below_micro", int(value * 1_000_000)))
                     changes.append(f"auto-approve: ${value:.2f}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --auto: {args[i + 1]}")
@@ -440,27 +483,25 @@ Examples:
             elif args[i] == "--networks" and i + 1 < len(args):
                 try:
                     networks = [int(n.strip()) for n in args[i + 1].split(",")]
-                    policy.networks = networks
+                    policy_changes.append(("networks", networks))
                     changes.append(f"networks: {args[i + 1]}")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
                 i += 2
-            elif args[i] == "--allow-domains" and i + 1 < len(args):
-                val = args[i + 1].strip().lower()
-                policy.allowed_domains = [] if val == "all" else [d.strip() for d in args[i + 1].split(",") if d.strip()]
-                changes.append(f"allowed domains: {args[i + 1]}")
-                i += 2
-            elif args[i] == "--block-domains" and i + 1 < len(args):
-                val = args[i + 1].strip().lower()
-                policy.blocked_domains = [] if val == "none" else [d.strip() for d in args[i + 1].split(",") if d.strip()]
-                changes.append(f"blocked domains: {args[i + 1]}")
-                i += 2
+            elif args[i] == "--allow-domains":
+                domains, i = _parse_domain_list(args, i)
+                policy_changes.append(("allowed_domains", domains))
+                changes.append(f"allowed domains: {', '.join(domains) if domains else '(cleared)'}")
+            elif args[i] == "--block-domains":
+                domains, i = _parse_domain_list(args, i)
+                policy_changes.append(("blocked_domains", domains))
+                changes.append(f"blocked domains: {', '.join(domains) if domains else '(cleared)'}")
             # x402 option
             elif args[i] == "--x402" and i + 1 < len(args):
                 val = args[i + 1].strip().lower()
                 if val not in ("on", "off"):
                     return CommandResult.fail(f"--x402 must be 'on' or 'off', got: {args[i + 1]}")
-                policy.x402_enabled = val == "on"
+                policy_changes.append(("x402_enabled", val == "on"))
                 changes.append(f"x402: {val}")
                 i += 2
             # Trading options
@@ -473,7 +514,7 @@ Examples:
                 i += 2
             elif args[i] == "--trade-max" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
                         return CommandResult.fail(f"Trade max cannot be negative: {args[i + 1]}")
                     trading_changes.append(("per_trade_max_usd", value))
@@ -483,7 +524,7 @@ Examples:
                 i += 2
             elif args[i] == "--trade-daily" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
                         return CommandResult.fail(f"Trade daily limit cannot be negative: {args[i + 1]}")
                     trading_changes.append(("daily_volume_limit_usd", value))
@@ -498,7 +539,7 @@ Examples:
                     changes.append("trade auto: off")
                 else:
                     try:
-                        value = float(args[i + 1])
+                        value = _parse_limit_float(args[i + 1])
                         if value < 0:
                             return CommandResult.fail(f"Trade auto-approve cannot be negative: {args[i + 1]}")
                         trading_changes.append(("auto_approve_below_usd", value))
@@ -508,9 +549,9 @@ Examples:
                 i += 2
             elif args[i] == "--min-eth" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0:
-                        return CommandResult.fail(f"Min ETH reserve cannot be negative: {args[i + 1]}")
+                        return CommandResult.fail(f"Minimum ETH balance cannot be negative: {args[i + 1]}")
                     trading_changes.append(("min_reserve_eth", value))
                     changes.append(f"min ETH: {value}")
                 except ValueError:
@@ -518,13 +559,23 @@ Examples:
                 i += 2
             elif args[i] == "--max-slip" and i + 1 < len(args):
                 try:
-                    value = float(args[i + 1])
+                    value = _parse_limit_float(args[i + 1])
                     if value < 0 or value > 100:
                         return CommandResult.fail(f"Max slippage must be 0-100%: {args[i + 1]}")
                     trading_changes.append(("max_slippage_percent", value))
                     changes.append(f"max slippage: {value}%")
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --max-slip: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--max-impact" and i + 1 < len(args):
+                try:
+                    value = _parse_limit_float(args[i + 1])
+                    if value < 0 or value > 100:
+                        return CommandResult.fail(f"Max price impact must be 0-100%: {args[i + 1]}")
+                    trading_changes.append(("max_price_impact_percent", value))
+                    changes.append(f"max price impact: {value}%")
+                except ValueError:
+                    return CommandResult.fail(f"Invalid value for --max-impact: {args[i + 1]}")
                 i += 2
             elif args[i].startswith("--"):
                 return CommandResult.fail(
@@ -537,10 +588,11 @@ Examples:
         if not changes:
             return CommandResult.fail("No changes specified. Use 'policy edit --help' for options.")
 
-        # Apply trading changes
+        # Every option parsed - now apply, so a failure above changed nothing.
+        for attr, value in policy_changes:
+            setattr(policy, attr, value)
         if trading_changes:
             if policy.trading_rules is None:
-                # Create new trading rules with defaults
                 policy.trading_rules = TradingRules()
             for field_name, value in trading_changes:
                 setattr(policy.trading_rules, field_name, value)

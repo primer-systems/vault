@@ -144,6 +144,36 @@ def _extract_resource(x402_data: Dict[str, Any], req: Dict[str, Any], version: i
     return per_accept or top_url
 
 
+def _select_offer(accepts: list) -> Any:
+    """Pick the offer Vault can settle, from a list of alternatives.
+
+    Supported means: a chain Vault knows, and USDG on that chain. The choice is
+    a convenience - every gate that matters runs afterwards on whatever is
+    returned here.
+    """
+    from ..networks import NETWORKS, TOKENS
+
+    usdg = TOKENS["USDG"].addresses
+    for entry in accepts:
+        if not isinstance(entry, dict):
+            continue
+        asset = entry.get("asset")
+        network = entry.get("network")
+        if not asset or not network:
+            continue
+        try:
+            chain_id = parse_caip_network(to_caip_network(str(network)))
+        except (ValueError, IndexError):
+            continue
+        expected = usdg.get(chain_id)
+        if chain_id in NETWORKS and expected and str(asset).lower() == expected.lower():
+            return entry
+
+    # Nothing supported. Return the first so the error names its asset rather
+    # than saying only that none of them matched.
+    return accepts[0]
+
+
 def parse_x402(x402_data: Dict[str, Any]) -> PaymentRequirements:
     """
     Parse an x402 payment requirement (v1 or v2) into the neutral
@@ -165,7 +195,17 @@ def parse_x402(x402_data: Dict[str, Any]) -> PaymentRequirements:
     if len(accepts) == 0:
         raise ValueError("Empty 'accepts' array")
 
-    req = accepts[0]
+    # `accepts` is a list of alternatives by design - a merchant that serves
+    # several chains offers each of them. Reading only the first meant a service
+    # offering [USDC on Base, USDG on RHC] was refused for an unsupported asset
+    # while offering exactly what Vault pays in.
+    #
+    # This picks the first entry Vault could actually settle, and falls back to
+    # the first entry so an unsupported payload still produces the same specific
+    # error it did before rather than a vaguer one. Choosing here does not widen
+    # what is allowed: the asset and chain are still checked against policy
+    # afterwards, and that check is what decides.
+    req = _select_offer(accepts)
     if not isinstance(req, dict):
         raise ValueError("Invalid accepts[0] format")
 
@@ -193,9 +233,12 @@ def parse_x402(x402_data: Dict[str, Any]) -> PaymentRequirements:
     if not asset:
         raise ValueError("Missing 'asset' in accepts")
 
-    # Normalize to CAIP-2
-    caip_network = to_caip_network(network)
-    chain_id = parse_caip_network(caip_network)
+    # Normalize to CAIP-2. Rebuild the string from the parsed chain id rather
+    # than keeping the payee's raw text - a merchant controls this field, and
+    # anything after the chain id (newlines, a fabricated recipient block) would
+    # otherwise be carried onto the approval dialog verbatim.
+    chain_id = parse_caip_network(to_caip_network(network))
+    caip_network = f"eip155:{chain_id}"
 
     # Extract token metadata from 'extra' field if available (same in both dialects)
     extra = req.get("extra") or {}
@@ -299,6 +342,126 @@ def sign_transfer_authorization(
     if not sig_hex.startswith("0x"):
         sig_hex = "0x" + sig_hex
     return sig_hex
+
+
+def build_transfer_authorization_typed_data(
+    chain_id: int,
+    token_address: str,
+    token_name: str,
+    token_version: str,
+    from_address: str,
+    to_address: str,
+    value: int,
+    valid_after: int,
+    valid_before: int,
+    nonce: bytes
+) -> Dict[str, Any]:
+    """
+    Build EIP-712 typed data for TransferWithAuthorization without signing.
+
+    Used for hardware wallet signing where the signing happens on the device.
+
+    Args:
+        chain_id: EVM chain ID
+        token_address: ERC-20 token contract address
+        token_name: Token name (for EIP-712 domain)
+        token_version: Token version (for EIP-712 domain)
+        from_address: Address tokens are transferred from
+        to_address: Address tokens are transferred to
+        value: Amount in token's smallest unit
+        valid_after: Unix timestamp after which the authorization is valid
+        valid_before: Unix timestamp before which the authorization is valid
+        nonce: 32-byte random nonce
+
+    Returns:
+        EIP-712 typed data dictionary
+    """
+    return {
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "TransferWithAuthorization": [
+                {"name": "from", "type": "address"},
+                {"name": "to", "type": "address"},
+                {"name": "value", "type": "uint256"},
+                {"name": "validAfter", "type": "uint256"},
+                {"name": "validBefore", "type": "uint256"},
+                {"name": "nonce", "type": "bytes32"}
+            ]
+        },
+        "primaryType": "TransferWithAuthorization",
+        "domain": {
+            "name": token_name,
+            "version": token_version,
+            "chainId": chain_id,
+            "verifyingContract": Web3.to_checksum_address(token_address)
+        },
+        "message": {
+            "from": Web3.to_checksum_address(from_address),
+            "to": Web3.to_checksum_address(to_address),
+            "value": value,
+            "validAfter": valid_after,
+            "validBefore": valid_before,
+            "nonce": nonce
+        }
+    }
+
+
+def create_payment_from_signature(
+    from_address: str,
+    requirements: PaymentRequirements,
+    signature: str,
+    valid_after: int,
+    valid_before: int,
+    nonce_hex: str,
+    accepted: Optional[Dict[str, Any]] = None,
+    resource: Any = None,
+) -> Dict[str, Any]:
+    """
+    Create an x402 v2 PaymentPayload from a pre-existing signature.
+
+    Used for hardware wallet signing where the signature comes from the device.
+
+    Args:
+        from_address: The signer's address
+        requirements: Parsed payment requirements
+        signature: Hex-encoded signature from the hardware wallet
+        valid_after: Unix timestamp used in the signature
+        valid_before: Unix timestamp used in the signature
+        nonce_hex: Hex-encoded nonce used in the signature (with 0x prefix)
+        accepted: The merchant's selected `accepts[]` entry
+        resource: The request's top-level resource
+
+    Returns:
+        x402 v2 PaymentPayload
+    """
+    # Ensure signature has 0x prefix
+    if not signature.startswith("0x"):
+        signature = "0x" + signature
+
+    payment = {
+        "x402Version": X402_VERSION,
+        "accepted": _build_accepted(requirements, accepted),
+        "payload": {
+            "signature": signature,
+            "authorization": {
+                "from": from_address,
+                "to": requirements.pay_to,
+                "value": requirements.max_amount_required,
+                "validAfter": valid_after,
+                "validBefore": valid_before,
+                "nonce": nonce_hex
+            }
+        }
+    }
+    resource_obj = _normalize_resource(resource if resource is not None else requirements.resource)
+    if resource_obj is not None:
+        payment["resource"] = resource_obj
+    return payment
 
 
 def _build_accepted(requirements: PaymentRequirements, accepted_raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:

@@ -14,16 +14,12 @@ from typing import Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QLineEdit, QApplication, QFrame, QTextEdit, QSplitter,
-    QAbstractItemView
-)
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QLineEdit, QApplication, QTextEdit, QSplitter, QAbstractItemView
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor
 
 from .theme import Theme, active, colored_span
+from ..version import USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +42,7 @@ class MarketFetchThread(QThread):
                 url = f"{MARKET_API}?limit=200&offset={offset}"
                 req = Request(url, headers={
                     "Accept": "application/json",
-                    "User-Agent": "Vault/1.0 (https://primer.systems)",
+                    "User-Agent": USER_AGENT,
                 })
                 with urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode())

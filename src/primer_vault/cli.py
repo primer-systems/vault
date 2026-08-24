@@ -19,17 +19,17 @@ Scripting Mode:
 import sys
 import os
 import getpass
-from pathlib import Path
+import subprocess
 
 from .core import Vault
 from .commands import CommandHandler, CommandResult
-from .utils import get_app_dir
+from .utils import get_app_dir, DataDirectoryError
 from .version import __version__
 
 
 BANNER = f"""
-█▀▄▀█ █ █ █   ▀█▀ █ █▀▀ █   ▄▀█ █ █ █
-█ ▀ █ █▄█ █▄▄  █  █ █▄▄ █▄▄ █▀█ ▀▄▀▄▀
+█ █ ▄▀█ █ █ █   ▀█▀
+▀▄▀ █▀█ █▄█ █▄▄  █
 v{__version__} - Type 'help' for commands, 'exit' to quit
 """
 
@@ -146,7 +146,7 @@ def run_command(handler: CommandHandler, command: str, script_ctx: ScriptContext
 
     # Check for clear (in terminal, clear screen)
     if result.data and result.data.get("action") == "clear":
-        os.system('cls' if os.name == 'nt' else 'clear')
+        subprocess.run('cls' if os.name == 'nt' else 'clear', shell=True, check=False)
 
     return True
 
@@ -223,8 +223,18 @@ def print_usage():
     print(f"""Vault CLI v{__version__}
 
 Usage:
-  primer_vault                     Start interactive mode (REPL)
-  primer_vault <command> [args]    Run a single command
+  primer-vault                     Start the desktop app (default)
+  primer-vault --cli               Interactive terminal
+  primer-vault --headless          Run as a daemon, no window
+  primer-vault <command> [args]    Run a single command
+
+Mode flags:
+  --gui / --cli / --headless   How Vault runs (default: desktop app)
+  --wallet <name>              Open this wallet on start
+  --agent-port <n>             Agent API port (default 4663)
+  --admin-port <n>             Admin API port (default 4664)
+  --allow-lan                  Bind the agent API to the LAN
+  --admin-open                 Start with the Admin API open (persists)
 
 Global Flags (single-command mode only):
   --yes, -y           Auto-confirm destructive actions (supplies YES)
@@ -234,14 +244,18 @@ Environment Variables:
   PRIMER_VAULT_PASSWORD  Password for wallet operations (alternative to --password)
 
 Examples:
-  primer_vault wallet list
-  primer_vault wallet open mywallet --password "secret"
-  primer_vault policy delete old-policy --yes
-  PRIMER_VAULT_PASSWORD="secret" primer_vault wallet create newwallet --yes
+  primer-vault status
+  primer-vault wallet open mywallet --password "a-strong-passphrase"
+  primer-vault policy delete old-policy --yes
+  PRIMER_VAULT_PASSWORD="a-strong-passphrase" primer-vault wallet create newwallet --yes
+
+Note: a password given on the command line is visible to other users on the
+machine (via the process list) and is usually kept in your shell history. For
+unattended use prefer PRIMER_VAULT_PASSWORD, which is neither.
 
 For command help:
-  primer_vault help
-  primer_vault <command> --help
+  primer-vault help
+  primer-vault <command> --help
 """)
 
 
@@ -257,8 +271,13 @@ def main():
         print(f"Vault {__version__}")
         sys.exit(0)
 
-    # Resolve data directory
-    data_dir = get_app_dir()
+    # Resolve data directory. If it is unwritable there is nothing useful to do
+    # but say so plainly - every command below needs somewhere to read and write.
+    try:
+        data_dir = get_app_dir()
+    except DataDirectoryError as e:
+        print(e.user_message(), file=sys.stderr)
+        sys.exit(1)
 
     # Try to connect to a running instance that shares our data directory
     core = None
@@ -269,8 +288,22 @@ def main():
         pass
 
     if core is None:
-        # No running instance found (or wrong data dir) — create our own core
-        core = Vault(data_dir=data_dir)
+        # No running instance answered the probe — create our own core. The
+        # instance lock inside Vault() is the backstop: if an instance IS
+        # running but the probe missed it (slow to answer, admin API on a
+        # different port, an unrelated program on 4664), this refuses cleanly
+        # instead of silently running a second core against the same files.
+        from primer_vault.instance_lock import InstanceAlreadyRunning
+        try:
+            core = Vault(data_dir=data_dir)
+        except InstanceAlreadyRunning as e:
+            print(e.user_message(), file=sys.stderr)
+            print(
+                "\nA running Vault normally answers the CLI on port 4664, but "
+                "this one did not - it may still be starting, or the port may "
+                "be taken by another program. Try again in a moment.",
+                file=sys.stderr)
+            sys.exit(1)
 
     handler = CommandHandler(core)
 
@@ -278,6 +311,11 @@ def main():
     if len(sys.argv) > 1:
         # Single command mode (scriptable)
         single_command_mode(handler, sys.argv[1:])
+    elif sys.stdin is None:
+        # A windowed build has no stdin, so there is no terminal to read from.
+        # Reached when the desktop window could not open and run_gui() handed
+        # over to here; _gui_unavailable has already told the user by then.
+        sys.exit(1)
     elif not sys.stdin.isatty():
         # Piped / redirected stdin — process each line as a command
         piped_mode(handler)

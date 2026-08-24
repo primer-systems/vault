@@ -12,13 +12,15 @@ Keys never exist unencrypted on disk.
 
 import os
 import json
+import logging
 import secrets
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass, asdict
 
-from ..utils import validate_name
+from ..utils import fsync_dir, validate_name
 
 # Cryptography
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -27,19 +29,34 @@ from argon2.low_level import hash_secret_raw, Type
 # Ethereum
 from mnemonic import Mnemonic
 from eth_account import Account
-from eth_account.hdaccount import generate_mnemonic, seed_from_mnemonic, key_from_seed
+from eth_account.hdaccount import seed_from_mnemonic, key_from_seed
 
 # Enable HD wallet features
 Account.enable_unaudited_hdwallet_features()
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================
 # Security Constants
 # ============================================
 
-# Argon2id parameters (OWASP recommendations for high-security)
+# Argon2id parameters for wrapping the master key.
+#
+# These are the settings new wallets are written with. An existing wallet records
+# the settings it was wrapped with and is opened using those, so raising these
+# strands nothing.
+#
+# Memory is the lever that matters: it is the resource an attacker with graphics
+# cards or custom hardware finds expensive to parallelise, far more than passes.
+# 256 MB costs ~280ms to unlock on a current desktop, which is imperceptible for
+# a once-per-session operation, and puts a single-core attacker at roughly 3.5
+# guesses per second.
+#
+# This runs only on unlock, not per agent request, which is what affords a
+# budget this large.
 ARGON2_TIME_COST = 3
-ARGON2_MEMORY_COST = 65536  # 64 MB
+ARGON2_MEMORY_COST = 262144  # 256 MB
 ARGON2_PARALLELISM = 4
 ARGON2_HASH_LEN = 32  # 256 bits for AES-256
 
@@ -50,11 +67,76 @@ AES_IV_SIZE = 12  # 96 bits (recommended for GCM)
 # BIP-44 derivation path for Ethereum
 ETH_DERIVATION_PATH = "m/44'/60'/0'/0/{}"
 
-# Sentinel for unencrypted wallets
+# Placeholder callers pass to load() when opening a legacy unencrypted wallet
+# file (load ignores the password for those). Creating an unencrypted wallet,
+# or stripping the password from an encrypted one, is not possible from any
+# interface: validate_wallet_password rejects this value outright, and
+# create()/change_password() always wrap the master key. Only the read side
+# exists, so legacy unencrypted wallet files still open.
 NO_PASSWORD_SENTINEL = "__NO_PASSWORD__"
+
+# On-disk wallet format. Older layouts are refused, not guessed at.
+WALLET_FORMAT_VERSION = 3
+
+
+class UnsupportedWalletVersion(ValueError):
+    """The wallet file is not a format this build reads.
+
+    Separate from a wrong password because the remedy is different and no
+    password will ever open the file.
+    """
+
+
+class CorruptedWalletFile(ValueError):
+    """The file cannot be read as a wallet at all.
+
+    Separate from a wrong password for the same reason as above: retyping the
+    password cannot fix it. Without a distinct type, a JSON parse error is a
+    ValueError and falls into the wrong-password handler. A user sent after their password
+    retries it, concludes they forgot it, and may abandon a recoverable
+    wallet. The remedies are file-level: the .previous copy each save keeps,
+    another backup, or re-importing the seed phrase.
+    """
 
 # Secure file permissions (Unix only)
 SECURE_FILE_MODE = 0o600  # Owner read/write only
+
+
+def _derive_private_key(seed_phrase: str, path: str) -> bytes:
+    """Derive a private key from a seed phrase at the given derivation path.
+
+    Every derivation goes through here so that no exception raised by the
+    library reaches a caller with its message intact. eth_account puts the
+    input in the message on at least one path - a phrase whose words are valid
+    in more than one BIP-39 wordlist raises "Word(s) are valid in multiple
+    languages: <the whole phrase>" - and Vault's callers format exceptions with
+    str(e) straight into logs and API error responses. Which future library
+    messages carry the input is not Vault's to know, so none of them cross this
+    boundary.
+
+    `from None` matters as much as the new message: it drops the original from
+    the chain, so the global excepthook cannot print it as context.
+
+    The two steps are caught separately so the caller still learns which one
+    failed. Only the first is handed a secret.
+    """
+    try:
+        seed_bytes = seed_from_mnemonic(seed_phrase, passphrase="")
+    except Exception as e:
+        raise ValueError(
+            f"Could not read this seed phrase ({type(e).__name__}). "
+            "Check that it is a valid BIP-39 English phrase."
+        ) from None
+
+    try:
+        return key_from_seed(seed_bytes, path)
+    except Exception as e:
+        # The path holds no secret - it is the stored derivation template with
+        # an index substituted in - so naming it is both safe and the only way
+        # the caller can tell a bad index from a bad phrase.
+        raise ValueError(
+            f"Derivation path {path} is not valid ({type(e).__name__})."
+        ) from None
 
 
 def set_secure_permissions(filepath: Path) -> None:
@@ -73,18 +155,6 @@ def set_secure_permissions(filepath: Path) -> None:
 
 
 # ============================================
-# Data Classes
-# ============================================
-
-@dataclass
-class WalletAddress:
-    """A derived address from the HD wallet."""
-    path: str       # BIP-44 path (e.g., "m/44'/60'/0'/0/0")
-    address: str    # 0x... address
-    label: str      # User-friendly name
-
-
-# ============================================
 # Key Derivation
 # ============================================
 
@@ -92,9 +162,14 @@ def derive_key(password: str, salt: bytes) -> bytes:
     """
     Derive an encryption key from password using Argon2id.
 
-    Argon2id is memory-hard, making brute-force attacks expensive.
-    With these parameters, each password guess requires ~64MB RAM
-    and takes ~1 second on modern hardware.
+    Argon2id is memory-hard, so each guess costs an attacker the full memory
+    footprint as well as the time - that is what makes guessing expensive.
+
+    Cost at the parameters above, measured rather than estimated: ~280ms and
+    256MB per guess on a current desktop CPU, so roughly 3.5 guesses per second
+    per core. If the parameters change, measure again and restate the figure
+    here - an estimate stated as fact here misleads about how much protection a
+    weak password actually has.
     """
     return hash_secret_raw(
         secret=password.encode('utf-8'),
@@ -105,573 +180,6 @@ def derive_key(password: str, salt: bytes) -> bytes:
         hash_len=ARGON2_HASH_LEN,
         type=Type.ID
     )
-
-
-# ============================================
-# Encryption
-# ============================================
-
-def encrypt_seed(seed_phrase: str, password: str) -> tuple[bytes, bytes, bytes, bytes]:
-    """
-    Encrypt a seed phrase with a password.
-
-    Returns: (encrypted_data, iv, tag, salt)
-    """
-    salt = secrets.token_bytes(16)
-    key = derive_key(password, salt)
-    iv = secrets.token_bytes(AES_IV_SIZE)
-
-    aesgcm = AESGCM(key)
-    ciphertext_and_tag = aesgcm.encrypt(iv, seed_phrase.encode('utf-8'), None)
-
-    ciphertext = ciphertext_and_tag[:-16]
-    tag = ciphertext_and_tag[-16:]
-
-    return ciphertext, iv, tag, salt
-
-
-def decrypt_seed(encrypted_seed: bytes, iv: bytes, tag: bytes,
-                 salt: bytes, password: str) -> str:
-    """
-    Decrypt a seed phrase with a password.
-
-    Raises: InvalidTag if password is wrong or data is tampered.
-    """
-    key = derive_key(password, salt)
-    ciphertext_and_tag = encrypted_seed + tag
-
-    aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(iv, ciphertext_and_tag, None)
-
-    return plaintext.decode('utf-8')
-
-
-# ============================================
-# Wallet Class
-# ============================================
-
-class Wallet:
-    """
-    Secure Ethereum wallet with HD key derivation.
-
-    Usage:
-        # Create new wallet
-        wallet = Wallet.create("my-password")
-        seed = wallet.seed_phrase  # Store securely offline
-        wallet.save("wallet.json")
-
-        # Load existing wallet
-        wallet = Wallet.load("wallet.json", "my-password")
-
-        # Get address
-        address = wallet.get_address(0)
-
-        # Sign a message
-        signature = wallet.sign_message(message, address_index=0)
-    """
-
-    def __init__(self, seed_phrase: str, password: str, derivation_path: str = None):
-        """Initialize wallet with seed phrase (decrypted in memory)."""
-        self._seed_phrase = seed_phrase
-        self._password = password
-        self._addresses: list[WalletAddress] = []
-        self._derivation_path = derivation_path or ETH_DERIVATION_PATH
-
-        mnemo = Mnemonic("english")
-        if not mnemo.check(seed_phrase):
-            raise ValueError("Invalid seed phrase")
-
-        self._seed = seed_from_mnemonic(seed_phrase, passphrase="")
-
-    @property
-    def seed_phrase(self) -> str:
-        """The seed phrase (sensitive - only show during backup!)."""
-        return self._seed_phrase
-
-    @classmethod
-    def create(cls, password: str, word_count: int = 12) -> 'Wallet':
-        """
-        Create a new wallet with a fresh seed phrase.
-
-        Args:
-            password: Password to encrypt the wallet
-            word_count: 12 (128-bit) or 24 (256-bit) word seed
-
-        Returns:
-            New Wallet instance
-        """
-        if word_count == 12:
-            seed_phrase = generate_mnemonic(num_words=12, lang="english")
-        elif word_count == 24:
-            seed_phrase = generate_mnemonic(num_words=24, lang="english")
-        else:
-            raise ValueError("word_count must be 12 or 24")
-
-        wallet = cls(seed_phrase, password)
-        wallet.derive_address(0, "Primary")
-        return wallet
-
-    @classmethod
-    def restore(cls, seed_phrase: str, password: str, derivation_path: str = None) -> 'Wallet':
-        """
-        Restore a wallet from an existing seed phrase.
-
-        Args:
-            seed_phrase: 12 or 24 word BIP-39 seed phrase
-            password: Password to encrypt the wallet
-            derivation_path: Custom derivation path template
-        """
-        if derivation_path:
-            parts = derivation_path.rstrip('/').split('/')
-            if parts and parts[-1].isdigit():
-                pass
-            elif '{}' not in derivation_path:
-                derivation_path = derivation_path.rstrip('/') + '/{}'
-
-        wallet = cls(seed_phrase, password, derivation_path)
-        wallet.derive_address(0, "Primary")
-        return wallet
-
-    def derive_address(self, index: int, label: str = "") -> WalletAddress:
-        """
-        Derive an address at the given index.
-
-        Args:
-            index: Address index (0, 1, 2, ...)
-            label: User-friendly label
-
-        Returns:
-            WalletAddress with the derived address
-        """
-        path = self._derivation_path.format(index)
-        private_key = key_from_seed(self._seed, path)
-        account = Account.from_key(private_key)
-
-        addr = WalletAddress(
-            path=path,
-            address=account.address,
-            label=label or f"Address {index}"
-        )
-
-        existing = [a for a in self._addresses if a.path == path]
-        if not existing:
-            self._addresses.append(addr)
-
-        return addr
-
-    def get_address(self, index: int) -> str:
-        """Get the address at the given index (derives if needed)."""
-        path = self._derivation_path.format(index)
-        for addr in self._addresses:
-            if addr.path == path:
-                return addr.address
-        return self.derive_address(index).address
-
-    def get_private_key(self, index: int) -> bytes:
-        """
-        Get the private key for an address index.
-
-        WARNING: Handle with extreme care! Only for signing.
-        """
-        path = self._derivation_path.format(index)
-        return key_from_seed(self._seed, path)
-
-    def get_account(self, index: int) -> Account:
-        """Get an eth_account Account object for signing."""
-        private_key = self.get_private_key(index)
-        return Account.from_key(private_key)
-
-    @property
-    def addresses(self) -> list[WalletAddress]:
-        """All derived addresses."""
-        return self._addresses.copy()
-
-    @property
-    def primary_address(self) -> str:
-        """The first (primary) address."""
-        return self.get_address(0)
-
-    # ============================================
-    # File Operations
-    # ============================================
-
-    def save(self, filepath: str | Path) -> None:
-        """
-        Save wallet to file.
-
-        If password is NO_PASSWORD_SENTINEL, saves unencrypted (for testnet use).
-        Otherwise, the seed phrase is encrypted with AES-256-GCM.
-        """
-        filepath = Path(filepath)
-
-        if self._password == NO_PASSWORD_SENTINEL:
-            # Unencrypted storage - seed phrase in plaintext
-            wallet_data = {
-                "version": 1,
-                "type": "hd",
-                "encrypted": False,
-                "created": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "derivation_path": self._derivation_path,
-                "seed_phrase": self._seed_phrase,
-                "addresses": [asdict(a) for a in self._addresses]
-            }
-        else:
-            # Encrypted storage
-            encrypted_seed, iv, tag, salt = encrypt_seed(
-                self._seed_phrase,
-                self._password
-            )
-
-            wallet_data = {
-                "version": 1,
-                "type": "hd",
-                "encrypted": True,
-                "created": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "derivation_path": self._derivation_path,
-                "kdf": {
-                    "algorithm": "argon2id",
-                    "salt": salt.hex(),
-                    "time_cost": ARGON2_TIME_COST,
-                    "memory_cost": ARGON2_MEMORY_COST,
-                    "parallelism": ARGON2_PARALLELISM
-                },
-                "encrypted_seed": encrypted_seed.hex(),
-                "iv": iv.hex(),
-                "tag": tag.hex(),
-                "addresses": [asdict(a) for a in self._addresses]
-            }
-
-        temp_path = filepath.with_suffix('.tmp')
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(wallet_data, f, indent=2)
-
-        temp_path.replace(filepath)
-        set_secure_permissions(filepath)
-
-    @classmethod
-    def load(cls, filepath: str | Path, password: str = None) -> 'Wallet':
-        """
-        Load wallet from file.
-
-        Handles both encrypted and unencrypted wallet files.
-
-        Raises:
-            FileNotFoundError: If wallet file doesn't exist
-            ValueError: If password is wrong (for encrypted wallets)
-        """
-        filepath = Path(filepath)
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        if data.get("version") != 1:
-            raise ValueError(f"Unsupported wallet version: {data.get('version')}")
-
-        # Check if wallet is unencrypted
-        is_encrypted = data.get("encrypted", True)  # Default to encrypted
-
-        if not is_encrypted:
-            # Unencrypted wallet - load directly
-            seed_phrase = data["seed_phrase"]
-            derivation_path = data.get("derivation_path", ETH_DERIVATION_PATH)
-            wallet = cls(seed_phrase, NO_PASSWORD_SENTINEL, derivation_path)
-        else:
-            # Encrypted wallet - decrypt with password
-            kdf = data["kdf"]
-            salt = bytes.fromhex(kdf["salt"])
-            encrypted_seed = bytes.fromhex(data["encrypted_seed"])
-            iv = bytes.fromhex(data["iv"])
-            tag = bytes.fromhex(data["tag"])
-
-            try:
-                seed_phrase = decrypt_seed(encrypted_seed, iv, tag, salt, password)
-            except Exception as e:
-                raise ValueError("Wrong password or corrupted wallet file") from e
-
-            derivation_path = data.get("derivation_path", ETH_DERIVATION_PATH)
-            wallet = cls(seed_phrase, password, derivation_path)
-
-        for addr_data in data.get("addresses", []):
-            wallet._addresses.append(WalletAddress(**addr_data))
-
-        return wallet
-
-    @staticmethod
-    def is_encrypted(filepath: str | Path) -> bool:
-        """Check if a wallet file is encrypted."""
-        filepath = Path(filepath)
-        if not filepath.exists():
-            return True  # Assume encrypted for non-existent files
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return data.get("encrypted", True)  # Default to encrypted
-        except (json.JSONDecodeError, IOError):
-            return True
-
-    @staticmethod
-    def exists(filepath: str | Path) -> bool:
-        """Check if a wallet file exists."""
-        return Path(filepath).exists()
-
-    # ============================================
-    # Signing
-    # ============================================
-
-    def sign_message(self, message: str | bytes, address_index: int = 0) -> bytes:
-        """
-        Sign a message with the private key at the given index.
-
-        Returns: 65-byte signature (r + s + v)
-        """
-        account = self.get_account(address_index)
-
-        if isinstance(message, str):
-            message = message.encode('utf-8')
-
-        signed = account.sign_message(signable_message=message)
-        return signed.signature
-
-    def sign_typed_data(self, typed_data: dict, address_index: int = 0):
-        """
-        Sign EIP-712 typed data (used by x402).
-
-        Returns: SignedMessage with signature
-        """
-        account = self.get_account(address_index)
-        return account.sign_typed_data(full_message=typed_data)
-
-    # ============================================
-    # Security: Memory Cleanup
-    # ============================================
-
-    def lock(self) -> None:
-        """
-        Lock the wallet, clearing sensitive data from memory.
-
-        After locking, the wallet cannot sign until reloaded.
-        """
-        if hasattr(self, '_seed_phrase'):
-            self._seed_phrase = None
-        if hasattr(self, '_seed'):
-            self._seed = None
-        if hasattr(self, '_password'):
-            self._password = None
-
-    def __del__(self):
-        """Attempt to clear sensitive data on destruction."""
-        self.lock()
-
-
-# ============================================
-# Private Key Wallet (Single Address)
-# ============================================
-
-class PrivateKeyWallet:
-    """
-    Simple wallet from a single private key.
-
-    Unlike HD wallets, this can only have one address.
-    """
-
-    def __init__(self, private_key: bytes, password: str):
-        """Initialize wallet with private key (decrypted in memory)."""
-        self._private_key = private_key
-        self._password = password
-        self._account = Account.from_key(private_key)
-
-    @property
-    def address(self) -> str:
-        """The wallet address."""
-        return self._account.address
-
-    @property
-    def addresses(self) -> list[WalletAddress]:
-        """List of addresses (only one for private key wallets)."""
-        return [WalletAddress(
-            path="imported",
-            address=self.address,
-            label="Imported"
-        )]
-
-    @classmethod
-    def from_private_key(cls, private_key: str, password: str) -> 'PrivateKeyWallet':
-        """
-        Create a wallet from a hex private key.
-
-        Args:
-            private_key: Hex private key (with or without 0x prefix)
-            password: Password to encrypt the wallet
-        """
-        pkey = private_key.strip()
-        if pkey.startswith("0x") or pkey.startswith("0X"):
-            pkey = pkey[2:]
-
-        pkey_bytes = bytes.fromhex(pkey)
-        Account.from_key(pkey_bytes)  # Validate
-        return cls(pkey_bytes, password)
-
-    def get_address(self, index: int = 0) -> str:
-        """Get address (only index 0 is valid)."""
-        if index != 0:
-            raise ValueError("Private key wallets only have one address")
-        return self.address
-
-    def get_private_key(self, index: int = 0) -> bytes:
-        """Get the private key (only index 0 is valid)."""
-        if index != 0:
-            raise ValueError("Private key wallets only have one address")
-        return self._private_key
-
-    def get_account(self, index: int = 0) -> Account:
-        """Get the account for signing."""
-        if index != 0:
-            raise ValueError("Private key wallets only have one address")
-        return self._account
-
-    def sign_message(self, message: str | bytes, address_index: int = 0) -> bytes:
-        """Sign a message with the private key."""
-        if address_index != 0:
-            raise ValueError("Private key wallets only have one address")
-
-        if isinstance(message, str):
-            message = message.encode('utf-8')
-
-        signed = self._account.sign_message(signable_message=message)
-        return signed.signature
-
-    def sign_typed_data(self, typed_data: dict, address_index: int = 0):
-        """Sign EIP-712 typed data."""
-        if address_index != 0:
-            raise ValueError("Private key wallets only have one address")
-        return self._account.sign_typed_data(full_message=typed_data)
-
-    def save(self, filepath: str | Path) -> None:
-        """Save wallet to file (encrypted or unencrypted based on password)."""
-        filepath = Path(filepath)
-
-        pkey_hex = self._private_key.hex()
-
-        if self._password == NO_PASSWORD_SENTINEL:
-            # Unencrypted storage
-            wallet_data = {
-                "version": 1,
-                "type": "private_key",
-                "encrypted": False,
-                "created": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "private_key": pkey_hex,
-                "address": self.address
-            }
-        else:
-            # Encrypted storage
-            encrypted_pkey, iv, tag, salt = encrypt_seed(pkey_hex, self._password)
-
-            wallet_data = {
-                "version": 1,
-                "type": "private_key",
-                "encrypted": True,
-                "created": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "kdf": {
-                    "algorithm": "argon2id",
-                    "salt": salt.hex(),
-                    "time_cost": ARGON2_TIME_COST,
-                    "memory_cost": ARGON2_MEMORY_COST,
-                    "parallelism": ARGON2_PARALLELISM
-                },
-                "encrypted_seed": encrypted_pkey.hex(),
-                "iv": iv.hex(),
-                "tag": tag.hex(),
-                "address": self.address
-            }
-
-        temp_path = filepath.with_suffix('.tmp')
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(wallet_data, f, indent=2)
-
-        temp_path.replace(filepath)
-        set_secure_permissions(filepath)
-
-    @classmethod
-    def load(cls, filepath: str | Path, password: str = None) -> 'PrivateKeyWallet':
-        """Load wallet from file (handles encrypted and unencrypted)."""
-        filepath = Path(filepath)
-
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        if data.get("type") != "private_key":
-            raise ValueError("Not a private key wallet file")
-
-        is_encrypted = data.get("encrypted", True)  # Default to encrypted
-
-        if not is_encrypted:
-            # Unencrypted wallet
-            pkey_hex = data["private_key"]
-            pkey_bytes = bytes.fromhex(pkey_hex)
-            return cls(pkey_bytes, NO_PASSWORD_SENTINEL)
-        else:
-            # Encrypted wallet
-            kdf = data["kdf"]
-            salt = bytes.fromhex(kdf["salt"])
-            encrypted_pkey = bytes.fromhex(data["encrypted_seed"])
-            iv = bytes.fromhex(data["iv"])
-            tag = bytes.fromhex(data["tag"])
-
-            try:
-                pkey_hex = decrypt_seed(encrypted_pkey, iv, tag, salt, password)
-            except Exception as e:
-                raise ValueError("Wrong password or corrupted wallet file") from e
-
-            pkey_bytes = bytes.fromhex(pkey_hex)
-            return cls(pkey_bytes, password)
-
-    def lock(self) -> None:
-        """Lock the wallet, clearing sensitive data from memory."""
-        if hasattr(self, '_private_key'):
-            self._private_key = None
-        if hasattr(self, '_account'):
-            self._account = None
-        if hasattr(self, '_password'):
-            self._password = None
-
-    def __del__(self):
-        """Attempt to clear sensitive data on destruction."""
-        self.lock()
-
-
-# ============================================
-# Wallet Loader (Auto-detect type)
-# ============================================
-
-def load_wallet(filepath: str | Path, password: str = None) -> Wallet | PrivateKeyWallet:
-    """
-    Load a wallet file, auto-detecting the type.
-
-    Returns either a Wallet (HD) or PrivateKeyWallet.
-    Password can be None for unencrypted wallets.
-    """
-    filepath = Path(filepath)
-
-    with open(filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    if data.get("type") == "private_key":
-        return PrivateKeyWallet.load(filepath, password)
-    else:
-        return Wallet.load(filepath, password)
-
-
-def is_wallet_encrypted(filepath: str | Path) -> bool:
-    """Check if a wallet file is encrypted."""
-    filepath = Path(filepath)
-    if not filepath.exists():
-        return True  # Assume encrypted for non-existent files
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data.get("encrypted", True)  # Default to encrypted
-    except (json.JSONDecodeError, IOError):
-        return True
 
 
 # ============================================
@@ -695,26 +203,204 @@ class SeedEntry:
         return cls(**data)
 
 
+# Wallet types
+WALLET_TYPE_SOFTWARE = "software"
+WALLET_TYPE_LEDGER = "ledger"
+
+#: Display names per hardware wallet_type. Add a row when adding a brand.
+DEVICE_LABELS = {
+    WALLET_TYPE_LEDGER: "Ledger",
+}
+
+#: Address ID prefix per hardware wallet_type (L001, ...). Existing wallets
+#: already contain these IDs, so a brand's prefix must never change.
+DEVICE_ID_PREFIXES = {
+    WALLET_TYPE_LEDGER: "L",
+}
+
+
 @dataclass
 class AddressEntry:
-    """An address in the wallet."""
-    id: str                    # A001, A002, etc.
+    """An address in the wallet.
+
+    Supports three types of addresses:
+    - Seed-derived: seed_id + index set, derives from HD seed
+    - Imported: encrypted_pkey set, raw private key
+    - Hardware: wallet_type names the device (e.g. "ledger"), device_path set,
+      signing happens on the device
+
+    For hardware addresses, no secrets are stored - the device holds the keys.
+
+    The device fields are deliberately brand-neutral: every hardware wallet is
+    identified by a derivation path and a path convention, so a second brand
+    needs a new wallet_type value rather than new columns.
+    """
+    id: str                    # A001, A002, L001, etc.
     name: str                  # User-friendly name
     address: str               # 0x... address
-    seed_id: Optional[str] = None     # S001, S002, or None for imported
-    index: Optional[int] = None       # Derivation index, or None for imported
+    seed_id: Optional[str] = None     # S001, S002, or None for imported/hardware
+    index: Optional[int] = None       # Derivation index, or None for imported/hardware
     encrypted_pkey: Optional[str] = None  # For imported keys only (hex)
     pkey_iv: Optional[str] = None         # AES IV for imported key
     pkey_tag: Optional[str] = None        # AES tag for imported key
+    # Hardware wallet fields
+    wallet_type: str = WALLET_TYPE_SOFTWARE  # "software" or a device name e.g. "ledger"
+    device_path: Optional[str] = None        # Full derivation path on the device
+    device_path_type: Optional[str] = None   # "ledger_live", "bip44", "legacy_mew", "custom"
+
+    @property
+    def is_hardware(self) -> bool:
+        """True if signing requires a physical device."""
+        return self.wallet_type != WALLET_TYPE_SOFTWARE
+
+    @property
+    def is_ledger(self) -> bool:
+        """True if this address is backed by a Ledger specifically.
+
+        Prefer is_hardware for routing; this is for the few places that need
+        to know the brand (labels, device drivers).
+        """
+        return self.wallet_type == WALLET_TYPE_LEDGER
+
+    @property
+    def is_software(self) -> bool:
+        """True if this address is backed by a software key (seed or imported)."""
+        return self.wallet_type == WALLET_TYPE_SOFTWARE
+
+    @property
+    def device_label(self) -> str:
+        """Human-readable device name, e.g. "Ledger". Empty for software."""
+        if not self.is_hardware:
+            return ""
+        return DEVICE_LABELS.get(self.wallet_type, self.wallet_type.title())
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        # Remove None values for cleaner JSON
-        return {k: v for k, v in d.items() if v is not None}
+        # Drop None values so each entry carries only the fields its kind uses:
+        # a seed address has no pkey fields, a hardware address has no secrets.
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
     @classmethod
     def from_dict(cls, data: dict) -> "AddressEntry":
         return cls(**data)
+
+
+# ============================================
+# Master Key
+# ============================================
+#
+# A wallet has one randomly generated master key. Every secret the wallet holds
+# - seed phrases, imported private keys - and every secret that belongs to the
+# wallet but is stored elsewhere (agent credentials) is encrypted under it.
+#
+# The password never encrypts a secret directly; it only wraps this key. So a
+# password change re-wraps exactly one value and cannot leave a secret behind
+# under the old password. Unwrapping is also what proves the password correct,
+# and the KDF parameters travel with the wrapping, so they can be retuned later
+# without stranding wallets written by an earlier build.
+
+
+#: Shortest password a wallet may be locked with. Matches Rabby's floor.
+#:
+#: A length floor only - no composition rules. Requiring a capital, a digit and a
+#: symbol is deprecated practice (NIST SP 800-63B): it annoys people into
+#: predictable shapes like "Password1!", which lowers real entropy rather than
+#: raising it. Whitespace counts as characters and nothing is stripped, so a
+#: pasted passphrase arrives exactly as the user's password manager produced it.
+#:
+#: This floor removes indefensibly short passwords. It does not make a short-but-
+#: guessable one safe: how long an attacker needs is set by how predictable the
+#: password is, and only the person choosing it controls that.
+MIN_PASSWORD_LENGTH = 8
+
+
+class WeakPasswordError(ValueError):
+    """The password is too short to lock a wallet with."""
+
+
+def validate_wallet_password(password: str) -> None:
+    """Check a password is acceptable for locking a wallet.
+
+    Called wherever a password becomes the thing that wraps the master key -
+    creation and change - so no interface can forget it. Deliberately NOT called
+    when opening a wallet: the file is already encrypted with whatever password
+    was set, and enforcing a policy at that point would lock people out of their
+    own wallets the moment the policy changed.
+
+    NO_PASSWORD_SENTINEL is rejected by name. In legacy wallet files it
+    marks "unencrypted", and it travels in the same channel as real passwords,
+    so accepting it as a password would quietly encrypt a wallet under a
+    published magic value - and treating it as the legacy switch would quietly
+    encrypt nothing at all. Legacy files that carry it still open; see load().
+
+    Raises:
+        WeakPasswordError: if the password is shorter than MIN_PASSWORD_LENGTH
+            or is the reserved NO_PASSWORD_SENTINEL value
+    """
+    if password == NO_PASSWORD_SENTINEL:
+        raise WeakPasswordError(
+            "This value is reserved and cannot be used as a wallet password. "
+            "Unencrypted wallets can no longer be created; choose a real "
+            f"password of at least {MIN_PASSWORD_LENGTH} characters.")
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
+        raise WeakPasswordError(
+            f"Password must be at least {MIN_PASSWORD_LENGTH} characters.")
+
+
+def encrypt_with_key(key: bytes, plaintext: str) -> tuple[str, str, str]:
+    """Encrypt a string under a raw AES-256 key. Returns hex (ciphertext, iv, tag)."""
+    iv = secrets.token_bytes(AES_IV_SIZE)
+    blob = AESGCM(key).encrypt(iv, plaintext.encode('utf-8'), None)
+    return blob[:-16].hex(), iv.hex(), blob[-16:].hex()
+
+
+def decrypt_with_key(key: bytes, ciphertext_hex: str, iv_hex: str, tag_hex: str) -> str:
+    """Decrypt a string produced by encrypt_with_key. Raises on tampering."""
+    blob = bytes.fromhex(ciphertext_hex) + bytes.fromhex(tag_hex)
+    return AESGCM(key).decrypt(bytes.fromhex(iv_hex), blob, None).decode('utf-8')
+
+
+def wrap_data_key(data_key: bytes, password: str) -> dict:
+    """Wrap the master key with a password-derived key, for storage."""
+    salt = secrets.token_bytes(16)
+    kek = derive_key(password, salt)
+    ciphertext, iv, tag = encrypt_with_key(kek, data_key.hex())
+    return {
+        "algorithm": "argon2id",
+        "salt": salt.hex(),
+        "time_cost": ARGON2_TIME_COST,
+        "memory_cost": ARGON2_MEMORY_COST,
+        "parallelism": ARGON2_PARALLELISM,
+        "ciphertext": ciphertext,
+        "iv": iv,
+        "tag": tag,
+    }
+
+
+def unwrap_data_key(wrapped: dict, password: str) -> bytes:
+    """Recover the master key from its stored wrapping.
+
+    KDF parameters are read from the wrapping rather than from the constants
+    above, so a wallet written with different settings still opens.
+
+    Raises ValueError if the password is wrong or the wrapping is damaged.
+    """
+    try:
+        kek = hash_secret_raw(
+            secret=password.encode('utf-8'),
+            salt=bytes.fromhex(wrapped["salt"]),
+            time_cost=int(wrapped["time_cost"]),
+            memory_cost=int(wrapped["memory_cost"]),
+            parallelism=int(wrapped["parallelism"]),
+            hash_len=ARGON2_HASH_LEN,
+            type=Type.ID,
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError("Wallet key wrapping is malformed") from e
+    try:
+        return bytes.fromhex(decrypt_with_key(
+            kek, wrapped["ciphertext"], wrapped["iv"], wrapped["tag"]))
+    except Exception as e:
+        raise ValueError("Wrong password or corrupted wallet") from e
 
 
 class VaultWallet:
@@ -738,10 +424,16 @@ class VaultWallet:
         wallet = VaultWallet.load("primer.wallet", "password")
     """
 
-    def __init__(self, password: str, salt: bytes):
-        """Initialize wallet (internal use - use create() or load())."""
-        self._password = password
-        self._salt = salt
+    def __init__(self, data_key: bytes, encrypted: bool):
+        """Initialize wallet (internal use - use create() or load()).
+
+        `data_key` is the master key described above. `_wrapped_key` is its
+        stored wrapping, kept so the wallet can be saved again without holding
+        on to the password after unlock.
+        """
+        self._data_key: Optional[bytes] = data_key
+        self._encrypted = encrypted
+        self._wrapped_key: Optional[dict] = None
         self._seeds: dict[str, SeedEntry] = {}       # id -> SeedEntry
         self._addresses: dict[str, AddressEntry] = {}  # id -> AddressEntry
         self._decrypted_seeds: dict[str, str] = {}   # id -> plaintext phrase
@@ -749,11 +441,29 @@ class VaultWallet:
         self._created_at: str = ""
         self._next_seed_num = 1
         self._next_addr_num = 1
+        self._next_device_num = 1  # For hardware addresses: L001, L002, etc.
+        # Set by change_password, cleared by the save that follows it. The
+        # previous-version copy is the file as it was, so after a re-key it
+        # still opens with the password being replaced - see save().
+        self._rekeyed_since_save = False
 
     @property
     def is_encrypted(self) -> bool:
-        """Check if wallet uses encryption."""
-        return self._password != NO_PASSWORD_SENTINEL
+        """True if this wallet is protected by a password."""
+        return self._encrypted
+
+    @property
+    def data_key(self) -> bytes:
+        """The master key, for encrypting data belonging to this wallet.
+
+        Agent credentials are encrypted with this rather than with the password,
+        so rotating the password cannot orphan them.
+
+        Raises ValueError if the wallet is locked.
+        """
+        if self._data_key is None:
+            raise ValueError("Wallet is locked")
+        return self._data_key
 
     @property
     def seeds(self) -> list[SeedEntry]:
@@ -785,40 +495,27 @@ class VaultWallet:
 
     @classmethod
     def create(cls, password: str) -> "VaultWallet":
-        """Create a new empty wallet."""
-        salt = secrets.token_bytes(16)
-        wallet = cls(password, salt)
+        """Create a new empty wallet with a fresh random master key.
+
+        Every new wallet is encrypted. Unencrypted wallets can only reach this
+        process as legacy files through load().
+
+        Raises WeakPasswordError if the password is too short or reserved.
+        """
+        validate_wallet_password(password)
+        data_key = secrets.token_bytes(AES_KEY_SIZE)
+        wallet = cls(data_key, encrypted=True)
+        wallet._wrapped_key = wrap_data_key(data_key, password)
         wallet._created_at = datetime.now(timezone.utc).isoformat()
         return wallet
 
     def _encrypt_data(self, plaintext: str) -> tuple[str, str, str]:
-        """Encrypt data with wallet password. Returns (ciphertext_hex, iv_hex, tag_hex)."""
-        if self._password == NO_PASSWORD_SENTINEL:
-            # Store as "plaintext" with markers
-            return plaintext, "", ""
-
-        key = derive_key(self._password, self._salt)
-        iv = secrets.token_bytes(AES_IV_SIZE)
-        aesgcm = AESGCM(key)
-        ciphertext_and_tag = aesgcm.encrypt(iv, plaintext.encode('utf-8'), None)
-        ciphertext = ciphertext_and_tag[:-16]
-        tag = ciphertext_and_tag[-16:]
-        return ciphertext.hex(), iv.hex(), tag.hex()
+        """Encrypt data under the master key. Returns hex (ciphertext, iv, tag)."""
+        return encrypt_with_key(self.data_key, plaintext)
 
     def _decrypt_data(self, ciphertext_hex: str, iv_hex: str, tag_hex: str) -> str:
-        """Decrypt data with wallet password."""
-        if self._password == NO_PASSWORD_SENTINEL:
-            # Data is plaintext
-            return ciphertext_hex
-
-        key = derive_key(self._password, self._salt)
-        ciphertext = bytes.fromhex(ciphertext_hex)
-        iv = bytes.fromhex(iv_hex)
-        tag = bytes.fromhex(tag_hex)
-        ciphertext_and_tag = ciphertext + tag
-        aesgcm = AESGCM(key)
-        plaintext = aesgcm.decrypt(iv, ciphertext_and_tag, None)
-        return plaintext.decode('utf-8')
+        """Decrypt data encrypted under the master key."""
+        return decrypt_with_key(self.data_key, ciphertext_hex, iv_hex, tag_hex)
 
     def _next_seed_id(self) -> str:
         """Generate next seed ID."""
@@ -835,6 +532,18 @@ class VaultWallet:
             self._next_addr_num += 1
             if aid not in self._addresses:
                 return aid
+
+    def _next_device_id(self, wallet_type: str) -> str:
+        """Generate the next hardware address ID for a device type (L001, ...)."""
+        prefix = DEVICE_ID_PREFIXES.get(wallet_type)
+        if not prefix:
+            raise ValueError(f"No address ID prefix registered for wallet type {wallet_type!r}")
+
+        while True:
+            did = f"{prefix}{self._next_device_num:03d}"
+            self._next_device_num += 1
+            if did not in self._addresses:
+                return did
 
     def add_seed(self, seed_phrase: str, derivation_path: str = None) -> str:
         """
@@ -897,8 +606,7 @@ class VaultWallet:
         seed_entry = self._seeds[seed_id]
         path = seed_entry.derivation_path.format(index)
 
-        seed_bytes = seed_from_mnemonic(seed_phrase, passphrase="")
-        private_key = key_from_seed(seed_bytes, path)
+        private_key = _derive_private_key(seed_phrase, path)
         account = Account.from_key(private_key)
 
         return account.address
@@ -991,6 +699,69 @@ class VaultWallet:
 
         return addr_id
 
+    def add_hardware_address(
+        self,
+        address: str,
+        path: str,
+        path_type: str,
+        name: str = None,
+        wallet_type: str = WALLET_TYPE_LEDGER
+    ) -> str:
+        """
+        Add a hardware wallet address.
+
+        No secrets are stored - the device holds the private keys.
+
+        Args:
+            address: The 0x... address derived from the device
+            path: Full derivation path (e.g., "m/44'/60'/0'/0/0")
+            path_type: Path type ("ledger_live", "bip44", "legacy_mew", "custom")
+            name: User-friendly name (default: "<Device> #N")
+            wallet_type: Which device this came from (default: Ledger)
+
+        Returns:
+            Address ID (e.g., "L001")
+        """
+        # Validate custom name if provided
+        if name:
+            validate_name(name, "Address name")
+
+        # Normalize address
+        address = address.strip()
+        if not address.startswith("0x"):
+            address = "0x" + address
+
+        # Check for duplicate
+        for addr in self._addresses.values():
+            if addr.address.lower() == address.lower():
+                return addr.id  # Already exists
+
+        addr_id = self._next_device_id(wallet_type)
+
+        # Count existing addresses from this device for the default name
+        label = DEVICE_LABELS.get(wallet_type, wallet_type.title())
+        device_count = len(self.get_hardware_addresses(wallet_type))
+        addr_name = name or f"{label} #{device_count + 1}"
+
+        entry = AddressEntry(
+            id=addr_id,
+            name=addr_name,
+            address=address,
+            wallet_type=wallet_type,
+            device_path=path,
+            device_path_type=path_type
+        )
+        self._addresses[addr_id] = entry
+
+        return addr_id
+
+    def get_hardware_addresses(self, wallet_type: str = None) -> list[AddressEntry]:
+        """Get hardware wallet addresses, optionally for one device type only."""
+        return [
+            a for a in self._addresses.values()
+            if a.is_hardware and (wallet_type is None or a.wallet_type == wallet_type)
+        ]
+
     def rename_address(self, address_id: str, new_name: str) -> None:
         """Rename an address."""
         if address_id not in self._addresses:
@@ -1028,22 +799,38 @@ class VaultWallet:
 
     def get_private_key(self, address_id: str) -> bytes:
         """
-        Get private key for an address.
+        Get private key for a software address.
 
         Returns the raw private key bytes for signing.
+
+        Raises:
+            ValueError: If the wallet is locked, the address is unknown, or the
+                address is backed by a hardware device
         """
+        # Locking clears the decrypted seeds, so a seed-derived address would
+        # otherwise fail on a missing dictionary key and surface to the caller as
+        # a bare KeyError naming a seed id - true, but useless to act on.
+        if self._data_key is None:
+            raise ValueError("Wallet is locked")
+
         if address_id not in self._addresses:
             raise ValueError(f"Unknown address: {address_id}")
 
         addr = self._addresses[address_id]
+
+        # Hardware addresses have no private key here - the device holds it
+        if addr.is_hardware:
+            raise ValueError(
+                f"Cannot get private key for {addr.device_label} address {address_id}. "
+                "Signing must happen on the device."
+            )
 
         if addr.seed_id is not None:
             # Derived from seed
             seed_phrase = self._decrypted_seeds[addr.seed_id]
             seed_entry = self._seeds[addr.seed_id]
             path = seed_entry.derivation_path.format(addr.index)
-            seed_bytes = seed_from_mnemonic(seed_phrase, passphrase="")
-            return key_from_seed(seed_bytes, path)
+            return _derive_private_key(seed_phrase, path)
         else:
             # Imported key
             if address_id in self._decrypted_pkeys:
@@ -1079,172 +866,338 @@ class VaultWallet:
     # Password Management
     # ============================================
 
-    def change_password(self, new_password: str) -> None:
-        """
-        Change the wallet password.
+    def verify_password(self, password: str) -> bool:
+        """Check a password against this wallet without changing anything.
 
-        Re-encrypts all seeds and private keys with the new password.
-        The wallet must be saved after calling this method.
+        Unwraps the stored master key and compares it to the one in use, so the
+        answer comes from the wrapping itself rather than from a retained copy
+        of the password.
+        """
+        if not self._encrypted:
+            return password == NO_PASSWORD_SENTINEL
+        if not self._wrapped_key:
+            return False
+        try:
+            return unwrap_data_key(self._wrapped_key, password) == self.data_key
+        except ValueError:
+            return False
+
+    def change_password(self, new_password: str) -> None:
+        """Change the wallet password.
+
+        Only the wrapping of the master key changes. Seeds, imported keys and
+        agent credentials are encrypted under that key rather than under the
+        password, so none of them are touched and none can be left behind.
+
+        The wallet must be saved after calling this.
+
+        Encryption can only be added or re-keyed here, never removed: this is
+        also the path that upgrades a legacy unencrypted wallet when the user
+        sets a password on it.
 
         Args:
-            new_password: New password (or NO_PASSWORD_SENTINEL for unencrypted)
+            new_password: New password
+
+        Raises:
+            WeakPasswordError: if the new password is too short or reserved
         """
-        if new_password == self._password:
-            return  # No change needed
-
-        # Generate new salt for the new password
-        new_salt = secrets.token_bytes(16)
-        old_password = self._password
-        old_salt = self._salt
-
-        # Update password and salt
-        self._password = new_password
-        self._salt = new_salt
-
-        # Re-encrypt all seeds
-        for seed_id, phrase in self._decrypted_seeds.items():
-            encrypted, iv, tag = self._encrypt_data(phrase)
-            entry = self._seeds[seed_id]
-            self._seeds[seed_id] = SeedEntry(
-                id=entry.id,
-                encrypted_phrase=encrypted,
-                iv=iv,
-                tag=tag,
-                derivation_path=entry.derivation_path
-            )
-
-        # Re-encrypt all imported private keys
-        for addr_id, pkey_bytes in self._decrypted_pkeys.items():
-            entry = self._addresses[addr_id]
-            if entry.encrypted_pkey:  # Only re-encrypt imported keys
-                pkey_hex = pkey_bytes.hex()
-                encrypted, iv, tag = self._encrypt_data(pkey_hex)
-                self._addresses[addr_id] = AddressEntry(
-                    id=entry.id,
-                    name=entry.name,
-                    address=entry.address,
-                    seed_id=entry.seed_id,
-                    index=entry.index,
-                    encrypted_pkey=encrypted,
-                    pkey_iv=iv,
-                    pkey_tag=tag
-                )
-
-    def set_password(self, new_password: str) -> None:
-        """
-        Set password on an unencrypted wallet, or change existing password.
-
-        Alias for change_password() with clearer semantics for unencrypted wallets.
-        """
-        self.change_password(new_password)
+        validate_wallet_password(new_password)
+        self._encrypted = True
+        self._wrapped_key = wrap_data_key(self.data_key, new_password)
+        self._rekeyed_since_save = True
 
     # ============================================
     # File Operations
     # ============================================
 
     def save(self, filepath: str | Path) -> None:
-        """Save wallet to file."""
+        """Write the wallet so it is never seen partially written or unprotected.
+
+        The same durable-write sequence PolicyStore uses, and for the same
+        reasons - written out in full there, in models/store.py.
+
+        Two details matter more here than they do for a policy file:
+
+        Permissions go on before the move, not after. Setting them afterwards
+        leaves a window in which the wallet exists at its real path with default
+        permissions, which for the file holding every seed and key is the wrong
+        window to leave open.
+
+        The contents are flushed all the way to disk before the move, so a power
+        loss cannot leave a wallet whose directory entry points at unwritten
+        blocks. A wallet that saved and then vanished is unrecoverable in a way
+        an ordinary data file is not - the seed is not written down anywhere
+        else.
+
+        The temporary file is unique per save and hidden. The old name was
+        `filepath.with_suffix(".tmp")`, which is fixed - two saves at once wrote
+        to one path - and, because with_suffix replaces rather than appends,
+        `my.backup.wallet` produced `my.backup.tmp`. It also sat visible in the
+        data directory, which the settings watcher observes.
+        """
         filepath = Path(filepath)
 
         wallet_data = {
-            "version": 2,
-            "encrypted": self.is_encrypted,
+            "version": WALLET_FORMAT_VERSION,
+            "encrypted": self._encrypted,
             "created_at": self._created_at,
-            "kdf": {
-                "algorithm": "argon2id",
-                "salt": self._salt.hex(),
-                "time_cost": ARGON2_TIME_COST,
-                "memory_cost": ARGON2_MEMORY_COST,
-                "parallelism": ARGON2_PARALLELISM
-            },
             "seeds": [s.to_dict() for s in self._seeds.values()],
             "addresses": [a.to_dict() for a in self._addresses.values()]
         }
+        if self._encrypted:
+            wallet_data["wrapped_key"] = self._wrapped_key
+        else:
+            # No password: the master key is stored in the clear. That is exactly
+            # as readable as the secrets it protects would be without it.
+            wallet_data["data_key"] = self.data_key.hex()
 
-        # Ensure directory exists
         filepath.parent.mkdir(parents=True, exist_ok=True)
 
-        temp_path = filepath.with_suffix('.tmp')
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(wallet_data, f, indent=2)
+        # Alongside the target, because a move is only atomic within one
+        # filesystem.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(filepath.parent), prefix=f".{filepath.name}.", suffix=".tmp")
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(wallet_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            set_secure_permissions(tmp_path)
+            # The version being replaced is kept as `<name>.previous` - the
+            # only file-level recovery a damaged wallet has. Written after the
+            # new contents are safely on disk, so a failed save cannot cost
+            # the backup as well.
+            #
+            # Except after a password change. The copy is the file as it was,
+            # so it still opens with the password being replaced, and it holds
+            # the same master key - which means the same seeds. Someone who
+            # changes their password because the old one leaked would be left
+            # with a fully readable wallet under the leaked password. The copy
+            # is dropped instead, and the next ordinary save makes a fresh one
+            # under the new password.
+            if filepath.exists():
+                if self._rekeyed_since_save:
+                    self._discard_previous_version(filepath)
+                else:
+                    self._keep_previous_version(filepath)
+            os.replace(tmp_path, filepath)
+            # Make the renames durable, not just atomic - one directory fsync
+            # covers the .previous rename above too, since both entries live
+            # in this directory. See fsync_dir for the power-loss window this
+            # closes.
+            fsync_dir(filepath.parent)
+            # Only once the new file is in place: a save that fails leaves the
+            # old wallet live, so it must keep its re-key pending too.
+            self._rekeyed_since_save = False
+        except BaseException:
+            # A failed save must not leave a partial wallet lying in the data
+            # directory under a name that looks like a backup.
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
-        temp_path.replace(filepath)
-        set_secure_permissions(filepath)
+    @staticmethod
+    def _discard_previous_version(filepath: Path) -> None:
+        """Remove `<name>.previous`, which a re-key has made unsafe to keep.
+
+        Best effort, like keeping it: a wallet save must not fail because the
+        old copy could not be removed. A failure is logged loudly, because what
+        is left behind still opens with the previous password.
+        """
+        previous = filepath.with_name(filepath.name + ".previous")
+        try:
+            previous.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(
+                "Could not remove the previous-version copy of %s after a "
+                "password change - it still opens with the old password: %s",
+                filepath.name, e)
+
+    @staticmethod
+    def _keep_previous_version(filepath: Path) -> None:
+        """Copy the wallet as it stands to `<name>.previous`, atomically.
+
+        Written just before each save replaces the file, so one save ago is
+        always on disk. That is the recovery path CorruptedWalletFile points
+        at: corruption is usually recent, and the previous version opens
+        normally.
+
+        A copy rather than a rename, so the live wallet never has a moment of
+        not existing. The same durable-write sequence as the wallet itself,
+        because a backup that can itself be torn by a crash is not a backup.
+
+        Two consequences are deliberate and worth knowing:
+        - The copy holds whatever the wallet held one save ago - including a
+          seed removed since, under a password changed since. Recoverability
+          is the point; deleting the wallet deletes the copy too.
+        - It is best effort. A wallet save must not fail because its backup
+          could not be written, so failures are logged and the save proceeds.
+        """
+        previous = filepath.with_name(filepath.name + ".previous")
+        try:
+            current_bytes = filepath.read_bytes()
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(filepath.parent), prefix=f".{previous.name}.", suffix=".tmp")
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(current_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
+                set_secure_permissions(tmp)
+                os.replace(tmp, previous)
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logger.warning(
+                "Could not keep a previous-version copy of %s: %s",
+                filepath.name, e)
+
+    @staticmethod
+    def _sweep_stale_temp_files(directory: Path, name: str) -> None:
+        """Remove leftover atomic-write temp files for the wallet ``name``.
+
+        `save` writes a complete wallet to a hidden temp file and renames it into
+        place; a power loss or a kill between the write and the rename raises
+        nothing, so `save`'s cleanup never runs and the temp is simply left on
+        disk. Each one is a whole wallet, readable under the password in force
+        when it was written - so one that outlives a password-change re-key
+        still opens under the old, possibly leaked, password, the very thing
+        `_discard_previous_version` drops `.previous` to prevent. Nothing else
+        removes them, so Vault clears them when it opens the wallet.
+
+        Only this wallet's own temp files are swept: `save` and
+        `_keep_previous_version` both name theirs ``.<name>.<rand>.tmp`` and
+        ``.<name>.previous.<rand>.tmp``, so both begin ``.<name>.`` - which the
+        prefix below matches without touching an unrelated hidden ``.tmp`` that
+        happens to share the directory (a real risk when the wallet lives in a
+        folder the user also keeps other things in).
+
+        Safe because Vault holds a single-instance lock: no other process is
+        part-way through a save in this directory, so no live temp is at risk.
+        `.previous` (the real backup) has no `.tmp` suffix and is left alone.
+        """
+        prefix = f".{name}."
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith(prefix) and entry.name.endswith(".tmp"):
+                try:
+                    entry.unlink()
+                except OSError as e:
+                    logger.warning(
+                        "Could not remove stale wallet temp file %s: %s",
+                        entry.name, e)
 
     @classmethod
     def load(cls, filepath: str | Path, password: str) -> "VaultWallet":
-        """
-        Load wallet from file.
+        """Load wallet from file.
+
+        Unwrapping the master key is the password check, so a wrong password is
+        rejected whether or not this wallet happens to hold any secrets.
 
         Raises:
             FileNotFoundError: If wallet doesn't exist
-            ValueError: If password is wrong or file is corrupted
+            ValueError: If the version is unsupported, the password is wrong,
+                or the file is corrupted
         """
         filepath = Path(filepath)
 
-        with open(filepath, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        # Opening the wallet is Vault's startup moment for this directory, and
+        # the one chance to clear temp files a crashed save left behind before
+        # they outlive a later re-key. See _sweep_stale_temp_files.
+        cls._sweep_stale_temp_files(filepath.parent, filepath.name)
 
-        version = data.get("version", 1)
-        if version != 2:
-            raise ValueError(f"Unsupported wallet version: {version}")
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise CorruptedWalletFile(
+                f"the file is not readable as JSON: {e}") from e
+        if not isinstance(data, dict):
+            raise CorruptedWalletFile("the file does not contain a wallet record")
 
-        is_encrypted = data.get("encrypted", True)
-        if not is_encrypted:
-            password = NO_PASSWORD_SENTINEL
+        version = data.get("version")
+        if version != WALLET_FORMAT_VERSION:
+            raise UnsupportedWalletVersion(
+                f"This wallet file is format version {version}; this build of Vault "
+                f"reads version {WALLET_FORMAT_VERSION}.")
 
-        kdf = data["kdf"]
-        salt = bytes.fromhex(kdf["salt"])
+        encrypted = data.get("encrypted", True)
+        if not encrypted:
+            # Unencrypted wallets are no longer opened by this build - only ever
+            # created by an older one, and their master key sits in the file in
+            # the clear. Refuse rather than open a wallet with no protection at
+            # rest. The remedy is a one-time conversion: open the file in Vault
+            # 0.1 (still on GitHub and PyPI), set a password to encrypt it, and
+            # it opens here.
+            raise UnsupportedWalletVersion(
+                "This wallet file is unencrypted, which this version of Vault "
+                "does not open. Open it in an earlier Vault (0.1), set a password "
+                "to encrypt it, and then open it here.")
 
-        wallet = cls(password, salt)
+        wrapped = data.get("wrapped_key")
+        if not isinstance(wrapped, dict):
+            # Structural damage, not a password problem - unwrap failure
+            # below is the only true wrong-password signal.
+            raise CorruptedWalletFile(
+                "the wallet is marked encrypted but carries no key wrapping")
+        data_key = unwrap_data_key(wrapped, password)
+
+        wallet = cls(data_key, encrypted)
+        wallet._wrapped_key = wrapped
         wallet._created_at = data.get("created_at", "")
 
-        # Load and decrypt seeds
+        # The master key unwrapped above, so the password is correct. A
+        # decryption failure now is damage inside the payload, not a wrong
+        # password - raise it as such so the caller names the real fault and
+        # the recovery copy, rather than sending the user after their password.
         for seed_data in data.get("seeds", []):
             entry = SeedEntry.from_dict(seed_data)
             wallet._seeds[entry.id] = entry
-
-            # Decrypt seed phrase
             try:
-                phrase = wallet._decrypt_data(
-                    entry.encrypted_phrase,
-                    entry.iv,
-                    entry.tag
-                )
-                wallet._decrypted_seeds[entry.id] = phrase
+                wallet._decrypted_seeds[entry.id] = wallet._decrypt_data(
+                    entry.encrypted_phrase, entry.iv, entry.tag)
             except Exception as e:
-                raise ValueError("Wrong password or corrupted wallet") from e
-
-            # Track highest seed number
+                raise CorruptedWalletFile(
+                    f"seed {entry.id} could not be decrypted") from e
             if entry.id.startswith("S"):
                 try:
-                    num = int(entry.id[1:])
-                    wallet._next_seed_num = max(wallet._next_seed_num, num + 1)
+                    wallet._next_seed_num = max(wallet._next_seed_num, int(entry.id[1:]) + 1)
                 except ValueError:
                     pass
 
-        # Load addresses
         for addr_data in data.get("addresses", []):
             entry = AddressEntry.from_dict(addr_data)
             wallet._addresses[entry.id] = entry
 
-            # Decrypt imported private keys
             if entry.encrypted_pkey:
                 try:
-                    pkey_hex = wallet._decrypt_data(
-                        entry.encrypted_pkey,
-                        entry.pkey_iv,
-                        entry.pkey_tag
-                    )
-                    wallet._decrypted_pkeys[entry.id] = bytes.fromhex(pkey_hex)
+                    wallet._decrypted_pkeys[entry.id] = bytes.fromhex(wallet._decrypt_data(
+                        entry.encrypted_pkey, entry.pkey_iv, entry.pkey_tag))
                 except Exception as e:
-                    raise ValueError("Wrong password or corrupted wallet") from e
+                    raise CorruptedWalletFile(
+                        f"address {entry.id} private key could not be decrypted") from e
 
-            # Track highest address number
             if entry.id.startswith("A"):
                 try:
-                    num = int(entry.id[1:])
-                    wallet._next_addr_num = max(wallet._next_addr_num, num + 1)
+                    wallet._next_addr_num = max(wallet._next_addr_num, int(entry.id[1:]) + 1)
+                except ValueError:
+                    pass
+            elif entry.id[:1] in set(DEVICE_ID_PREFIXES.values()):
+                try:
+                    wallet._next_device_num = max(wallet._next_device_num, int(entry.id[1:]) + 1)
                 except ValueError:
                     pass
 
@@ -1265,14 +1218,19 @@ class VaultWallet:
             with open(filepath, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return data.get("encrypted", True)
-        except (json.JSONDecodeError, IOError):
+        except (ValueError, AttributeError, OSError):
+            # Damaged in any way - not UTF-8 (UnicodeDecodeError), not JSON
+            # (JSONDecodeError), or not an object (AttributeError on .get).
+            # Report "encrypted" so the caller routes to the unlock/load path,
+            # where load_wallet raises CorruptedWalletFile and the user is shown
+            # the real fault and the .previous copy - never a crash on startup.
             return True
 
     def lock(self) -> None:
-        """Lock the wallet, clearing sensitive data from memory."""
+        """Lock the wallet, dropping the master key and every decrypted secret."""
         self._decrypted_seeds.clear()
         self._decrypted_pkeys.clear()
-        self._password = None
+        self._data_key = None
 
     def __del__(self):
         """Attempt to clear sensitive data on destruction."""

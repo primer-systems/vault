@@ -27,16 +27,6 @@ def temp_data_dir(tmp_path):
     return data_dir
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Core instance with temp directory and unlocked wallet."""
-    from primer_vault.core import Vault
-    core = Vault(data_dir=temp_data_dir)
-    # Create and unlock a wallet for agent operations
-    wallet_path = str(temp_data_dir / "wallets" / "test.wallet")
-    core.create_wallet(wallet_path, "testpass")
-    core.load_wallet(wallet_path, "testpass")
-    return core
 
 
 @pytest.fixture
@@ -123,16 +113,17 @@ class TestWalletLifecycle:
         status = handler.execute("wallet status")
         assert "unlocked" in status.output.lower()
 
-    def test_create_wallet_no_password(self, handler):
-        """Create wallet with empty password."""
+    def test_create_wallet_rejects_an_empty_password(self, handler):
+        """An empty password accepted as a real one would encrypt the wallet
+        with nothing while still looking protected."""
         result = execute_with_inputs(
             handler,
             "wallet create nopasswallet",
             {"password": "", "confirm": ""}
         )
 
-        assert result.success
-        assert "Wallet created" in result.output
+        assert not result.success
+        assert "at least 8" in result.error
 
     def test_create_wallet_password_mismatch(self, handler):
         """Password confirmation mismatch should fail."""
@@ -200,13 +191,13 @@ class TestWalletLifecycle:
         execute_with_inputs(
             handler,
             "wallet create dupwallet",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
 
         result = execute_with_inputs(
             handler,
             "wallet create dupwallet",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
 
         assert not result.success
@@ -226,7 +217,7 @@ class TestAddressLifecycle:
         execute_with_inputs(
             handler,
             "wallet create addrtest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         return handler
 
@@ -335,7 +326,7 @@ class TestAgentLifecycle:
         """Delete agent cancelled if not YES."""
         handler.execute("agent register keepbot")
 
-        result = execute_with_inputs(
+        execute_with_inputs(
             handler,
             "agent delete keepbot",
             {"confirm": "no"}
@@ -407,7 +398,7 @@ class TestDependenciesAndCascades:
         execute_with_inputs(
             handler,
             "wallet create deptest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         handler.execute("policy create testpolicy --day 100")
         handler.execute("agent register testagent")
@@ -575,7 +566,7 @@ class TestEndToEndWorkflows:
         execute_with_inputs(
             handler,
             "wallet create multiagent",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
 
         # Create second address for second agent
@@ -598,45 +589,6 @@ class TestEndToEndWorkflows:
         assert "untrusted-bot" in result.output
         assert "trusted-bot" in result.output
         assert len(result.data.get("agents", [])) == 2
-
-    def test_wallet_recovery_flow(self, handler, temp_data_dir):
-        """
-        Simulate wallet recovery:
-        1. Create wallet, save seed
-        2. Delete wallet
-        3. Create new wallet with same seed
-        4. Verify same address derived
-        """
-        # Create and get seed
-        result = execute_with_inputs(
-            handler,
-            "wallet create original",
-            {"password": "", "confirm": ""}
-        )
-        seed_phrase = result.data["seed_phrase"]
-
-        # Get the address
-        addr_result = handler.execute("address list")
-        # Parse out the address (this is a bit fragile, depends on output format)
-
-        # Delete wallet
-        execute_with_inputs(
-            handler,
-            "wallet delete",
-            {"confirm": "YES"}
-        )
-
-        # Recreate with same seed by using seed import after creating empty wallet
-        # (This tests the seed import flow)
-        execute_with_inputs(
-            handler,
-            "wallet create recovered",
-            {"password": "", "confirm": ""}
-        )
-
-        # The wallet creation already uses a new seed, so this test would need
-        # a different approach - creating wallet then importing seed
-        # For now, verify we can at least create and recover works conceptually
 
 
 # =============================================================================
@@ -710,7 +662,7 @@ class TestSeedLifecycle:
         execute_with_inputs(
             handler,
             "wallet create seedtest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         return handler
 
@@ -747,7 +699,7 @@ class TestSeedLifecycle:
         """Delete a seed with confirmation."""
         # First create an extra seed so we can delete it
         unlocked_wallet.execute("seed create")
-        seeds_before = unlocked_wallet.execute("seed list")
+        unlocked_wallet.execute("seed list")
 
         # Delete S002
         result = execute_with_inputs(
@@ -760,7 +712,7 @@ class TestSeedLifecycle:
 
     def test_delete_seed_cancelled(self, unlocked_wallet):
         """Cancelling seed delete should not delete."""
-        result = execute_with_inputs(
+        execute_with_inputs(
             unlocked_wallet,
             "seed delete S001",
             {"confirm": "no"}  # Not YES
@@ -789,7 +741,7 @@ class TestHistoryWithTransactions:
         execute_with_inputs(
             handler,
             "wallet create histtest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         handler.execute("policy create testpolicy")
         handler.execute("agent register histagent")
@@ -870,7 +822,7 @@ class TestMandateGeneration:
         execute_with_inputs(
             handler,
             "wallet create mandatetest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         # Create policy with networks via core (CLI doesn't expose networks flag)
         handler.core.create_policy(
@@ -897,7 +849,7 @@ class TestMandateGeneration:
         execute_with_inputs(
             handler,
             "wallet create mandatetest2",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         handler.execute("agent register uncommagent")
 
@@ -947,7 +899,7 @@ class TestSigningApprovalFlow:
         execute_with_inputs(
             handler,
             "wallet create approvaltest",
-            {"password": "", "confirm": ""}
+            {"password": "testpassword", "confirm": "testpassword"}
         )
         handler.execute("policy create testpolicy --day 100 --txn 10 --auto 0")  # No auto-approve
         handler.execute("agent register approvalagent")

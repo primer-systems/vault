@@ -13,7 +13,7 @@ import tempfile
 import shutil
 import time
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -31,11 +31,6 @@ def temp_data_dir():
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 @pytest.fixture
@@ -123,7 +118,11 @@ class TestRPCFailures:
             signing_service._verify_transaction_sync(settled_transaction)
 
             # Should mark as failed
-            assert settled_transaction.verification_status == "failed"
+            # Could not reach a node. That is not the chain reporting a revert,
+            # and the record must not say it was, or a moment offline leaves a
+            # permanent "payment failed" in the compliance trail.
+            assert settled_transaction.verification_status == "unavailable"
+            assert settled_transaction.verification_detail
 
     def test_rpc_timeout_handled(self, settled_transaction, signing_service):
         """RPC timeout should be handled gracefully."""
@@ -134,7 +133,11 @@ class TestRPCFailures:
 
             signing_service._verify_transaction_sync(settled_transaction)
 
-            assert settled_transaction.verification_status == "failed"
+            # Could not reach a node. That is not the chain reporting a revert,
+            # and the record must not say it was, or a moment offline leaves a
+            # permanent "payment failed" in the compliance trail.
+            assert settled_transaction.verification_status == "unavailable"
+            assert settled_transaction.verification_detail
 
     def test_rpc_invalid_response_handled(self, settled_transaction, signing_service):
         """Invalid RPC response should be handled."""
@@ -161,7 +164,11 @@ class TestRPCFailures:
 
             signing_service._verify_transaction_sync(settled_transaction)
 
+            # The chain answered, and the answer was that it reverted. This is
+            # the one case that earns "failed" — the counterpart to the tests
+            # above, where Vault could not ask at all.
             assert settled_transaction.verification_status == "failed"
+            assert "reverted" in (settled_transaction.verification_detail or "")
 
     def test_rpc_returns_successful_transaction(self, settled_transaction, signing_service):
         """RPC returning successful tx should mark as verified."""
@@ -232,7 +239,11 @@ class TestInvalidTxHash:
             signing_service._verify_transaction_sync(settled_transaction)
 
             # Should be marked as failed
-            assert settled_transaction.verification_status == "failed"
+            # Could not reach a node. That is not the chain reporting a revert,
+            # and the record must not say it was, or a moment offline leaves a
+            # permanent "payment failed" in the compliance trail.
+            assert settled_transaction.verification_status == "unavailable"
+            assert settled_transaction.verification_detail
 
 
 # =============================================================================
@@ -288,8 +299,9 @@ class TestNetworkResolution:
 
         signing_service._verify_transaction_sync(tx)
 
-        # Should fail gracefully
-        assert tx.verification_status == "failed"
+        # An unknown network means Vault cannot check, not that the payment failed.
+        assert tx.verification_status == "unavailable"
+        assert "unknown network" in (tx.verification_detail or "")
 
 
 # =============================================================================
@@ -301,7 +313,7 @@ class TestManualVerification:
 
     def test_verify_settled_transaction(self, settled_transaction, signing_service):
         """Manual verification should work on settled transactions."""
-        with patch.object(signing_service, '_verify_transaction_sync') as mock_verify:
+        with patch.object(signing_service, '_verify_transaction_sync'):
             signing_service.verify_transaction(settled_transaction)
 
             # Should set to pending first
@@ -401,7 +413,6 @@ class TestAutoVerification:
     def test_requeue_stuck_verifications(self, temp_data_dir, core, signing_service):
         """Stuck pending verifications should be requeued on startup."""
         # Create a transaction stuck in pending verification
-        from primer_vault.models.store import PolicyStore
 
         tx = Transaction.create(
             agent_id="ABC123",
@@ -419,7 +430,7 @@ class TestAutoVerification:
         core._policy_store.add_transaction(tx)
 
         # Call requeue (simulates restart)
-        with patch.object(signing_service, '_queue_verification') as mock_queue:
+        with patch.object(signing_service, '_queue_verification'):
             signing_service._requeue_stuck_verifications()
 
             # Should have requeued the stuck transaction

@@ -17,7 +17,6 @@ import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from unittest.mock import Mock, patch
 
 import pytest
 
@@ -42,11 +41,6 @@ def policy_store(temp_data_dir):
     return PolicyStore(temp_data_dir)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 # =============================================================================
@@ -105,29 +99,49 @@ class TestJSONCorruptionRecovery:
         assert isinstance(store.get_all_policies(), list)
 
     def test_null_json_handled(self, temp_data_dir):
-        """Null JSON value should be handled - implementation raises TypeError."""
+        """A file holding `null` loads as no policies, rather than raising.
+
+        PolicyStore is constructed by Vault(), which runs during startup, so
+        anything raised out of it is the difference between an application that
+        starts and one that does not. A malformed file must cost its contents,
+        not the application.
+        """
         policies_file = temp_data_dir / "policies.json"
 
         with open(policies_file, 'w') as f:
             f.write('null')
 
-        # Implementation iterates over loaded data, so null causes TypeError
-        # This is expected behavior - malformed file is detected
-        with pytest.raises(TypeError):
-            store = PolicyStore(temp_data_dir)
+        store = PolicyStore(temp_data_dir)
+        assert store.get_all_policies() == []
 
     def test_json_with_missing_required_fields(self, temp_data_dir):
-        """JSON with missing required fields should be handled - implementation raises."""
+        """An unreadable record is skipped; the rest of the file still loads."""
         policies_file = temp_data_dir / "policies.json"
 
-        # Write policy missing required fields
+        good = SpendPolicy.create(
+            name="Good", networks=[4663], daily_limit_micro=1_000_000)
         with open(policies_file, 'w') as f:
-            json.dump([{"id": "test"}], f)  # Missing name, networks, etc.
+            json.dump([{"id": "test"}, good.to_dict()], f)  # first one is unusable
 
-        # Implementation tries to create SpendPolicy from incomplete data
-        # This raises TypeError for missing required arguments
-        with pytest.raises(TypeError):
-            store = PolicyStore(temp_data_dir)
+        store = PolicyStore(temp_data_dir)
+
+        assert [p.name for p in store.get_all_policies()] == ["Good"]
+
+    def test_a_skipped_record_is_left_in_the_file(self, temp_data_dir):
+        """Skipping is a read-time decision, not a repair.
+
+        Vault starts without the record but does not rewrite the file, so a
+        recoverable mistake - a hand-edit, a half-written save - can still be
+        fixed by hand rather than being destroyed by the next startup.
+        """
+        policies_file = temp_data_dir / "policies.json"
+        with open(policies_file, 'w') as f:
+            json.dump([{"id": "test"}], f)
+
+        PolicyStore(temp_data_dir)
+
+        with open(policies_file) as f:
+            assert json.load(f) == [{"id": "test"}]
 
     def test_recovery_after_corruption(self, temp_data_dir):
         """System should recover after fixing corrupted file."""
@@ -173,9 +187,13 @@ class TestJSONCorruptionRecovery:
 class TestConcurrentAccess:
     """Test behavior under concurrent file access."""
 
-    @pytest.mark.xfail(reason="Known race condition: concurrent writes without file locking can corrupt JSON")
     def test_concurrent_policy_creation(self, temp_data_dir):
-        """Multiple threads creating policies should not corrupt data."""
+        """Multiple threads creating policies should not corrupt data.
+
+        Was marked xfail against a known race: saves truncated the target file
+        before writing it, so concurrent writers interleaved. Saves are now
+        written to a temporary file and moved into place under a lock.
+        """
         store = PolicyStore(temp_data_dir)
 
         def create_policy(i):
@@ -194,7 +212,7 @@ class TestConcurrentAccess:
             for future in as_completed(futures):
                 try:
                     policy_ids.append(future.result())
-                except Exception as e:
+                except Exception:
                     # May get duplicate name errors
                     pass
 
@@ -283,13 +301,6 @@ class TestFilePermissions:
         # Should be owner read/write only
         assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
 
-    def test_read_only_directory_handled(self, temp_data_dir):
-        """Read-only directory should be handled gracefully."""
-        # This is tricky to test cross-platform
-        # Just verify the pattern exists in code
-        pass
-
-
 # =============================================================================
 # Data Integrity Tests
 # =============================================================================
@@ -327,12 +338,11 @@ class TestDataIntegrity:
 
     def test_agent_round_trip(self, temp_data_dir):
         """Agent should survive save/load cycle unchanged."""
-        from primer_vault.models.agent import generate_agent_id, generate_agent_token
+        from primer_vault.models.agent import generate_agent_id
 
         store1 = PolicyStore(temp_data_dir)
 
         # Create agent manually
-        from primer_vault.models import Agent
         agent = Agent(
             id=generate_agent_id(),
             code=str(__import__('uuid').uuid4()),
@@ -379,14 +389,6 @@ class TestDataIntegrity:
         assert loaded.amount_micro == tx.amount_micro
         assert loaded.network == tx.network
 
-    def test_unicode_data_preserved(self, temp_data_dir):
-        """Unicode data should be preserved through save/load."""
-        # Note: Implementation validates that names only contain printable ASCII
-        # This is a security feature to prevent various attacks
-        # So we test with an ASCII name that the unicode restriction is enforced
-        pass  # This test intentionally skipped - implementation rejects non-ASCII names
-
-
 # =============================================================================
 # Edge Cases
 # =============================================================================
@@ -400,7 +402,7 @@ class TestPersistenceEdgeCases:
             new_dir = Path(tmp) / "new" / "nested" / "dir"
             assert not new_dir.exists()
 
-            store = PolicyStore(new_dir)
+            PolicyStore(new_dir)
 
             assert new_dir.exists()
 
@@ -522,3 +524,110 @@ class TestTransactionHistory:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# Atomic saves
+# =============================================================================
+
+class TestAtomicSaves:
+    """Saves must never leave a partially written file on disk.
+
+    The store previously opened the target directly, which truncates it before
+    the new contents are written. An interruption in that window destroyed the
+    data, because the previous version was already gone.
+    """
+
+    def test_all_policies_survive_concurrent_writers(self, temp_data_dir):
+        """Every write lands - the lock stops one silently replacing another."""
+        store = PolicyStore(temp_data_dir)
+
+        def add(i):
+            store.add_policy(SpendPolicy.create(
+                name=f"P{i}", networks=[4663],
+                daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(as_completed([ex.submit(add, i) for i in range(25)]))
+
+        saved = json.loads((temp_data_dir / "policies.json").read_text(encoding="utf-8"))
+        assert len(saved) == 25
+
+    def test_agents_and_transactions_also_survive(self, temp_data_dir):
+        """The same treatment applies to the other two files."""
+        from primer_vault.models import Transaction
+        store = PolicyStore(temp_data_dir)
+
+        def add(i):
+            store.add_transaction(Transaction.create(
+                agent_id=f"A{i}", agent_name="Bot", agent_code=f"C{i}",
+                amount_micro=1_000, recipient="0x" + "11" * 20,
+                network="eip155:4663"))
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(as_completed([ex.submit(add, i) for i in range(25)]))
+
+        saved = json.loads((temp_data_dir / "transactions.json").read_text(encoding="utf-8"))
+        assert len(saved) == 25
+
+    def test_a_failed_write_leaves_the_previous_file_intact(self, temp_data_dir):
+        """The point of the temporary file: a mid-write failure loses nothing."""
+        from primer_vault.models import store as store_mod
+
+        store = PolicyStore(temp_data_dir)
+        store.add_policy(SpendPolicy.create(
+            name="Original", networks=[4663],
+            daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+        before = (temp_data_dir / "policies.json").read_text(encoding="utf-8")
+
+        real_dump = store_mod.json.dump
+
+        def explode(*a, **k):
+            raise OSError("disk full")
+
+        store_mod.json.dump = explode
+        try:
+            with pytest.raises(OSError):
+                store.add_policy(SpendPolicy.create(
+                    name="Doomed", networks=[4663],
+                    daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+        finally:
+            store_mod.json.dump = real_dump
+
+        after = (temp_data_dir / "policies.json").read_text(encoding="utf-8")
+        assert after == before
+        assert json.loads(after)[0]["name"] == "Original"
+
+    def test_no_temporary_files_are_left_behind(self, temp_data_dir):
+        """Successful and failed writes both clean up after themselves."""
+        from primer_vault.models import store as store_mod
+
+        store = PolicyStore(temp_data_dir)
+        store.add_policy(SpendPolicy.create(
+            name="Kept", networks=[4663],
+            daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+
+        real_dump = store_mod.json.dump
+        store_mod.json.dump = lambda *a, **k: (_ for _ in ()).throw(OSError("boom"))
+        try:
+            with pytest.raises(OSError):
+                store.add_policy(SpendPolicy.create(
+                    name="Failed", networks=[4663],
+                    daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+        finally:
+            store_mod.json.dump = real_dump
+
+        leftovers = [p.name for p in temp_data_dir.iterdir() if p.name.endswith(".tmp")]
+        assert leftovers == []
+
+    def test_saved_file_is_reloadable(self, temp_data_dir):
+        """A fresh store reads back exactly what was written."""
+        store = PolicyStore(temp_data_dir)
+        for i in range(5):
+            store.add_policy(SpendPolicy.create(
+                name=f"Reload{i}", networks=[4663],
+                daily_limit_micro=1_000_000, per_request_max_micro=100_000))
+
+        reloaded = PolicyStore(temp_data_dir)
+        assert len(reloaded.get_all_policies()) == 5
+        assert {p.name for p in reloaded.get_all_policies()} == {f"Reload{i}" for i in range(5)}

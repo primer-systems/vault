@@ -8,7 +8,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Vault is a desktop application whose primary target is Windows, and the
+    # release workflow builds macOS and Linux binaries too. Testing only on
+    # Linux left the platform most users are on unverified - path handling,
+    # file permissions and process behaviour are exactly where that shows.
+    #
+    # requirements.lock is resolved for every platform at once, so the same
+    # hashed install works on all three.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    # PyQt6 has no display on any CI runner, so render off-screen. The tests
+    # already default this, but setting it for the whole job covers import time
+    # too, before any test body runs.
+    env:
+      QT_QPA_PLATFORM: offscreen
 
     steps:
       - name: Checkout code
@@ -19,19 +37,41 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      # PyQt6's Linux wheels bundle Qt but still link the system graphics
+      # libraries. Without these, `import PyQt6.QtWidgets` fails with
+      # "libEGL.so.1: cannot open shared object file" and every UI test errors
+      # at collection. Windows and macOS runners already have their equivalents.
+      - name: Install Qt system libraries (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libglib2.0-0
+
+      - name: Install locked dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-mock pytest-asyncio
+          pip install --require-hashes -r requirements.lock
+          pip install pytest pytest-cov pytest-mock pytest-asyncio ruff
+
+      # Catches the class of mistake review misses: a name that does not exist,
+      # an import left behind by a deletion, an exception raised without its
+      # cause. Configured in pyproject.toml, and narrow on purpose.
+      #
+      # Lint and coverage read the source, not the platform, so one run of each
+      # is enough - the matrix exists to run the tests three times, not these.
+      - name: Lint
+        if: matrix.os == 'ubuntu-latest'
+        run: ruff check src/ tests/
 
       - name: Run tests
         run: python -m pytest tests/ -v --tb=short
 
       - name: Run tests with coverage
+        if: matrix.os == 'ubuntu-latest'
         run: python -m pytest tests/ --cov=src --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest'
         uses: codecov/codecov-action@v4
         with:
           file: ./coverage.xml

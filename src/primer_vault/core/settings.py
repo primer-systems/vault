@@ -8,14 +8,24 @@ external changes using watchdog.
 import json
 import logging
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, TYPE_CHECKING
+from typing import Optional, Callable
+
+from ..models.store import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
 # Canonical default port for Vault (RHC mainnet chain ID)
 DEFAULT_PORT = 4663
+
+#: Requests per minute one caller may make to the agent API. 0 means no ceiling.
+#:
+#: Lives here rather than in the GUI's own settings file because the ceiling
+#: protects the agent server, which the daemon and the CLI also run - a limit
+#: only the GUI could set would not exist in headless mode, which is the mode
+#: most exposed to a LAN.
+DEFAULT_RATE_LIMIT_PER_MINUTE = 300
 
 # Admin API access modes
 ADMIN_API_MODE_OPEN = "open"          # Any local process can access (current behavior)
@@ -33,7 +43,8 @@ DEFAULT_SETTINGS = {
     },
     "server": {
         "default_port": DEFAULT_PORT,
-        "allow_lan": False
+        "allow_lan": False,
+        "rate_limit_per_minute": DEFAULT_RATE_LIMIT_PER_MINUTE,
     },
     "security": {
         "admin_api_mode": ADMIN_API_MODE_GUI_ONLY,
@@ -60,6 +71,7 @@ class ServerSettings:
     """Server-related settings."""
     default_port: int = DEFAULT_PORT
     allow_lan: bool = False
+    rate_limit_per_minute: int = DEFAULT_RATE_LIMIT_PER_MINUTE
 
 
 @dataclass
@@ -102,6 +114,7 @@ class AppSettings:
             "server": {
                 "default_port": self.server.default_port,
                 "allow_lan": self.server.allow_lan,
+                "rate_limit_per_minute": self.server.rate_limit_per_minute,
             },
             "security": {
                 "admin_api_mode": self.security.admin_api_mode,
@@ -128,10 +141,27 @@ class AppSettings:
             s = data["server"]
             settings.server.default_port = s.get("default_port", DEFAULT_PORT)
             settings.server.allow_lan = s.get("allow_lan", False)
+            settings.server.rate_limit_per_minute = s.get(
+                "rate_limit_per_minute", DEFAULT_RATE_LIMIT_PER_MINUTE)
 
         if "security" in data:
             s = data["security"]
-            settings.security.admin_api_mode = s.get("admin_api_mode", ADMIN_API_MODE_GUI_ONLY)
+            raw_mode = s.get("admin_api_mode", ADMIN_API_MODE_GUI_ONLY)
+            # Validate on the way in. The admin-API gate is the only thing
+            # standing between a local process and the wallet, and it treats any
+            # value other than "open" as locked-down - but a hand-edited
+            # settings.json can carry a near-miss of the *safe* value ("GUI_ONLY",
+            # "gui-only") that is neither, and an unvalidated one would sail
+            # through. Anything not exactly one of the two known modes falls back
+            # to the safe one, the same way an unreadable file does.
+            if raw_mode not in (ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY):
+                logger.warning(
+                    "Unrecognised admin_api_mode %r in settings.json; using the "
+                    "safe default %r. Valid values are %r and %r.",
+                    raw_mode, ADMIN_API_MODE_GUI_ONLY,
+                    ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY)
+                raw_mode = ADMIN_API_MODE_GUI_ONLY
+            settings.security.admin_api_mode = raw_mode
 
         if "display" in data:
             s = data["display"]
@@ -156,7 +186,8 @@ class SettingsManager:
     def __init__(
         self,
         data_dir: Path,
-        on_change: Optional[Callable[[AppSettings], None]] = None
+        on_change: Optional[Callable[[AppSettings], None]] = None,
+        on_save_error: Optional[Callable[[str], None]] = None
     ):
         """
         Initialize settings manager.
@@ -164,15 +195,25 @@ class SettingsManager:
         Args:
             data_dir: Directory for settings file
             on_change: Callback when settings change (from file or programmatic)
+            on_save_error: Callback with a user-readable message when a save
+                fails. The in-memory settings stay in effect after a failed
+                save, so the person who made the change is the one who needs
+                to hear that it will not survive a restart - a log line does
+                not reach them.
         """
         self._data_dir = data_dir
         self._settings_file = data_dir / "settings.json"
         self._settings = AppSettings()
         self._on_change = on_change
+        self._on_save_error = on_save_error
         self._observer = None
         self._write_lock = threading.Lock()
         self._last_written_content: Optional[str] = None  # To detect our own writes
-        self._skip_next_reload = False  # Flag to skip watcher reload after our writes
+        # Set when settings.json exists but could not be READ at startup, and no
+        # copy could be kept - so the file on disk is the only copy of the user's
+        # settings. A save writes defaults over it, so saving is refused until a
+        # restart reads it cleanly. See _load and _save.
+        self._protected = False
 
         # Load existing settings
         self._load()
@@ -183,7 +224,7 @@ class SettingsManager:
     def _load(self) -> None:
         """Load settings from file."""
         if not self._settings_file.exists():
-            logger.info(f"No settings file found, using defaults")
+            logger.info("No settings file found, using defaults")
             self._save()  # Create with defaults
             return
 
@@ -193,25 +234,79 @@ class SettingsManager:
             self._settings = AppSettings.from_dict(data)
             logger.info(f"Loaded settings from {self._settings_file}")
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid settings file, using defaults: {e}")
+            # Readable but not valid JSON. Keep a copy so the user's settings
+            # stay recoverable, then fall back to defaults. If even the copy
+            # cannot be made, protect the file from the next save's overwrite.
+            aside = self._set_aside()
+            if aside is None:
+                self._protected = True
             self._settings = AppSettings()
+            logger.error("Invalid settings file, using defaults: %s. A copy "
+                         "has been kept as %s.", e,
+                         aside or "(copy failed; the original is untouched)")
         except Exception as e:
-            logger.error(f"Failed to load settings: {e}")
+            # Could not open the file at all - it is the only copy of the user's
+            # settings, so the next save must not overwrite it with defaults.
+            self._protected = True
             self._settings = AppSettings()
+            logger.error("Failed to load settings: %s. The file will be left "
+                         "untouched, not overwritten, so it stays recoverable "
+                         "until a restart can read it.", e)
+
+    def _set_aside(self) -> Optional[str]:
+        """Copy settings.json aside before a save can replace it. Best effort;
+        returns the copy's name, or None if the copy could not be made."""
+        aside = self._settings_file.with_name(self._settings_file.name + ".unreadable")
+        try:
+            import shutil
+            shutil.copy2(self._settings_file, aside)
+        except OSError:
+            return None
+        return aside.name
 
     def _save(self) -> None:
-        """Save settings to file."""
+        """Save settings to file.
+
+        Through the same atomic writer the policy store uses. An in-place
+        write truncates the file first, so a save that fails midway destroys
+        the previous settings, which the next start then silently
+        replaces with defaults - re-enabling networks the user had disabled
+        and discarding a custom RPC endpoint.
+        """
         with self._write_lock:
+            if self._protected:
+                message = ("Not saving settings: settings.json could not be "
+                           "read at startup and no copy was kept, so it is "
+                           "left untouched to stay recoverable. Your change is "
+                           "active now but will be lost when Vault restarts; "
+                           "restart while the file is readable to save it.")
+                logger.error(message)
+                if self._on_save_error:
+                    try:
+                        self._on_save_error(message)
+                    except Exception:
+                        logger.exception("Settings save-error callback failed")
+                return
             try:
                 self._data_dir.mkdir(parents=True, exist_ok=True)
-                content = json.dumps(self._settings.to_dict(), indent=2)
-                self._last_written_content = content
-                self._skip_next_reload = True  # Skip watcher reload for our own write
-                with open(self._settings_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                data = self._settings.to_dict()
+                # Remembered before the write so the watcher recognises the
+                # resulting file as our own when its event arrives.
+                self._last_written_content = json.dumps(data, indent=2)
+                write_json_atomic(self._settings_file, data)
                 logger.debug(f"Saved settings to {self._settings_file}")
             except Exception as e:
-                logger.error(f"Failed to save settings: {e}")
+                # The change is already live in memory; only the file is
+                # stale. Whoever made the change needs to hear that, not
+                # just the log.
+                message = (f"Could not save settings ({e}). Your change is "
+                           "active now but will be lost when Vault restarts.")
+                logger.error(message)
+                if self._on_save_error:
+                    try:
+                        self._on_save_error(message)
+                    except Exception:
+                        logger.exception("Settings save-error callback failed")
 
     def _start_watcher(self) -> None:
         """Start watching the settings file for changes."""
@@ -220,14 +315,30 @@ class SettingsManager:
             from watchdog.events import FileSystemEventHandler
 
             class SettingsFileHandler(FileSystemEventHandler):
+                """React to any event that can land new contents at
+                settings.json. An in-place editor fires on_modified; an
+                atomic save - ours, or an editor doing write-temp-then-
+                rename - arrives as on_moved or on_created depending on
+                platform. Handling only on_modified missed renames."""
+
                 def __init__(handler_self, manager):
                     handler_self.manager = manager
 
-                def on_modified(handler_self, event):
-                    if event.is_directory:
-                        return
-                    if Path(event.src_path).name == "settings.json":
+                def _maybe_reload(handler_self, path):
+                    if Path(path).name == "settings.json":
                         handler_self.manager._on_file_changed()
+
+                def on_modified(handler_self, event):
+                    if not event.is_directory:
+                        handler_self._maybe_reload(event.src_path)
+
+                def on_created(handler_self, event):
+                    if not event.is_directory:
+                        handler_self._maybe_reload(event.src_path)
+
+                def on_moved(handler_self, event):
+                    if not event.is_directory:
+                        handler_self._maybe_reload(event.dest_path)
 
             self._observer = Observer()
             handler = SettingsFileHandler(self)
@@ -241,32 +352,56 @@ class SettingsManager:
             logger.error(f"Failed to start settings watcher: {e}")
 
     def _on_file_changed(self) -> None:
-        """Handle external settings file change."""
-        # Skip if this was triggered by our own write
-        if self._skip_next_reload:
-            self._skip_next_reload = False
-            return
+        """Handle a settings-file change seen by the watcher.
 
+        Our own saves land here too - a rename raises a watcher event just as
+        an external edit does. They are recognised by content: whatever we
+        last wrote is not news. Content comparison is the right recogniser here:
+        a save can raise no event or several, so anything that counts events
+        (a "skip the next reload" flag) can swallow a real external change or
+        reload our own write. Content cannot drift that way.
+
+        It is not airtight either: `_last_written_content` records our own
+        saves and nothing else, so an external edit that happens to restore
+        exactly what we last wrote - a reverted file, a restored backup - is
+        indistinguishable from our own write and is ignored. Vault then holds
+        settings the file no longer shows, until its next save.
+
+        The comparison must run under the write lock. Watcher events arrive
+        late: an event from save N can land while save N+1 is underway, read
+        the not-yet-replaced file, see it differ from what save N+1 just
+        recorded, and "reload" stale settings over the newer in-memory ones.
+        Holding the lock means this only ever compares a settled file against
+        the record of the save that produced it.
+        """
+        changed = None
         try:
-            # Read file content
-            with open(self._settings_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            with self._write_lock:
+                with open(self._settings_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
 
-            # Skip if content matches what we last wrote (backup check)
-            if content == self._last_written_content:
-                return
+                # Our own write, arriving back via the watcher
+                if content == self._last_written_content:
+                    return
 
-            # Parse and update
-            data = json.loads(content)
-            self._settings = AppSettings.from_dict(data)
-            logger.info("Settings reloaded from external change")
+                # Parse and update
+                data = json.loads(content)
+                self._settings = AppSettings.from_dict(data)
+                changed = self._settings
+                logger.info("Settings reloaded from external change")
 
-            # Notify listener
-            if self._on_change:
-                self._on_change(self._settings)
-
+        except FileNotFoundError:
+            # Events can arrive for a path that is gone again already - the
+            # file is being replaced this instant. The event for the version
+            # that lands will find it.
+            pass
         except Exception as e:
             logger.error(f"Failed to reload settings: {e}")
+
+        # The listener runs outside the lock: it may react by changing a
+        # setting itself, which saves, which takes the lock again.
+        if changed is not None and self._on_change:
+            self._on_change(changed)
 
     def stop(self) -> None:
         """Stop the file watcher."""
@@ -347,6 +482,19 @@ class SettingsManager:
         """Set allow LAN connections setting."""
         if self._settings.server.allow_lan != allowed:
             self._settings.server.allow_lan = allowed
+            self._save()
+            if self._on_change:
+                self._on_change(self._settings)
+
+    def get_rate_limit(self) -> int:
+        """Requests per minute allowed from one caller. 0 means no ceiling."""
+        return self._settings.server.rate_limit_per_minute
+
+    def set_rate_limit(self, requests_per_minute: int) -> None:
+        """Set the agent API's per-caller ceiling. 0 means no ceiling."""
+        value = max(0, int(requests_per_minute))
+        if self._settings.server.rate_limit_per_minute != value:
+            self._settings.server.rate_limit_per_minute = value
             self._save()
             if self._on_change:
                 self._on_change(self._settings)

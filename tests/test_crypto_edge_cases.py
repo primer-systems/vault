@@ -1,11 +1,11 @@
 """
 Cryptography Edge Cases Tests
 
-Tests for wallet encryption edge cases, wrong password handling,
-corrupted data detection, key derivation boundaries, and memory cleanup.
+Wallet encryption edge cases, wrong password handling, corrupted data
+detection, key derivation boundaries, and memory cleanup.
 
-These tests verify that cryptographic operations fail safely and
-securely handle edge cases.
+These verify that cryptographic operations fail safely: a wallet that cannot be
+proved authentic must not open, and a locked wallet must retain nothing.
 """
 
 import json
@@ -15,17 +15,19 @@ import sys
 import tempfile
 import shutil
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
+from cryptography.exceptions import InvalidTag
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from primer_vault.wallet.crypto import (
-    Wallet, encrypt_seed, decrypt_seed, derive_key,
-    NO_PASSWORD_SENTINEL, ETH_DERIVATION_PATH
+    VaultWallet, UnsupportedWalletVersion, CorruptedWalletFile,
+    WALLET_FORMAT_VERSION, derive_key, encrypt_with_key, decrypt_with_key,
 )
+
+PASSWORD = "a sufficiently long password"
 
 
 @pytest.fixture
@@ -37,17 +39,44 @@ def temp_data_dir():
 
 
 @pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance with temporary data directory."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
-
-
-@pytest.fixture
 def valid_seed_phrase():
     """Generate a valid 12-word seed phrase."""
     from eth_account.hdaccount import generate_mnemonic
     return generate_mnemonic(num_words=12, lang="english")
+
+
+def make_wallet(seed_phrase, password=PASSWORD):
+    """A wallet holding one seed and one derived address."""
+    wallet = VaultWallet.create(password)
+    seed_id = wallet.add_seed(seed_phrase)
+    wallet.add_address_from_seed(seed_id, 0, "Primary")
+    return wallet, seed_id
+
+
+def saved_wallet(path, seed_phrase, password=PASSWORD):
+    """A wallet written to `path`, returned with its seed id."""
+    wallet, seed_id = make_wallet(seed_phrase, password)
+    wallet.save(path)
+    return wallet, seed_id
+
+
+def stored_strings(node):
+    """Every string *value* in a wallet file, at any depth.
+
+    Values only - the keys are Vault's own field names, not stored data. That
+    distinction matters here: six BIP-39 words ("address", "index", "name",
+    "salt", "tag", "version") are also keys in this file, so a scan of the raw
+    text finds them in about one run in twenty-nine no matter how sound the
+    encryption is.
+    """
+    if isinstance(node, dict):
+        for value in node.values():
+            yield from stored_strings(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from stored_strings(value)
+    elif isinstance(node, str):
+        yield node
 
 
 # =============================================================================
@@ -60,68 +89,69 @@ class TestWrongPasswordHandling:
     def test_wrong_password_raises_error(self, temp_data_dir, valid_seed_phrase):
         """Wrong password should raise ValueError."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        # Create wallet with password
-        wallet = Wallet(valid_seed_phrase, "correct_password")
-        wallet.save(wallet_path)
-
-        # Try to load with wrong password
-        with pytest.raises(ValueError) as exc_info:
-            Wallet.load(wallet_path, "wrong_password")
-
-        assert "Wrong password" in str(exc_info.value) or "corrupted" in str(exc_info.value).lower()
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, "wrong_password")
 
     def test_empty_password_on_encrypted_wallet(self, temp_data_dir, valid_seed_phrase):
-        """Empty password on encrypted wallet should fail."""
+        """Empty password should fail on an encrypted wallet."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        # Create encrypted wallet
-        wallet = Wallet(valid_seed_phrase, "secure_password")
-        wallet.save(wallet_path)
-
-        # Try to load with empty password
-        with pytest.raises((ValueError, Exception)):
-            Wallet.load(wallet_path, "")
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, "")
 
     def test_none_password_on_encrypted_wallet(self, temp_data_dir, valid_seed_phrase):
-        """None password on encrypted wallet should fail."""
+        """None password should fail rather than being treated as empty."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        # Create encrypted wallet
-        wallet = Wallet(valid_seed_phrase, "secure_password")
-        wallet.save(wallet_path)
+        with pytest.raises((ValueError, TypeError, AttributeError)):
+            VaultWallet.load(wallet_path, None)
 
-        # Try to load with None password
-        with pytest.raises((ValueError, TypeError, Exception)):
-            Wallet.load(wallet_path, None)
-
-    def test_unencrypted_wallet_ignores_password(self, temp_data_dir, valid_seed_phrase):
-        """Unencrypted wallet should load regardless of password provided."""
+    def test_verify_password_does_not_open_on_a_wrong_one(self, temp_data_dir,
+                                                          valid_seed_phrase):
+        """The check answers from the stored wrapping, not a retained password."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
+        wallet = VaultWallet.load(wallet_path, PASSWORD)
 
-        # Create unencrypted wallet
-        wallet = Wallet(valid_seed_phrase, NO_PASSWORD_SENTINEL)
-        wallet.save(wallet_path)
-
-        # Should load with any password (ignored)
-        loaded = Wallet.load(wallet_path, "any_password")
-        assert loaded.seed_phrase == valid_seed_phrase
+        assert wallet.verify_password(PASSWORD) is True
+        assert wallet.verify_password("wrong_password") is False
 
     def test_password_not_stored_in_wallet_file(self, temp_data_dir, valid_seed_phrase):
-        """Password should never be stored in the wallet file."""
+        """Neither the password nor the seed may appear anywhere in the file.
+
+        The password and the whole phrase are checked against the raw text -
+        both are long and distinctive, so finding either is conclusive.
+
+        Individual seed words are checked against the stored *values* instead,
+        and as whole whitespace-delimited tokens. Two reasons, and both are
+        needed: scanning the raw text matches Vault's own field names, six of
+        which are BIP-39 words; and matching a bare substring would hit the
+        encrypted hex blobs, where a short word made of hex letters turns up by
+        chance. Tokens-within-values catches what actually matters - a phrase
+        stored as a list, or a word left in a name or a label - without either
+        false positive.
+        """
         wallet_path = temp_data_dir / "test.wallet"
-        password = "super_secret_password_12345"
+        password = "my_secret_password_123"
+        saved_wallet(wallet_path, valid_seed_phrase, password)
 
-        wallet = Wallet(valid_seed_phrase, password)
-        wallet.save(wallet_path)
-
-        # Read raw file content
-        with open(wallet_path, 'r') as f:
-            content = f.read()
-
-        # Password should not appear in file
+        content = wallet_path.read_text(encoding="utf-8")
         assert password not in content
-        assert "super_secret" not in content
+        assert valid_seed_phrase not in content
+
+        values = list(stored_strings(json.loads(content)))
+        assert values, "the file should contain stored values to check"
+
+        words = set(valid_seed_phrase.split())
+        for value in values:
+            assert password not in value
+            assert valid_seed_phrase not in value
+            leaked = words.intersection(value.split())
+            assert not leaked, f"seed word(s) {sorted(leaked)} stored in {value!r}"
 
 
 # =============================================================================
@@ -129,419 +159,456 @@ class TestWrongPasswordHandling:
 # =============================================================================
 
 class TestCorruptedDataHandling:
-    """Test behavior with corrupted wallet files."""
+    """Every one of these must fail closed: no wallet, not a partial one."""
 
     def test_truncated_json_rejected(self, temp_data_dir, valid_seed_phrase):
-        """Truncated JSON file should be rejected."""
+        """A half-written file must not open."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        # Create valid wallet
-        wallet = Wallet(valid_seed_phrase, "password")
-        wallet.save(wallet_path)
+        content = wallet_path.read_text(encoding="utf-8")
+        wallet_path.write_text(content[:len(content) // 2], encoding="utf-8")
 
-        # Truncate the file
-        with open(wallet_path, 'r') as f:
-            content = f.read()
+        with pytest.raises((ValueError, json.JSONDecodeError, KeyError)):
+            VaultWallet.load(wallet_path, PASSWORD)
 
-        with open(wallet_path, 'w') as f:
-            f.write(content[:len(content)//2])  # Write only half
-
-        # Should fail to load
-        with pytest.raises((json.JSONDecodeError, ValueError, Exception)):
-            Wallet.load(wallet_path, "password")
-
-    def test_corrupted_encrypted_seed_rejected(self, temp_data_dir, valid_seed_phrase):
-        """Corrupted encrypted seed should be detected."""
+    def test_corrupted_wrapped_key_rejected(self, temp_data_dir, valid_seed_phrase):
+        """Tampering with the wrapped master key must be caught by GCM."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        # Create valid wallet
-        wallet = Wallet(valid_seed_phrase, "password")
-        wallet.save(wallet_path)
+        data = json.loads(wallet_path.read_text(encoding="utf-8"))
+        data["wrapped_key"]["ciphertext"] = secrets.token_bytes(
+            len(data["wrapped_key"]["ciphertext"]) // 2).hex()
+        wallet_path.write_text(json.dumps(data), encoding="utf-8")
 
-        # Corrupt the encrypted seed
-        with open(wallet_path, 'r') as f:
-            data = json.load(f)
-
-        # Flip some bits in encrypted seed
-        if "encrypted_seed" in data:
-            original = data["encrypted_seed"]
-            # Corrupt a byte
-            corrupted = original[:-4] + "XXXX"
-            data["encrypted_seed"] = corrupted
-
-            with open(wallet_path, 'w') as f:
-                json.dump(data, f)
-
-            # Should fail to decrypt
-            with pytest.raises((ValueError, Exception)):
-                Wallet.load(wallet_path, "password")
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, PASSWORD)
 
     def test_modified_auth_tag_rejected(self, temp_data_dir, valid_seed_phrase):
-        """Modified authentication tag should be detected (AES-GCM integrity)."""
+        """A flipped authentication tag must not decrypt."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        wallet = Wallet(valid_seed_phrase, "password")
-        wallet.save(wallet_path)
+        data = json.loads(wallet_path.read_text(encoding="utf-8"))
+        tag = bytearray.fromhex(data["wrapped_key"]["tag"])
+        tag[0] ^= 0xFF
+        data["wrapped_key"]["tag"] = tag.hex()
+        wallet_path.write_text(json.dumps(data), encoding="utf-8")
 
-        # Modify the auth tag
-        with open(wallet_path, 'r') as f:
-            data = json.load(f)
-
-        if "tag" in data:
-            original_tag = data["tag"]
-            # Flip a bit in the tag
-            modified_tag = "00" + original_tag[2:]
-            data["tag"] = modified_tag
-
-            with open(wallet_path, 'w') as f:
-                json.dump(data, f)
-
-            # AES-GCM should reject this
-            with pytest.raises((ValueError, Exception)):
-                Wallet.load(wallet_path, "password")
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, PASSWORD)
 
     def test_modified_iv_causes_decryption_failure(self, temp_data_dir, valid_seed_phrase):
-        """Modified IV should cause decryption to fail."""
+        """A changed IV must not silently yield different plaintext."""
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        wallet = Wallet(valid_seed_phrase, "password")
-        wallet.save(wallet_path)
+        data = json.loads(wallet_path.read_text(encoding="utf-8"))
+        iv = bytearray.fromhex(data["wrapped_key"]["iv"])
+        iv[0] ^= 0xFF
+        data["wrapped_key"]["iv"] = iv.hex()
+        wallet_path.write_text(json.dumps(data), encoding="utf-8")
 
-        with open(wallet_path, 'r') as f:
-            data = json.load(f)
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, PASSWORD)
 
-        if "iv" in data:
-            # Modify IV
-            data["iv"] = secrets.token_hex(12)
+    def test_tampered_seed_rejected(self, temp_data_dir, valid_seed_phrase):
+        """A seed entry altered under an intact master key is still caught."""
+        wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-            with open(wallet_path, 'w') as f:
-                json.dump(data, f)
+        data = json.loads(wallet_path.read_text(encoding="utf-8"))
+        blob = bytearray.fromhex(data["seeds"][0]["encrypted_phrase"])
+        blob[0] ^= 0xFF
+        data["seeds"][0]["encrypted_phrase"] = blob.hex()
+        wallet_path.write_text(json.dumps(data), encoding="utf-8")
 
-            with pytest.raises((ValueError, Exception)):
-                Wallet.load(wallet_path, "password")
+        # Caught as damage (the password was correct), not surfaced as the raw
+        # crypto exception, so the caller can name the fault and the backup.
+        with pytest.raises(CorruptedWalletFile):
+            VaultWallet.load(wallet_path, PASSWORD)
 
     def test_invalid_json_rejected(self, temp_data_dir):
-        """Invalid JSON should be rejected."""
+        """Not JSON at all."""
         wallet_path = temp_data_dir / "test.wallet"
+        wallet_path.write_text("this is not json", encoding="utf-8")
 
-        with open(wallet_path, 'w') as f:
-            f.write("this is not valid json {{{")
-
-        with pytest.raises((json.JSONDecodeError, Exception)):
-            Wallet.load(wallet_path, "password")
+        with pytest.raises((ValueError, json.JSONDecodeError)):
+            VaultWallet.load(wallet_path, PASSWORD)
 
     def test_missing_required_fields_rejected(self, temp_data_dir):
-        """Wallet file missing required fields should be rejected."""
+        """A wallet marked encrypted but carrying no key wrapping."""
         wallet_path = temp_data_dir / "test.wallet"
+        wallet_path.write_text(
+            json.dumps({"version": WALLET_FORMAT_VERSION, "encrypted": True}),
+            encoding="utf-8")
 
-        # Write minimal invalid wallet
-        with open(wallet_path, 'w') as f:
-            json.dump({"version": 1}, f)  # Missing encrypted_seed, etc.
-
-        with pytest.raises((KeyError, ValueError, Exception)):
-            Wallet.load(wallet_path, "password")
+        with pytest.raises((ValueError, KeyError)):
+            VaultWallet.load(wallet_path, PASSWORD)
 
     def test_wrong_version_rejected(self, temp_data_dir, valid_seed_phrase):
-        """Wallet with unsupported version should be rejected."""
+        """An unreadable format is refused distinctly from a bad password.
+
+        The remedy differs and no password will ever open the file, so saying
+        "wrong password" would send the user after the wrong problem.
+        """
         wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase)
 
-        wallet = Wallet(valid_seed_phrase, "password")
-        wallet.save(wallet_path)
+        data = json.loads(wallet_path.read_text(encoding="utf-8"))
+        data["version"] = 99
+        wallet_path.write_text(json.dumps(data), encoding="utf-8")
 
-        # Change version
-        with open(wallet_path, 'r') as f:
-            data = json.load(f)
-
-        data["version"] = 99  # Unsupported version
-
-        with open(wallet_path, 'w') as f:
-            json.dump(data, f)
-
-        with pytest.raises(ValueError) as exc_info:
-            Wallet.load(wallet_path, "password")
-
-        assert "version" in str(exc_info.value).lower()
+        with pytest.raises(UnsupportedWalletVersion):
+            VaultWallet.load(wallet_path, PASSWORD)
 
 
 # =============================================================================
-# Key Derivation Edge Cases Tests
+# Key Derivation Edge Cases
 # =============================================================================
 
 class TestKeyDerivationEdgeCases:
-    """Test edge cases in key derivation."""
+    """Test edge cases in HD key derivation."""
 
     def test_derive_address_index_zero(self, valid_seed_phrase):
-        """Should derive address at index 0 correctly."""
-        wallet = Wallet(valid_seed_phrase, "password")
-        address = wallet.get_address(0)
+        """Index 0 should derive successfully."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        address = wallet.derive_address_at_index(seed_id, 0)
 
-        assert address is not None
         assert address.startswith("0x")
         assert len(address) == 42
 
     def test_derive_address_index_large(self, valid_seed_phrase):
-        """Should handle large address indices."""
-        wallet = Wallet(valid_seed_phrase, "password")
+        """A large index should still derive."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        address = wallet.derive_address_at_index(seed_id, 1000)
 
-        # Derive at large index
-        address = wallet.get_address(1000)
-        assert address is not None
         assert address.startswith("0x")
+        assert len(address) == 42
 
     def test_derive_address_index_max_safe(self, valid_seed_phrase):
-        """Should handle max safe index within BIP-44 spec."""
-        wallet = Wallet(valid_seed_phrase, "password")
+        """The top of the non-hardened range should derive."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        address = wallet.derive_address_at_index(seed_id, 2**31 - 1)
 
-        # BIP-44 uses 31-bit indices
-        # Test a reasonably large but safe index
-        address = wallet.get_address(2**20)  # 1 million
-        assert address is not None
         assert address.startswith("0x")
 
     def test_negative_address_index_rejected(self, valid_seed_phrase):
-        """Negative address index should be rejected or handled."""
-        from eth_utils.exceptions import ValidationError
-        wallet = Wallet(valid_seed_phrase, "password")
+        """A negative index is not a derivation path."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
 
-        # Behavior depends on implementation
-        try:
-            address = wallet.get_address(-1)
-            # If it returns something, it should still be a valid address
-            # (implementation may wrap or reject)
-        except (ValueError, IndexError, OverflowError, ValidationError):
-            pass  # Expected behavior
+        # eth_account refuses to build the path, which is the right refusal —
+        # the point is that a negative index never reaches key derivation.
+        with pytest.raises(Exception, match="not valid"):
+            wallet.derive_address_at_index(seed_id, -1)
 
     def test_consistent_derivation(self, valid_seed_phrase):
-        """Same seed + index should always produce same address."""
-        wallet1 = Wallet(valid_seed_phrase, "password1")
-        wallet2 = Wallet(valid_seed_phrase, "password2")
+        """The same seed and index must always give the same address."""
+        wallet_a, seed_a = make_wallet(valid_seed_phrase)
+        wallet_b, seed_b = make_wallet(valid_seed_phrase, "a different password")
 
-        address1 = wallet1.get_address(0)
-        address2 = wallet2.get_address(0)
-
-        # Addresses should be identical (password only encrypts storage)
-        assert address1 == address2
+        for index in (0, 1, 5):
+            assert (wallet_a.derive_address_at_index(seed_a, index)
+                    == wallet_b.derive_address_at_index(seed_b, index))
 
     def test_different_seeds_different_addresses(self):
-        """Different seeds should produce different addresses."""
+        """Different seeds must not collide."""
         from eth_account.hdaccount import generate_mnemonic
+        wallet_a, seed_a = make_wallet(generate_mnemonic(num_words=12, lang="english"))
+        wallet_b, seed_b = make_wallet(generate_mnemonic(num_words=12, lang="english"))
 
-        seed1 = generate_mnemonic(num_words=12, lang="english")
-        seed2 = generate_mnemonic(num_words=12, lang="english")
+        assert (wallet_a.derive_address_at_index(seed_a, 0)
+                != wallet_b.derive_address_at_index(seed_b, 0))
 
-        wallet1 = Wallet(seed1, "password")
-        wallet2 = Wallet(seed2, "password")
+    def test_unknown_seed_rejected(self, valid_seed_phrase):
+        """Deriving from a seed the wallet does not hold."""
+        wallet, _ = make_wallet(valid_seed_phrase)
 
-        address1 = wallet1.get_address(0)
-        address2 = wallet2.get_address(0)
-
-        assert address1 != address2
+        with pytest.raises(ValueError):
+            wallet.derive_address_at_index("S999", 0)
 
 
 # =============================================================================
-# Seed Phrase Validation Tests
+# Seed Phrase Validation
 # =============================================================================
 
 class TestSeedPhraseValidation:
-    """Test seed phrase validation."""
+    """Only a valid BIP-39 mnemonic may enter the wallet."""
 
-    def test_invalid_seed_phrase_rejected(self):
-        """Invalid seed phrase should be rejected."""
-        with pytest.raises(ValueError):
-            Wallet("these are not valid bip39 words at all", "password")
-
-    def test_11_word_seed_rejected(self):
-        """11-word seed phrase should be rejected."""
-        # Generate 12 words and remove one
-        from eth_account.hdaccount import generate_mnemonic
-        seed = generate_mnemonic(num_words=12, lang="english")
-        words = seed.split()
-        invalid_seed = " ".join(words[:11])
+    @pytest.mark.parametrize("phrase, why", [
+        ("these are not valid bip39 words at all", "not in the wordlist"),
+        ("abandon " * 11, "11 words"),
+        ("abandon " * 13, "13 words"),
+        ("", "empty"),
+        ("   \t\n  ", "whitespace only"),
+    ])
+    def test_invalid_seed_phrase_rejected(self, phrase, why):
+        wallet = VaultWallet.create(PASSWORD)
 
         with pytest.raises(ValueError):
-            Wallet(invalid_seed, "password")
-
-    def test_13_word_seed_rejected(self):
-        """13-word seed phrase should be rejected (must be 12, 15, 18, 21, 24)."""
-        from eth_account.hdaccount import generate_mnemonic
-        seed = generate_mnemonic(num_words=12, lang="english")
-        words = seed.split()
-        # Add an extra valid word
-        invalid_seed = seed + " abandon"
-
-        with pytest.raises(ValueError):
-            Wallet(invalid_seed, "password")
+            wallet.add_seed(phrase.strip() if phrase.strip() else phrase)
 
     def test_24_word_seed_accepted(self):
-        """24-word seed phrase should be accepted."""
+        """24-word seeds are supported alongside 12."""
         from eth_account.hdaccount import generate_mnemonic
-        seed = generate_mnemonic(num_words=24, lang="english")
+        phrase = generate_mnemonic(num_words=24, lang="english")
 
-        wallet = Wallet(seed, "password")
-        assert wallet.seed_phrase == seed
+        wallet = VaultWallet.create(PASSWORD)
+        seed_id = wallet.add_seed(phrase)
 
-    def test_empty_seed_rejected(self):
-        """Empty seed phrase should be rejected."""
-        with pytest.raises((ValueError, Exception)):
-            Wallet("", "password")
+        assert wallet.get_seed_phrase(seed_id) == phrase
 
-    def test_whitespace_only_seed_rejected(self):
-        """Whitespace-only seed phrase should be rejected."""
-        with pytest.raises((ValueError, Exception)):
-            Wallet("   \t\n  ", "password")
+    def test_same_seed_added_twice_is_one_seed(self, valid_seed_phrase):
+        """Adding a seed already held returns the existing id."""
+        wallet = VaultWallet.create(PASSWORD)
+        first = wallet.add_seed(valid_seed_phrase)
+        second = wallet.add_seed(valid_seed_phrase)
+
+        assert first == second
+        assert len(wallet.seeds) == 1
 
 
 # =============================================================================
-# Memory Security Tests
+# Memory Security
 # =============================================================================
 
 class TestMemorySecurity:
-    """Test memory cleanup of sensitive data."""
+    """Locking must leave nothing usable behind."""
 
-    def test_lock_clears_seed_phrase(self, valid_seed_phrase):
-        """Locking wallet should clear seed phrase from memory."""
-        wallet = Wallet(valid_seed_phrase, "password")
-
-        # Verify seed is accessible
-        assert wallet.seed_phrase == valid_seed_phrase
-
-        # Lock wallet
-        wallet.lock()
-
-        # Seed should be cleared
-        assert wallet._seed_phrase is None
-
-    def test_lock_clears_seed_bytes(self, valid_seed_phrase):
-        """Locking wallet should clear seed bytes from memory."""
-        wallet = Wallet(valid_seed_phrase, "password")
-
-        # Lock wallet
-        wallet.lock()
-
-        # Internal seed should be cleared
-        assert wallet._seed is None
-
-    def test_lock_clears_password(self, valid_seed_phrase):
-        """Locking wallet should clear password reference."""
-        wallet = Wallet(valid_seed_phrase, "password")
+    def test_lock_clears_decrypted_seeds(self, valid_seed_phrase):
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        assert wallet.get_seed_phrase(seed_id) == valid_seed_phrase
 
         wallet.lock()
 
-        assert wallet._password is None
+        with pytest.raises(ValueError):
+            wallet.get_seed_phrase(seed_id)
+
+    def test_lock_clears_the_master_key(self, valid_seed_phrase):
+        """Without the master key nothing else in the wallet can be read."""
+        wallet, _ = make_wallet(valid_seed_phrase)
+        assert wallet.data_key is not None
+
+        wallet.lock()
+
+        with pytest.raises(ValueError):
+            _ = wallet.data_key
+
+    def test_lock_prevents_signing(self, valid_seed_phrase):
+        """A locked wallet must not produce a private key."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        addr_id = wallet.addresses[0].id
+
+        wallet.lock()
+
+        with pytest.raises(ValueError, match="locked"):
+            wallet.get_private_key(addr_id)
 
     def test_del_calls_lock(self, valid_seed_phrase):
-        """Wallet destructor should call lock()."""
-        wallet = Wallet(valid_seed_phrase, "password")
-        seed_id = id(wallet._seed_phrase)
+        """Destruction locks, so a dropped reference does not leave secrets."""
+        wallet, seed_id = make_wallet(valid_seed_phrase)
+        wallet.__del__()
 
-        # Delete wallet
-        del wallet
-
-        # Can't easily verify memory is cleared, but at least no crash
+        assert wallet._data_key is None
+        assert wallet._decrypted_seeds == {}
 
 
 # =============================================================================
-# Encryption/Decryption Edge Cases
+# Encryption / Decryption
 # =============================================================================
 
 class TestEncryptionDecryption:
-    """Test encryption and decryption edge cases."""
+    """Round trips under the master key, and passwords that stress the KDF."""
 
     def test_encrypt_decrypt_round_trip(self):
-        """Encrypt then decrypt should return original."""
-        original = "abandon " * 11 + "about"  # Valid seed
-        password = "test_password"
+        key = secrets.token_bytes(32)
+        original = "the quick brown fox jumps over the lazy dog"
 
-        encrypted, iv, tag, salt = encrypt_seed(original, password)
-        decrypted = decrypt_seed(encrypted, iv, tag, salt, password)
+        ciphertext, iv, tag = encrypt_with_key(key, original)
 
-        assert decrypted == original
+        assert decrypt_with_key(key, ciphertext, iv, tag) == original
+
+    def test_wrong_key_rejected(self):
+        ciphertext, iv, tag = encrypt_with_key(secrets.token_bytes(32), "secret")
+
+        with pytest.raises(InvalidTag):
+            decrypt_with_key(secrets.token_bytes(32), ciphertext, iv, tag)
 
     def test_unicode_password_supported(self, valid_seed_phrase, temp_data_dir):
-        """Unicode passwords should work correctly."""
-        wallet_path = temp_data_dir / "unicode.wallet"
-        password = "密码🔐пароль"  # Mixed unicode
+        """Nothing is stripped or normalised, so a passphrase arrives as typed."""
+        wallet_path = temp_data_dir / "test.wallet"
+        password = "пароль密码🔐passphrase"
+        saved_wallet(wallet_path, valid_seed_phrase, password)
 
-        wallet = Wallet(valid_seed_phrase, password)
-        wallet.save(wallet_path)
+        reloaded = VaultWallet.load(wallet_path, password)
 
-        loaded = Wallet.load(wallet_path, password)
-        assert loaded.seed_phrase == valid_seed_phrase
+        assert reloaded.get_seed_phrase(reloaded.seeds[0].id) == valid_seed_phrase
 
     def test_very_long_password(self, valid_seed_phrase, temp_data_dir):
-        """Very long passwords should work."""
-        wallet_path = temp_data_dir / "longpass.wallet"
-        password = "a" * 10000  # 10KB password
+        wallet_path = temp_data_dir / "test.wallet"
+        password = "x" * 1000
+        saved_wallet(wallet_path, valid_seed_phrase, password)
 
-        wallet = Wallet(valid_seed_phrase, password)
-        wallet.save(wallet_path)
+        reloaded = VaultWallet.load(wallet_path, password)
 
-        loaded = Wallet.load(wallet_path, password)
-        assert loaded.seed_phrase == valid_seed_phrase
+        assert reloaded.get_seed_phrase(reloaded.seeds[0].id) == valid_seed_phrase
 
-    def test_empty_password_creates_unencrypted(self, valid_seed_phrase, temp_data_dir):
-        """Empty password should create unencrypted wallet or be rejected."""
-        wallet_path = temp_data_dir / "empty.wallet"
+    def test_whitespace_in_password_is_significant(self, valid_seed_phrase, temp_data_dir):
+        """A pasted passphrase must not be quietly trimmed."""
+        wallet_path = temp_data_dir / "test.wallet"
+        saved_wallet(wallet_path, valid_seed_phrase, "  spaced password  ")
 
-        # Behavior depends on implementation
-        # May create unencrypted wallet or require non-empty password
-        try:
-            wallet = Wallet(valid_seed_phrase, "")
-            wallet.save(wallet_path)
+        with pytest.raises(ValueError):
+            VaultWallet.load(wallet_path, "spaced password")
 
-            # Check if saved as unencrypted
-            with open(wallet_path, 'r') as f:
-                data = json.load(f)
+    def test_derive_key_is_deterministic(self):
+        """Same password and salt, same key - or nothing would ever reopen."""
+        salt = secrets.token_bytes(16)
 
-            # Should either be unencrypted or fail
-        except (ValueError, Exception):
-            pass  # Some implementations reject empty password
+        assert derive_key("a password", salt) == derive_key("a password", salt)
+
+    def test_derive_key_varies_with_salt(self):
+        """Two wallets with one password must not share a key."""
+        assert (derive_key("a password", secrets.token_bytes(16))
+                != derive_key("a password", secrets.token_bytes(16)))
 
 
 # =============================================================================
-# Agent Secret Encryption Tests
+# Agent Secret Encryption
 # =============================================================================
 
 class TestAgentSecretEncryption:
-    """Test agent secret encryption edge cases."""
+    """Agent credentials are encrypted under the wallet's master key, with the
+    agent id bound in as associated data."""
 
     def test_agent_secret_encryption_round_trip(self):
-        """Agent secret encryption should be reversible with correct password."""
         from primer_vault.models.agent import encrypt_agent_secret, decrypt_agent_secret
 
-        secret = secrets.token_hex(32)
-        password = "wallet_password"
-        agent_id = "ABC123"
+        data_key = secrets.token_bytes(32)
+        secret = secrets.token_bytes(32).hex()
 
-        encrypted, iv, tag, salt = encrypt_agent_secret(secret, password, agent_id)
-        decrypted = decrypt_agent_secret(encrypted, iv, tag, salt, password, agent_id)
+        encrypted, iv, tag = encrypt_agent_secret(secret, data_key, "ABC123")
 
-        assert decrypted == secret
+        assert decrypt_agent_secret(encrypted, iv, tag, data_key, "ABC123") == secret
 
-    def test_agent_secret_wrong_password_rejected(self):
-        """Agent secret with wrong password should fail."""
+    def test_agent_secret_wrong_key_rejected(self):
         from primer_vault.models.agent import encrypt_agent_secret, decrypt_agent_secret
 
-        secret = secrets.token_hex(32)
-        agent_id = "ABC123"
+        secret = secrets.token_bytes(32).hex()
+        encrypted, iv, tag = encrypt_agent_secret(secret, secrets.token_bytes(32), "ABC123")
 
-        encrypted, iv, tag, salt = encrypt_agent_secret(secret, "correct", agent_id)
-
-        with pytest.raises(Exception):
-            decrypt_agent_secret(encrypted, iv, tag, salt, "wrong", agent_id)
+        with pytest.raises(InvalidTag):
+            decrypt_agent_secret(encrypted, iv, tag, secrets.token_bytes(32), "ABC123")
 
     def test_agent_secret_wrong_agent_id_rejected(self):
-        """Agent secret with wrong agent_id (AAD) should fail."""
+        """The binding is what stops a credential being moved between agents."""
         from primer_vault.models.agent import encrypt_agent_secret, decrypt_agent_secret
 
-        secret = secrets.token_hex(32)
-        password = "password"
+        data_key = secrets.token_bytes(32)
+        secret = secrets.token_bytes(32).hex()
+        encrypted, iv, tag = encrypt_agent_secret(secret, data_key, "ABC123")
 
-        encrypted, iv, tag, salt = encrypt_agent_secret(secret, password, "AGENT1")
+        with pytest.raises(InvalidTag):
+            decrypt_agent_secret(encrypted, iv, tag, data_key, "XYZ789")
 
-        with pytest.raises(Exception):
-            decrypt_agent_secret(encrypted, iv, tag, salt, password, "AGENT2")
+class TestSavingTheWalletFile:
+    """A save must not create a moment where the wallet is exposed or lost.
 
+    The wallet holds every seed and key, so the two windows an ordinary atomic
+    write closes matter more here than anywhere else: the file must never exist
+    at its real path with default permissions, and it must be on disk before the
+    directory entry points at it. PolicyStore has written this sequence down for
+    a while; the wallet was chmod-ing after the move and never flushing.
+    """
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    def test_a_save_leaves_no_temporary_file_behind(self, temp_data_dir,
+                                                    valid_seed_phrase):
+        path = temp_data_dir / "test.wallet"
+        saved_wallet(path, valid_seed_phrase)
+        assert [f.name for f in temp_data_dir.iterdir()] == ["test.wallet"]
+
+    def test_repeated_saves_leave_no_litter(self, temp_data_dir, valid_seed_phrase):
+        """The old temp name was fixed, so two saves shared one path.
+
+        Two files are the expected steady state: the wallet, and the
+        `.previous` copy each save keeps of the version it replaces (the
+        file-level recovery path for a damaged wallet). Litter means
+        anything beyond those two - orphaned temp files in particular.
+        """
+        path = temp_data_dir / "test.wallet"
+        wallet, _ = saved_wallet(path, valid_seed_phrase)
+        wallet.save(path)
+        wallet.save(path)
+        assert sorted(f.name for f in temp_data_dir.iterdir()) == [
+            "test.wallet", "test.wallet.previous"]
+
+    def test_a_dotted_wallet_name_survives_the_save(self, temp_data_dir,
+                                                    valid_seed_phrase):
+        """`with_suffix` replaces the extension rather than appending, so a
+        name like `my.backup.wallet` needs its temporary file built by
+        appending."""
+        path = temp_data_dir / "my.backup.wallet"
+        saved_wallet(path, valid_seed_phrase)
+
+        assert path.exists()
+        assert [f.name for f in temp_data_dir.iterdir()] == ["my.backup.wallet"]
+        assert VaultWallet.load(path, PASSWORD) is not None
+
+    def test_a_failed_save_leaves_the_previous_wallet_intact(self, temp_data_dir,
+                                                             valid_seed_phrase,
+                                                             monkeypatch):
+        """The failure mode that matters. Writing over the target directly would
+        destroy a good wallet to produce a broken one."""
+        import json as json_module
+
+        path = temp_data_dir / "test.wallet"
+        wallet, _ = saved_wallet(path, valid_seed_phrase)
+        before = path.read_text(encoding="utf-8")
+
+        def out_of_space(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(json_module, "dump", out_of_space)
+        with pytest.raises(OSError):
+            wallet.save(path)
+        monkeypatch.undo()
+
+        assert path.read_text(encoding="utf-8") == before
+        assert VaultWallet.load(path, PASSWORD) is not None
+        assert [f.name for f in temp_data_dir.iterdir()] == ["test.wallet"], (
+            "a half-written wallet was left in the data directory")
+
+    @pytest.mark.skipif(os.name == "nt", reason="Unix permissions only")
+    def test_the_saved_wallet_is_owner_only(self, temp_data_dir, valid_seed_phrase):
+        path = temp_data_dir / "test.wallet"
+        saved_wallet(path, valid_seed_phrase)
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+    @pytest.mark.skipif(os.name == "nt", reason="Unix permissions only")
+    def test_permissions_are_set_before_the_file_takes_its_name(
+            self, temp_data_dir, valid_seed_phrase, monkeypatch):
+        """The ordering, asserted directly rather than through its result.
+
+        Checking the mode afterwards passes either way - chmod-after-replace
+        ends in the same state, having been briefly world-readable at the real
+        path on the way. What has to be true is that the file is already 0600
+        when os.replace runs.
+        """
+        import os as os_module
+
+        path = temp_data_dir / "test.wallet"
+        modes = []
+        real_replace = os_module.replace
+
+        def watched(src, dst, *args, **kwargs):
+            modes.append(os_module.stat(src).st_mode & 0o777)
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(os_module, "replace", watched)
+        saved_wallet(path, valid_seed_phrase)
+        monkeypatch.undo()
+
+        assert modes, "the save did not go through os.replace"
+        assert all(m == 0o600 for m in modes), (
+            f"the wallet was moved into place with mode(s) {[oct(m) for m in modes]}")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "primer-vault"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-custodial execution wallet for AI agents on Robinhood Chain"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,23 +14,38 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
 ]
+# Floors are the versions the test suite runs against, and every one is capped
+# below the next breaking release. This used to be a set of open ranges, which
+# had two consequences worth avoiding for a wallet: a floor years below anything
+# tested meant the metadata *claimed support* for combinations nobody had ever
+# run, and no ceiling meant `pip install primer-vault` could pull a major
+# released that morning. Release binaries are built from requirements.lock and
+# were never exposed to either, but a pip install is not a release binary.
+#
+# Caps are raised deliberately, as a commit, after the suite passes against the
+# new version. Floors here must match the pins in requirements.txt -
+# tests/test_dependency_pinning.py fails if the two drift apart.
+#
+# For 0.x projects the cap is the next minor, because that is where those
+# projects put their breaking changes.
 dependencies = [
-    "cryptography>=42.0.0",
-    "argon2-cffi>=23.1.0",
-    "eth-account>=0.11.0",
-    "mnemonic>=0.20",
-    "eth-keys>=0.5.0",
-    "web3>=6.15.0",
-    "watchdog>=3.0.0",
-    "requests>=2.31.0",
-    "platformdirs>=4.0.0",
-]
-
-[project.optional-dependencies]
-gui = [
-    "PyQt6>=6.6.0",
+    "PyQt6>=6.10,<7",
+    "cryptography>=50.0,<51",
+    "argon2-cffi>=25.1,<26",
+    "eth-account>=0.13.7,<0.14",
+    "mnemonic>=0.21,<0.22",
+    "eth-keys>=0.7,<0.8",
+    # The code uses SignedTransaction.raw_transaction and Contract.encode_abi,
+    # both of which are v7 spellings.
+    "web3>=7.14,<8",
+    "watchdog>=6.0,<7",
+    "requests>=2.33,<3",
+    "platformdirs>=4.10,<5",
+    "ledgereth>=0.10,<0.11",
 ]
 
 [project.scripts]
@@ -38,3 +53,24 @@ primer-vault = "primer_vault:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/primer_vault"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# Deliberately narrow: rules that catch mistakes, not rules that impose a style.
+#
+#   F  pyflakes      — undefined names, unused imports and variables
+#   B  bugbear       — constructs that are usually a bug
+#
+# Style rules (import order, annotation syntax, quoting) are left off on purpose.
+# Turning them on would rewrite most of the tree, and a large mechanical diff
+# buries the small deliberate ones — which is how a real change goes unreviewed.
+# Add a category when someone is willing to fix what it finds, not before.
+select = ["F", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Fixtures legitimately shadow their own names, and a test may import a symbol
+# solely to prove it is importable.
+"tests/*" = ["F811"]

@@ -7,7 +7,6 @@ CommandHandler works identically whether given a direct core or a CoreClient.
 
 import sys
 import time
-import threading
 from pathlib import Path
 
 import pytest

@@ -29,11 +29,6 @@ def temp_data_dir():
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-@pytest.fixture
-def core(temp_data_dir):
-    """Create a Vault instance."""
-    from primer_vault.core import Vault
-    return Vault(data_dir=temp_data_dir)
 
 
 # =============================================================================

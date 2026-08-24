@@ -7,23 +7,16 @@ Contains dialogs for:
 - Wallet management
 """
 
-from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QTextEdit, QGroupBox, QFormLayout, QComboBox,
-    QCheckBox, QListWidget, QListWidgetItem,
-    QDoubleSpinBox, QDialogButtonBox, QAbstractItemView,
-    QApplication, QWidget, QRadioButton, QButtonGroup, QStackedWidget,
-    QGridLayout, QTabWidget, QSpinBox, QGraphicsOpacityEffect
-)
+from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QTextEdit, QGroupBox, QFormLayout, QComboBox, QCheckBox, QListWidget, QListWidgetItem, QDoubleSpinBox, QDialogButtonBox, QAbstractItemView, QApplication, QWidget, QRadioButton, QButtonGroup, QStackedWidget, QTabWidget, QSpinBox, QGraphicsOpacityEffect
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont
 from typing import Optional
 from datetime import datetime
+import logging
 
-from .theme import (
-    Theme, FramelessDialog, FramelessMessageBox,
-    active, status_color, status_token, colored_span, set_role,
-)
+logger = logging.getLogger(__name__)
+
+from .theme import Theme, FramelessDialog, FramelessMessageBox, status_token, colored_span, set_role
 
 # Clipboard auto-clear timeout (seconds)
 # Security: Sensitive data (secrets, private keys, seed phrases) should not
@@ -31,41 +24,117 @@ from .theme import (
 CLIPBOARD_CLEAR_TIMEOUT = 60
 
 
+def _set_clipboard_excluding_history(text: str) -> bool:
+    """Windows only. Put `text` on the clipboard marked to stay out of Clipboard
+    History (Win+V) and Cloud Clipboard sync, using the documented exclusion
+    formats — the mechanism password managers use. A plain copy would otherwise
+    be captured into the history list, which survives any later clear and, with
+    sync on, leaves the machine.
+
+    Returns True only if the whole sequence succeeded. Returns False on any
+    failure — not Windows, the clipboard could not be opened, the platform does
+    not honour the formats — leaving the caller to fall back to an ordinary
+    copy. See docs/security.md.
+    """
+    import sys
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import time
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.RegisterClipboardFormatW.restype = wintypes.UINT
+        user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+        CF_UNICODETEXT = 13
+        GMEM_MOVEABLE = 0x0002
+
+        def alloc(data: bytes):
+            h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not h:
+                raise ctypes.WinError(ctypes.get_last_error())
+            ptr = kernel32.GlobalLock(h)
+            if not ptr:
+                raise ctypes.WinError(ctypes.get_last_error())
+            ctypes.memmove(ptr, data, len(data))
+            kernel32.GlobalUnlock(h)
+            return h
+
+        formats = [user32.RegisterClipboardFormatW(name) for name in (
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "CanIncludeInClipboardHistory",
+            "CanUploadToCloudClipboard")]
+        if not all(formats):
+            return False
+
+        # Retry the open: ownership can be held for an instant by another
+        # process, which returns ACCESS_DENIED.
+        for _ in range(20):
+            if user32.OpenClipboard(None):
+                break
+            time.sleep(0.01)
+        else:
+            return False
+        try:
+            user32.EmptyClipboard()
+            user32.SetClipboardData(
+                CF_UNICODETEXT, alloc(text.encode("utf-16-le") + b"\x00\x00"))
+            for fmt in formats:  # DWORD 0 marks the opt-out under each format
+                user32.SetClipboardData(fmt, alloc(b"\x00\x00\x00\x00"))
+            return True
+        finally:
+            user32.CloseClipboard()
+    except Exception:
+        logger.exception("excluding-from-history clipboard set failed")
+        return False
+
+
 def copy_sensitive_to_clipboard(text: str, parent: QWidget = None, timeout_sec: int = CLIPBOARD_CLEAR_TIMEOUT):
-    """
-    Copy sensitive data to clipboard with auto-clear.
+    """Copy sensitive text (a seed phrase or private key) to the clipboard as
+    safely as the platform allows. Two exposures, two mechanisms:
 
-    Security: Sensitive data like agent secrets, private keys, or seed phrases
-    should not remain in the clipboard indefinitely. This function:
-    1. Copies the text to clipboard
-    2. Schedules automatic clearing after timeout (default 60 seconds)
-    3. Only clears if clipboard still contains our text (user may have copied something else)
+    - The live clipboard is cleared `timeout_sec` after the copy, if it still
+      holds our text (a later copy of something else is left untouched).
+    - Windows Clipboard History and Cloud Clipboard sync are not reachable by
+      that clear, so the copy is marked to stay out of them at the moment it is
+      set (`_set_clipboard_excluding_history`).
 
-    Args:
-        text: Sensitive text to copy
-        parent: Parent widget for notification dialog (optional)
-        timeout_sec: Seconds before auto-clear (default: 60)
-    """
+    Limitations (see docs/security.md): the exclusion is best effort and
+    platform dependent; it covers only copies Vault makes, not text the user
+    re-selects by hand; and other OSes' clipboard managers keep their own
+    history that only the timeout clear addresses."""
     clipboard = QApplication.clipboard()
-    clipboard.setText(text)
+    if not _set_clipboard_excluding_history(text):
+        clipboard.setText(text)
 
-    # Schedule clipboard clear
     def clear_clipboard():
         if clipboard.text() == text:
             clipboard.clear()
 
     QTimer.singleShot(timeout_sec * 1000, clear_clipboard)
 
-    # Show notification if parent available
     if parent:
-        FramelessMessageBox.information(
-            parent,
-            "Copied",
-            f"Data copied to clipboard.\n\nClipboard will auto-clear in {timeout_sec} seconds."
-        )
+        FramelessMessageBox.information(parent, "Copied", "Copied to clipboard.")
 from ..models import SpendPolicy, Agent, TradingRules
-from ..wallet import WalletInfo, Wallet, PrivateKeyWallet, AddressEntry
-from ..networks import NETWORKS, format_address, resolve_network, get_dex
+from ..models.transaction import STATUS_SETTLED
+from ..version import USER_AGENT
+from ..wallet import WalletInfo, AddressEntry
+from ..networks import (NETWORKS, DEFAULT_NETWORK, format_address,
+                        resolve_network, get_dex)
 from ..utils import agent_config_snippet
 
 # Type alias for wallet info objects (both old and new)
@@ -136,7 +205,7 @@ class AgentRegistrationDialog(FramelessDialog):
 
         # Description
         desc = QLabel(
-            "Register an AI agent to use with Vault. Choose a name and"
+            "Register an AI agent to use with Vault. Choose a name and "
             "authentication method for the agent."
         )
         desc.setWordWrap(True)
@@ -476,7 +545,7 @@ class CommissionDialog(FramelessDialog):
         ap2_layout.addWidget(self.upload_registry_checkbox)
 
         mandate_note = QLabel(
-            "An Intent Mandate is a cryptographically signed document that external"
+            "An Intent Mandate is a cryptographically signed document that external "
             "parties can use to verify this agent's spending authorization."
         )
         mandate_note.setWordWrap(True)
@@ -867,7 +936,6 @@ class EditAgentDialog(FramelessDialog):
         """Sort the wallet list by ID or name."""
         self.wallet_sort_by_id = by_id
         self._mark_active_sort(by_id)
-        current_addr = self.selected_wallet_address
         self.populate_wallet_list()
         self.select_current_wallet()
 
@@ -1290,13 +1358,31 @@ class NewPolicyDialog(FramelessDialog):
         form.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._trading_form_container)
 
+        def add_limit(label_text, widget, tooltip):
+            """Add a labelled row, with the explanation on both halves.
+
+            The label is what a user's cursor lands on, so it carries the tooltip
+            too - hovering the words is the natural way to ask what they mean.
+            """
+            label = QLabel(label_text)
+            label.setToolTip(tooltip)
+            widget.setToolTip(tooltip)
+            form.addRow(label, widget)
+
+        # The limits come first and auto-approve last. Auto-approve is a
+        # checkbox with its amount indented beneath it, so anything following it
+        # reads as being part of it - and these limits apply to every trade,
+        # approved by hand or not.
+
         # Per Trade Max
         self.trade_max_input = QDoubleSpinBox()
         self.trade_max_input.setRange(0.01, 100000)
         self.trade_max_input.setDecimals(2)
         self.trade_max_input.setSuffix(" USD")
         self.trade_max_input.setValue(100.0)
-        form.addRow("Per Trade Max:", self.trade_max_input)
+        add_limit("Per Trade Max:", self.trade_max_input,
+                  "The largest single swap, valued in USD.\n"
+                  "A trade worth more than this is refused outright.")
 
         # Daily Volume Limit
         self.trade_daily_input = QDoubleSpinBox()
@@ -1304,10 +1390,57 @@ class NewPolicyDialog(FramelessDialog):
         self.trade_daily_input.setDecimals(2)
         self.trade_daily_input.setSuffix(" USD")
         self.trade_daily_input.setValue(500.0)
-        form.addRow("Daily Volume Limit:", self.trade_daily_input)
+        add_limit("Daily Volume Limit:", self.trade_daily_input,
+                  "Total value this agent may trade in a day. Resets at midnight.\n"
+                  "Trades still waiting for your approval count against it, so a\n"
+                  "queue of them cannot clear the cap together.")
 
-        # Auto-approve checkbox
+        # Min ETH Balance floor
+        self.min_eth_input = QDoubleSpinBox()
+        self.min_eth_input.setRange(0, 10)
+        self.min_eth_input.setDecimals(6)
+        self.min_eth_input.setSuffix(" ETH")
+        self.min_eth_input.setValue(0.0001)
+        add_limit("Min ETH Balance:", self.min_eth_input,
+                  "A trade is blocked if it would take the wallet's ETH below\n"
+                  "this - so an ETH-spending trade cannot empty the balance you\n"
+                  "keep for gas. Gas itself is not reserved on top.\n"
+                  "Set to 0 to turn the check off.")
+
+        # Max Slippage %
+        self.max_slip_input = QDoubleSpinBox()
+        self.max_slip_input.setRange(0.1, 50)
+        self.max_slip_input.setDecimals(1)
+        self.max_slip_input.setSuffix(" %")
+        self.max_slip_input.setValue(3.0)
+        add_limit("Max Slippage:", self.max_slip_input,
+                  "How far the final fill may drift from the price Vault quoted,\n"
+                  "while the transaction waits to be mined. The chain enforces it:\n"
+                  "the swap reverts rather than filling worse.\n\n"
+                  "This is about the price moving, not whether it was good.")
+
+        # Max Price Impact %
+        # Set here and nowhere else: the agent picks the pool, so this is the
+        # user's ceiling on how bad that pick may be.
+        self.max_impact_input = QDoubleSpinBox()
+        self.max_impact_input.setRange(0.1, 100)
+        self.max_impact_input.setDecimals(1)
+        self.max_impact_input.setSuffix(" %")
+        self.max_impact_input.setValue(5.0)
+        add_limit("Max Price Impact:", self.max_impact_input,
+                  "How much worse than the pool's own rate a fill may be, with the\n"
+                  "pool's fee included. Catches a pool too thin for the trade,\n"
+                  "which would otherwise fill at a fraction of what it is worth.\n\n"
+                  "Above this, Vault asks you rather than trading.\n"
+                  "The agent picks the pool, so only you can set this.")
+
+        # Auto-approve checkbox, last: everything above applies either way.
         self.trade_auto_enabled = QCheckBox("Auto-approve trades below:")
+        self.trade_auto_enabled.setToolTip(
+            "Trades under this value go through without asking you.\n"
+            "Everything else waits for your approval - as does any trade that\n"
+            "trips one of the limits above.\n\n"
+            "Leave unticked to be asked about every trade.")
         form.addRow(self.trade_auto_enabled)
 
         # Auto-approve threshold
@@ -1317,23 +1450,8 @@ class NewPolicyDialog(FramelessDialog):
         self.trade_auto_input.setSuffix(" USD")
         self.trade_auto_input.setValue(10.0)
         self.trade_auto_input.setEnabled(False)
+        self.trade_auto_input.setToolTip(self.trade_auto_enabled.toolTip())
         form.addRow("", self.trade_auto_input)
-
-        # Min ETH Reserve
-        self.min_eth_input = QDoubleSpinBox()
-        self.min_eth_input.setRange(0, 10)
-        self.min_eth_input.setDecimals(6)
-        self.min_eth_input.setSuffix(" ETH")
-        self.min_eth_input.setValue(0.0001)
-        form.addRow("Min ETH Reserve:", self.min_eth_input)
-
-        # Max Slippage %
-        self.max_slip_input = QDoubleSpinBox()
-        self.max_slip_input.setRange(0.1, 50)
-        self.max_slip_input.setDecimals(1)
-        self.max_slip_input.setSuffix(" %")
-        self.max_slip_input.setValue(3.0)
-        form.addRow("Max Slippage:", self.max_slip_input)
 
         # Help text
         layout.addStretch()
@@ -1356,6 +1474,7 @@ class NewPolicyDialog(FramelessDialog):
                 self.trade_auto_input.setValue(tr.auto_approve_below_usd)
             self.min_eth_input.setValue(tr.min_reserve_eth)
             self.max_slip_input.setValue(tr.max_slippage_percent)
+            self.max_impact_input.setValue(tr.max_price_impact_percent)
 
         # Connect signals
         self.trading_enabled.toggled.connect(self._on_trading_toggled)
@@ -1573,9 +1692,10 @@ class NewPolicyDialog(FramelessDialog):
                 auto_approve_below_usd=auto_approve,
                 min_reserve_eth=self.min_eth_input.value(),
                 max_slippage_percent=self.max_slip_input.value(),
+                max_price_impact_percent=self.max_impact_input.value(),
             )
 
-        # Networks: always include the default network (4663 - Primer Testnet)
+        # Networks: always include the default network (4663 - Robinhood Chain)
         networks = [4663]
 
         return SpendPolicy.create(
@@ -1594,7 +1714,7 @@ class NewPolicyDialog(FramelessDialog):
         """Return policy parameters as dict for core.create_policy()."""
         name = self.name_input.text().strip()
 
-        # Networks: always include the default network (4663 - Primer Testnet)
+        # Networks: always include the default network (4663 - Robinhood Chain)
         networks = [4663]
 
         # x402 settings
@@ -1626,6 +1746,7 @@ class NewPolicyDialog(FramelessDialog):
                 auto_approve_below_usd=auto_approve,
                 min_reserve_eth=self.min_eth_input.value(),
                 max_slippage_percent=self.max_slip_input.value(),
+                max_price_impact_percent=self.max_impact_input.value(),
             )
 
         return {
@@ -1736,7 +1857,6 @@ class SettingsDialog(FramelessDialog):
         logging_desc.setProperty("role", "muted")
         logging_layout.addRow(logging_desc)
 
-        from PyQt6.QtWidgets import QSpinBox
 
         self.log_lines_input = QSpinBox()
         self.log_lines_input.setRange(0, 10000)
@@ -1784,7 +1904,11 @@ class SettingsDialog(FramelessDialog):
 
         self.replay_window_input = QSpinBox()
         self.replay_window_input.setRange(30, 600)  # 30 seconds to 10 minutes
-        self.replay_window_input.setValue(self._settings.get("replay_window_seconds", 300))
+        # From the core, which is what the signing service enforces. Read from
+        # the GUI's own settings file, this box showed one number while a
+        # different one was in force, and OK wrote the displayed one back.
+        self.replay_window_input.setValue(
+            self.core.get_max_request_age() if self.core else 300)
         self.replay_window_input.setSuffix(" sec")
         self.replay_window_input.setToolTip("How long signed requests remain valid (30-600 seconds)")
         self.replay_window_input.setMaximumWidth(100)
@@ -1792,19 +1916,34 @@ class SettingsDialog(FramelessDialog):
         security_layout.addRow("Replay window:", self.replay_window_input)
 
         # Admin API access mode
-        admin_api_desc = QLabel("Control which processes can access the admin API.")
+        admin_api_desc = QLabel(
+            "Lets a separate CLI process drive this running instance. Most people "
+            "never need to change this - CLI commands already work on the default "
+            "whenever Vault is not already open."
+        )
         admin_api_desc.setWordWrap(True)
         admin_api_desc.setProperty("role", "muted")
         security_layout.addRow(admin_api_desc)
 
         from ..core.settings import ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY
         self.admin_api_mode_combo = QComboBox()
-        self.admin_api_mode_combo.addItem("Open (any local process)", ADMIN_API_MODE_OPEN)
-        self.admin_api_mode_combo.addItem("GUI Only (block CLI/tools)", ADMIN_API_MODE_GUI_ONLY)
+        # Default first: the safe setting should read as the ordinary choice, not
+        # as the one that blocks things. currentData() is used to read the value
+        # back, so this order is presentation only.
+        self.admin_api_mode_combo.addItem("Vault window only (default)", ADMIN_API_MODE_GUI_ONLY)
+        self.admin_api_mode_combo.addItem("Open to local processes", ADMIN_API_MODE_OPEN)
+        self.admin_api_mode_combo.setToolTip(
+            "Vault window only - admin commands come from this window alone.\n\n"
+            "Open to local processes - any program running under your user account "
+            "can also use port 4664 to create agents and read their tokens, set "
+            "policies, and approve requests. While the wallet is unlocked those go "
+            "through without a prompt. For power users driving Vault from scripts "
+            "on a machine they control."
+        )
         # Set current value from settings if core is available
         if self.core:
             current_mode = self.core.settings_manager.get_admin_api_mode()
-            index = 0 if current_mode == ADMIN_API_MODE_OPEN else 1
+            index = 1 if current_mode == ADMIN_API_MODE_OPEN else 0
             self.admin_api_mode_combo.setCurrentIndex(index)
         self.admin_api_mode_combo.currentIndexChanged.connect(self._on_setting_changed)
         security_layout.addRow("Admin API:", self.admin_api_mode_combo)
@@ -1906,21 +2045,28 @@ class NetworkSettingsDialog(FramelessDialog):
         agent_group = QGroupBox("Agent Link")
         agent_layout = QFormLayout(agent_group)
 
-        from PyQt6.QtWidgets import QSpinBox
         from ..core.settings import DEFAULT_PORT
 
         # Port input with server button on same row
         port_row = QHBoxLayout()
+        # The port comes from the core, which is where `vault config set port`
+        # and the daemon read it too - one copy, so the window and a headless
+        # run cannot listen on different ports. "Custom" is not a stored
+        # setting - it is simply whether the port is not the default, which
+        # cannot drift out of step with the port itself.
+        configured_port = self.core.settings_manager.get_default_port()
+        is_custom_port = configured_port != DEFAULT_PORT
+
         self.port_input = QSpinBox()
         self.port_input.setRange(1024, 65535)
-        self.port_input.setValue(self._settings.get("server_port", DEFAULT_PORT))
+        self.port_input.setValue(configured_port)
         self.port_input.setMaximumWidth(80)
-        self.port_input.setEnabled(self._settings.get("custom_port_enabled", False))
+        self.port_input.setEnabled(is_custom_port)
         self.port_input.valueChanged.connect(self._on_setting_changed)
         port_row.addWidget(self.port_input)
 
         self.custom_port_checkbox = QCheckBox("Custom")
-        self.custom_port_checkbox.setChecked(self._settings.get("custom_port_enabled", False))
+        self.custom_port_checkbox.setChecked(is_custom_port)
         self.custom_port_checkbox.stateChanged.connect(self._on_custom_port_toggled)
         port_row.addWidget(self.custom_port_checkbox)
 
@@ -1961,7 +2107,10 @@ class NetworkSettingsDialog(FramelessDialog):
         rpc_row = QHBoxLayout()
         self.rpc_input = QLineEdit()
         self.rpc_input.setPlaceholderText(DEFAULT_RHC_RPC)
-        self.rpc_input.setText(self._settings.get("rhc_rpc", ""))
+        # From the core settings, which is what every chain call resolves
+        # through, so what this box shows is what a chain call will use.
+        self.rpc_input.setText(
+            self.core.settings_manager.get_rpc_endpoint(DEFAULT_NETWORK) or "")
         self.rpc_input.setFont(QFont(Theme.MONO_FONT, 9))
         self.rpc_input.textChanged.connect(self._on_setting_changed)
         rpc_row.addWidget(self.rpc_input)
@@ -1981,7 +2130,10 @@ class NetworkSettingsDialog(FramelessDialog):
         # Rate limit
         self.rate_limit_input = QSpinBox()
         self.rate_limit_input.setRange(0, 1000)
-        self.rate_limit_input.setValue(self._settings.get("rate_limit", 300))
+        # Also the core's: the ceiling protects the agent server, which the
+        # daemon runs too. Stored in the GUI's settings file it reached nothing
+        # - the limiter kept its built-in 300 whatever was typed here.
+        self.rate_limit_input.setValue(self.core.settings_manager.get_rate_limit())
         self.rate_limit_input.setSuffix(" req/min")
         self.rate_limit_input.setToolTip("0 = unlimited")
         self.rate_limit_input.setMaximumWidth(120)
@@ -1995,57 +2147,43 @@ class NetworkSettingsDialog(FramelessDialog):
         self.verify_checkbox.stateChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("", self.verify_checkbox)
 
-        # Uniswap v3 contract addresses (read-only by default, Edit button enables editing)
+        # Uniswap v3 contract addresses, shown so they can be checked against
+        # a block explorer.
+        #
+        # Read-only, and deliberately so. The trading path takes these
+        # addresses from the network registry, and they stay uneditable here:
+        # the router is the contract a swap approves to move tokens, and a box
+        # that repoints it is a way to lose funds to a typo or to a persuasive
+        # stranger.
         uniswap_label = QLabel("Uniswap v3 Addresses")
         uniswap_label.setProperty("role", "muted")
         advanced_layout.addRow(uniswap_label)
 
-        # Read-only address fields are greyed by the QLineEdit:read-only QSS rule;
-        # toggling setReadOnly() alone drives the styling.
+        # Read-only fields are greyed by the QLineEdit:read-only QSS rule.
 
         # Factory address
         self.uniswap_factory_input = QLineEdit()
-        self.uniswap_factory_input.setText(self._settings.get("uniswap_factory", RHC_UNISWAP_FACTORY))
+        self.uniswap_factory_input.setText(RHC_UNISWAP_FACTORY)
         self.uniswap_factory_input.setFont(QFont(Theme.MONO_FONT, 9))
         self.uniswap_factory_input.setToolTip("Uniswap v3 Factory contract (used for status check)")
         self.uniswap_factory_input.setReadOnly(True)
-        self.uniswap_factory_input.textChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("Factory:", self.uniswap_factory_input)
 
         # QuoterV2 address
         self.uniswap_quoter_input = QLineEdit()
-        self.uniswap_quoter_input.setText(self._settings.get("uniswap_quoter", RHC_UNISWAP_QUOTER_V2))
+        self.uniswap_quoter_input.setText(RHC_UNISWAP_QUOTER_V2)
         self.uniswap_quoter_input.setFont(QFont(Theme.MONO_FONT, 9))
         self.uniswap_quoter_input.setToolTip("Uniswap v3 QuoterV2 contract")
         self.uniswap_quoter_input.setReadOnly(True)
-        self.uniswap_quoter_input.textChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("QuoterV2:", self.uniswap_quoter_input)
 
         # SwapRouter02 address
         self.uniswap_router_input = QLineEdit()
-        self.uniswap_router_input.setText(self._settings.get("uniswap_router", RHC_UNISWAP_ROUTER))
+        self.uniswap_router_input.setText(RHC_UNISWAP_ROUTER)
         self.uniswap_router_input.setFont(QFont(Theme.MONO_FONT, 9))
         self.uniswap_router_input.setToolTip("Uniswap v3 SwapRouter02 contract")
         self.uniswap_router_input.setReadOnly(True)
-        self.uniswap_router_input.textChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("Router:", self.uniswap_router_input)
-
-        # Edit and Reset buttons for addresses
-        addr_btn_row = QHBoxLayout()
-        self.edit_addresses_btn = QPushButton("Edit")
-        self.edit_addresses_btn.setMaximumWidth(60)
-        self.edit_addresses_btn.clicked.connect(self._toggle_address_editing)
-        self._addresses_editable = False
-        addr_btn_row.addWidget(self.edit_addresses_btn)
-
-        self.reset_addresses_btn = QPushButton("Reset")
-        self.reset_addresses_btn.setMaximumWidth(60)
-        self.reset_addresses_btn.setToolTip("Reset to default Uniswap v3 addresses")
-        self.reset_addresses_btn.clicked.connect(self._reset_addresses)
-        addr_btn_row.addWidget(self.reset_addresses_btn)
-        addr_btn_row.addStretch()
-
-        advanced_layout.addRow("", addr_btn_row)
 
         layout.addWidget(advanced_group)
 
@@ -2129,36 +2267,6 @@ class NetworkSettingsDialog(FramelessDialog):
         """Handle any setting change."""
         self._changed = True
 
-    def _toggle_address_editing(self):
-        """Toggle edit mode for Uniswap addresses.
-
-        The QLineEdit:read-only QSS rule handles the greyed-out look, so we only
-        flip setReadOnly() and re-polish so the pseudo-state restyles at once.
-        """
-        self._addresses_editable = not self._addresses_editable
-
-        for field in (self.uniswap_factory_input,
-                      self.uniswap_quoter_input,
-                      self.uniswap_router_input):
-            field.setReadOnly(not self._addresses_editable)
-            style = field.style()
-            if style is not None:
-                style.unpolish(field)
-                style.polish(field)
-
-        # Update button text
-        if self._addresses_editable:
-            self.edit_addresses_btn.setText("Lock")
-        else:
-            self.edit_addresses_btn.setText("Edit")
-
-    def _reset_addresses(self):
-        """Reset Uniswap addresses to hardcoded defaults."""
-        self.uniswap_factory_input.setText(RHC_UNISWAP_FACTORY)
-        self.uniswap_quoter_input.setText(RHC_UNISWAP_QUOTER_V2)
-        self.uniswap_router_input.setText(RHC_UNISWAP_ROUTER)
-        self._changed = True
-
     def _check_rhc_connection(self):
         """Check RHC RPC connectivity in background (eth_blockNumber call)."""
         import threading
@@ -2176,7 +2284,7 @@ class NetworkSettingsDialog(FramelessDialog):
                     data=json.dumps({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}).encode(),
                     headers={
                         "Content-Type": "application/json",
-                        "User-Agent": "PrimerVault/1.0",
+                        "User-Agent": USER_AGENT,
                     }
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
@@ -2231,7 +2339,7 @@ class NetworkSettingsDialog(FramelessDialog):
                     data=json.dumps(call_data).encode(),
                     headers={
                         "Content-Type": "application/json",
-                        "User-Agent": "PrimerVault/1.0",
+                        "User-Agent": USER_AGENT,
                     }
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
@@ -2261,19 +2369,25 @@ class NetworkSettingsDialog(FramelessDialog):
             set_role(self.dex_status_label, status="error")
 
     def get_settings(self) -> dict:
-        """Return the modified settings."""
+        """Return the modified settings.
+
+        Only things the user can actually change. The Uniswap addresses are
+        displayed, not edited, so they are not settings and are not returned;
+        `server_port` and `rate_limit` are the core's, and the caller writes
+        them there rather than to the GUI's file.
+        """
         from ..core.settings import DEFAULT_PORT
+
         return {
-            "server_port": self.port_input.value(),
-            "custom_port_enabled": self.custom_port_checkbox.isChecked(),
+            # Unticking "Custom" means the default port, whatever the spinbox
+            # happens to be showing.
+            "server_port": (self.port_input.value()
+                            if self.custom_port_checkbox.isChecked() else DEFAULT_PORT),
             "allow_lan": self.allow_lan_checkbox.isChecked(),
             "auto_start_server": self.auto_start_checkbox.isChecked(),
             "rhc_rpc": self.rpc_input.text().strip(),
             "rate_limit": self.rate_limit_input.value(),
             "verify_settlements": self.verify_checkbox.isChecked(),
-            "uniswap_factory": self.uniswap_factory_input.text().strip() or RHC_UNISWAP_FACTORY,
-            "uniswap_quoter": self.uniswap_quoter_input.text().strip() or RHC_UNISWAP_QUOTER_V2,
-            "uniswap_router": self.uniswap_router_input.text().strip() or RHC_UNISWAP_ROUTER,
         }
 
     def has_changes(self) -> bool:
@@ -2338,8 +2452,18 @@ class TransactionDetailDialog(FramelessDialog):
             info_layout.addRow("Token In:", QLabel(f"{getattr(tx, 'symbol_in', '?')}"))
             info_layout.addRow("Amount In:", QLabel(f"{getattr(tx, 'amount_in', '?')}"))
             info_layout.addRow("Token Out:", QLabel(f"{getattr(tx, 'symbol_out', '?')}"))
+            # Quoted and filled are both shown, because the gap between them is
+            # the only place the cost of the pool becomes visible after the
+            # fact. A settled trade normally has both; a blank fill means the
+            # receipt could not be read, not that nothing arrived.
+            quoted = getattr(tx, 'amount_out_quoted', None)
             amt_out = getattr(tx, 'amount_out', None)
-            info_layout.addRow("Amount Out:", QLabel(f"{amt_out}" if amt_out else "pending"))
+            if tx.status == STATUS_SETTLED:
+                filled_text = f"{amt_out}" if amt_out else "could not be read"
+            else:
+                filled_text = f"{amt_out}" if amt_out else "pending"
+            info_layout.addRow("Amount Out (quoted):", QLabel(f"{quoted}" if quoted else "-"))
+            info_layout.addRow("Amount Out (filled):", QLabel(filled_text))
             info_layout.addRow("Fee Tier:", QLabel(f"{getattr(tx, 'fee_tier', '?')} bps"))
             pool = getattr(tx, 'pool', None)
             if pool:
@@ -2512,6 +2636,10 @@ class TransactionDetailDialog(FramelessDialog):
             return colored_span("✗ Failed on-chain", "error")
         elif status == "not_found":
             return colored_span("✗ Not found on-chain", "error")
+        elif status == "unavailable":
+            detail = getattr(self.tx, "verification_detail", None)
+            suffix = f" ({detail})" if detail else ""
+            return colored_span(f"? Could not check{suffix}", "pending")
         elif status == "pending":
             return colored_span("⏳ Verifying...", "pending")
         else:
@@ -2868,12 +2996,12 @@ class MandateViewerDialog(FramelessDialog):
 class ExportKeysDialog(FramelessDialog):
     """Dialog for exporting private keys and seed phrases."""
 
-    def __init__(self, wallets: list[WalletInfoLike], get_wallet_fn, parent=None):
+    def __init__(self, wallets: list[AddressEntry], get_wallet_fn, parent=None):
         """
         Initialize the export keys dialog.
 
         Args:
-            wallets: List of WalletInfo objects for available wallets
+            wallets: List of AddressEntry objects for available addresses
             get_wallet_fn: Function to get an unlocked wallet by address
             parent: Parent widget
         """
@@ -2911,13 +3039,12 @@ class ExportKeysDialog(FramelessDialog):
 
         self.address_combo = QComboBox()
         self.address_combo.setFont(QFont(Theme.MONO_FONT, 9))
-        for wallet_info in wallets:
-            addr_short = format_address(wallet_info.address)
-            entry_id = getattr(wallet_info, 'wallet_id', None) or getattr(wallet_info, 'id', '')
-            self.address_combo.addItem(
-                f"{entry_id}  {wallet_info.name}  ({addr_short})",
-                wallet_info
-            )
+        for entry in wallets:
+            addr_short = format_address(entry.address)
+            label = f"{entry.id}  {entry.name}  ({addr_short})"
+            if entry.is_hardware:
+                label += f"  [{entry.device_label}]"
+            self.address_combo.addItem(label, entry)
         self.address_combo.currentIndexChanged.connect(self._on_address_changed)
         layout.addWidget(self.address_combo)
 
@@ -2975,32 +3102,53 @@ class ExportKeysDialog(FramelessDialog):
 
     def _on_address_changed(self):
         """Handle address selection change."""
-        wallet_info = self.address_combo.currentData()
-        if not wallet_info:
+        entry = self.address_combo.currentData()
+        if not entry:
             return
 
-        # Check if this is an HD wallet (has seed) or private key wallet
-        wallet = self.get_wallet_fn(wallet_info.address)
-        if wallet:
-            is_hd = hasattr(wallet, 'seed_phrase') and wallet.seed_phrase is not None
-            self.export_seed_checkbox.setEnabled(is_hd)
-            if is_hd:
+        if entry.is_hardware:
+            # The device holds the key; there is nothing to export.
+            self.export_pkey_checkbox.setEnabled(False)
+            self.export_pkey_checkbox.setChecked(False)
+            self.export_pkey_checkbox.setText(
+                f"Private Key (held on {entry.device_label} device)"
+            )
+            self.export_seed_checkbox.setEnabled(False)
+            self.export_seed_checkbox.setChecked(False)
+            self.export_seed_checkbox.setText("Seed Phrase (not available - hardware wallet)")
+        else:
+            self.export_pkey_checkbox.setEnabled(True)
+            self.export_pkey_checkbox.setChecked(True)
+            self.export_pkey_checkbox.setText("Private Key (hex)")
+            if entry.seed_id is not None:
+                self.export_seed_checkbox.setEnabled(True)
                 self.export_seed_checkbox.setText("Seed Phrase")
             else:
-                self.export_seed_checkbox.setText("Seed Phrase (not available - private key wallet)")
+                self.export_seed_checkbox.setEnabled(False)
                 self.export_seed_checkbox.setChecked(False)
+                self.export_seed_checkbox.setText(
+                    "Seed Phrase (not available - imported private key)"
+                )
 
         # Clear output when address changes
         self.output_text.clear()
 
     def _reveal_keys(self):
         """Reveal the selected keys."""
-        wallet_info = self.address_combo.currentData()
-        if not wallet_info:
+        entry = self.address_combo.currentData()
+        if not entry:
             FramelessMessageBox.warning(self, "Error", "No address selected.")
             return
 
-        wallet = self.get_wallet_fn(wallet_info.address)
+        if entry.is_hardware:
+            FramelessMessageBox.information(
+                self, "Hardware Address",
+                f"The private key for {entry.id} is held on the "
+                f"{entry.device_label} device and cannot be exported."
+            )
+            return
+
+        wallet = self.get_wallet_fn(entry.address)
         if not wallet:
             FramelessMessageBox.warning(
                 self, "Error",
@@ -3020,35 +3168,14 @@ class ExportKeysDialog(FramelessDialog):
             return
 
         output_lines = []
-        output_lines.append(f"Address: {wallet_info.address}")
-        output_lines.append(f"Name: {wallet_info.name}")
+        output_lines.append(f"Address: {entry.address}")
+        output_lines.append(f"Name: {entry.name}")
         output_lines.append("")
 
         # Export private key
         if self.export_pkey_checkbox.isChecked():
             try:
-                # Find the address index for HD wallets
-                if hasattr(wallet, '_addresses'):
-                    # HD wallet - find the index from derivation path
-                    pkey = None
-                    for addr in wallet._addresses:
-                        if addr.address.lower() == wallet_info.address.lower():
-                            # Extract index from path like "m/44'/60'/0'/0/0"
-                            path_parts = addr.path.split('/')
-                            if path_parts:
-                                try:
-                                    index = int(path_parts[-1])
-                                    pkey = wallet.get_private_key(index)
-                                except ValueError:
-                                    pkey = wallet.get_private_key(0)
-                            break
-                    if pkey is None:
-                        # Fallback to index 0
-                        pkey = wallet.get_private_key(0)
-                else:
-                    # Private key wallet
-                    pkey = wallet.get_private_key(0)
-
+                pkey = wallet.get_private_key(entry.id)
                 output_lines.append("Private Key:")
                 output_lines.append(f"0x{pkey.hex()}")
                 output_lines.append("")
@@ -3059,11 +3186,10 @@ class ExportKeysDialog(FramelessDialog):
         # Export seed phrase
         if self.export_seed_checkbox.isChecked() and self.export_seed_checkbox.isEnabled():
             try:
-                seed = wallet.seed_phrase
-                if seed:
-                    output_lines.append("Seed Phrase:")
-                    output_lines.append(seed)
-                    output_lines.append("")
+                seed = wallet.get_seed_phrase(entry.seed_id)
+                output_lines.append("Seed Phrase:")
+                output_lines.append(seed)
+                output_lines.append("")
             except Exception as e:
                 output_lines.append(f"Error getting seed phrase: {e}")
                 output_lines.append("")
@@ -3082,819 +3208,20 @@ class ExportKeysDialog(FramelessDialog):
 
         copy_sensitive_to_clipboard(text, self)
 
-
-# ============================================
-# Withdraw USDG Dialog
-# ============================================
-
-class WithdrawUSDGDialog(FramelessDialog):
-    """Dialog for withdrawing USDG from a wallet (requires gas)."""
-
-    def __init__(
-        self,
-        wallet_entry: AddressEntry,
-        balance: float,
-        get_private_key_fn,
-        chain_id: int,
-        parent=None
-    ):
-        """
-        Initialize the withdraw dialog.
-
-        Args:
-            wallet_entry: The AddressEntry for the source wallet
-            balance: Current USDG balance
-            get_private_key_fn: Function to get private key by address_id
-            chain_id: Chain ID for the transaction
-            parent: Parent widget
-        """
-        super().__init__(f"Withdraw USDG - {wallet_entry.id}", parent, width=450)
-        self.setFixedHeight(420)
-        self.wallet_entry = wallet_entry
-        self.balance = balance
-        self.get_private_key_fn = get_private_key_fn
-        self.chain_id = chain_id
-
-        layout = self.content_layout
-        layout.setSpacing(12)
-
-        # Source info
-        source_group = QGroupBox("Source")
-        source_layout = QFormLayout(source_group)
-
-        addr_label = QLabel(wallet_entry.address)
-        addr_label.setFont(QFont(Theme.MONO_FONT, 9))
-        addr_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        source_layout.addRow("Address:", addr_label)
-
-        balance_label = QLabel(f"{balance:.6f} USDG")
-        balance_label.setProperty("role", "strong")
-        source_layout.addRow("Balance:", balance_label)
-
-        network = NETWORKS.get(chain_id)
-        network_label = QLabel(network.display_name if network else f"Chain {chain_id}")
-        source_layout.addRow("Network:", network_label)
-
-        layout.addWidget(source_group)
-
-        # Warning about gas
-        warning_box = QGroupBox()
-        warning_box.setObjectName("warningBox")
-        warning_layout = QVBoxLayout(warning_box)
-        warning_text = QLabel(
-            "This transaction requires gas. Ensure the source wallet has "
-            f"sufficient {network.native_symbol if network else 'native token'} for gas fees."
-        )
-        warning_text.setWordWrap(True)
-        warning_text.setProperty("role", "warn")
-        warning_layout.addWidget(warning_text)
-        layout.addWidget(warning_box)
-
-        # Destination
-        dest_group = QGroupBox("Destination")
-        dest_layout = QFormLayout(dest_group)
-
-        self.dest_input = QLineEdit()
-        self.dest_input.setPlaceholderText("0x...")
-        self.dest_input.setFont(QFont(Theme.MONO_FONT, 9))
-        dest_layout.addRow("Address:", self.dest_input)
-
-        layout.addWidget(dest_group)
-
-        # Amount
-        amount_group = QGroupBox("Amount")
-        amount_layout = QFormLayout(amount_group)
-
-        self.amount_input = QDoubleSpinBox()
-        self.amount_input.setDecimals(6)  # USDG has 6 decimals
-        self.amount_input.setMinimum(0.000001)
-        self.amount_input.setMaximum(balance)
-        self.amount_input.setValue(balance)
-        self.amount_input.setSuffix(" USDG")
-        amount_layout.addRow("Amount:", self.amount_input)
-
-        max_btn = QPushButton("Max")
-        max_btn.clicked.connect(lambda: self.amount_input.setValue(balance))
-        amount_layout.addRow("", max_btn)
-
-        layout.addWidget(amount_group)
-
-        # Export key link
-        export_link = QLabel('<a href="#">Export private key to use with external wallet</a>')
-        export_link.setOpenExternalLinks(False)
-        export_link.linkActivated.connect(self._export_key)
-        export_link.setProperty("role", "muted")
-        layout.addWidget(export_link)
-
-        # Status area (hidden by default)
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        self.status_label.setVisible(False)
-        layout.addWidget(self.status_label)
-
-        # Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        self.send_btn = QPushButton("Send USDG")
-        self.send_btn.setDefault(True)
-        self.send_btn.clicked.connect(self._execute_withdraw)
-        btn_layout.addWidget(self.send_btn)
-
-        layout.addLayout(btn_layout)
-
-    def _export_key(self):
-        """Export the private key for this wallet."""
-        if not FramelessMessageBox.question(
-            self,
-            "Export Private Key",
-            "Are you sure you want to export the private key?\n\n"
-            "Anyone with this key can access all funds in this wallet.\n"
-            "Never share it with anyone.",
-            default_no=True
-        ):
-            return
-
-        try:
-            pkey = self.get_private_key_fn(self.wallet_entry.id)
-            if pkey:
-                # Convert bytes to hex string if needed
-                if isinstance(pkey, bytes):
-                    pkey = "0x" + pkey.hex()
-                copy_sensitive_to_clipboard(pkey, self)
-        except Exception as e:
-            FramelessMessageBox.critical(self, "Error", f"Failed to export key: {e}")
-
-    def _execute_withdraw(self):
-        """Execute the USDG transfer."""
-        # Validate destination
-        dest = self.dest_input.text().strip()
-        if not dest or not dest.startswith("0x") or len(dest) != 42:
-            FramelessMessageBox.warning(self, "Invalid Address", "Please enter a valid destination address.")
-            return
-
-        amount = self.amount_input.value()
-        if amount <= 0 or amount > self.balance:
-            FramelessMessageBox.warning(self, "Invalid Amount", "Please enter a valid amount.")
-            return
-
-        # Confirm
-        if not FramelessMessageBox.question(
-            self,
-            "Confirm Transfer",
-            f"Send {amount:.6f} USDG to:\n\n"
-            f"{dest[:20]}...{dest[-8:]}\n\n"
-            "This will use gas from the source wallet.\n"
-            "Continue?",
-            default_no=True
-        ):
-            return
-
-        self.send_btn.setEnabled(False)
-        self.send_btn.setText("Sending...")
-        self.status_label.setText("Preparing transaction...")
-        self.status_label.setVisible(True)
-        QApplication.processEvents()
-
-        try:
-            from web3 import Web3
-            from ..networks import TOKENS
-
-            network = NETWORKS.get(self.chain_id)
-            if not network:
-                raise ValueError(f"Network not found: {self.chain_id}")
-
-            usdg_config = TOKENS.get("USDG")
-            if not usdg_config or self.chain_id not in usdg_config.addresses:
-                raise ValueError(f"USDG not configured for chain {self.chain_id}")
-
-            usdg_address = usdg_config.addresses[self.chain_id]
-            # Use Decimal to avoid floating point errors, then floor to ensure we don't exceed balance
-            from decimal import Decimal, ROUND_DOWN
-            amount_decimal = Decimal(str(amount)).quantize(Decimal('0.000001'), rounding=ROUND_DOWN)
-            amount_raw = int(amount_decimal * 1_000_000)
-
-            # Get private key
-            pkey = self.get_private_key_fn(self.wallet_entry.id)
-            if not pkey:
-                raise ValueError("Could not retrieve private key")
-
-            # Connect to network
-            w3 = Web3(Web3.HTTPProvider(network.rpc_url))
-            if not w3.is_connected():
-                raise ValueError(f"Could not connect to {network.display_name}")
-
-            # ERC-20 transfer ABI
-            erc20_abi = [
-                {
-                    "constant": False,
-                    "inputs": [
-                        {"name": "_to", "type": "address"},
-                        {"name": "_value", "type": "uint256"}
-                    ],
-                    "name": "transfer",
-                    "outputs": [{"name": "", "type": "bool"}],
-                    "type": "function"
-                }
-            ]
-
-            contract = w3.eth.contract(
-                address=Web3.to_checksum_address(usdg_address),
-                abi=erc20_abi
-            )
-
-            # Build transaction
-            from_addr = Web3.to_checksum_address(self.wallet_entry.address)
-            to_addr = Web3.to_checksum_address(dest)
-
-            self.status_label.setText("Estimating gas...")
-            QApplication.processEvents()
-
-            nonce = w3.eth.get_transaction_count(from_addr)
-            gas_price = w3.eth.gas_price
-
-            tx = contract.functions.transfer(to_addr, amount_raw).build_transaction({
-                'from': from_addr,
-                'nonce': nonce,
-                'gasPrice': gas_price,
-                'chainId': self.chain_id,
-            })
-
-            # Estimate gas
-            try:
-                gas_estimate = w3.eth.estimate_gas(tx)
-                tx['gas'] = int(gas_estimate * 1.2)  # 20% buffer
-            except Exception as e:
-                raise ValueError(f"Gas estimation failed: {e}")
-
-            self.status_label.setText("Signing transaction...")
-            QApplication.processEvents()
-
-            # Sign and send
-            from eth_account import Account
-            account = Account.from_key(pkey)
-            signed_tx = account.sign_transaction(tx)
-
-            self.status_label.setText("Broadcasting transaction...")
-            QApplication.processEvents()
-
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            tx_hash_hex = tx_hash.hex()
-
-            self.status_label.setText(f"Transaction sent: {tx_hash_hex[:16]}...")
-            self.status_label.setProperty("role", "success")
-
-            # Show success with explorer link
-            explorer_url = f"{network.explorer_url}/tx/0x{tx_hash_hex}"
-            FramelessMessageBox.information(
-                self,
-                "Transaction Sent",
-                f"USDG transfer submitted!\n\n"
-                f"Amount: {amount:.6f} USDG\n"
-                f"To: {dest[:16]}...{dest[-8:]}\n\n"
-                f"Transaction: {tx_hash_hex[:16]}...\n\n"
-                f"View on explorer:\n{explorer_url}"
-            )
-
-            self.accept()
-
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            self.status_label.setProperty("role", "error")
-            FramelessMessageBox.critical(self, "Transfer Failed", str(e))
-
-        finally:
-            self.send_btn.setEnabled(True)
-            self.send_btn.setText("Send USDG")
-
-
-# ============================================
-# Sweep USDG Dialog
-# ============================================
-
-class SweepUSDGDialog(FramelessDialog):
-    """
-    Dialog for sweeping USDG from multiple donor addresses to a single recipient.
-    Uses EIP-3009 transferWithAuthorization so sponsor pays all gas.
-    """
-
-    def __init__(
-        self,
-        parent: QWidget,
-        addresses: list,  # List of AddressEntry objects
-        get_private_key_fn,  # Function(address_id) -> bytes
-        chain_id: int,
-    ):
-        super().__init__("Sweep USDG", parent, width=550)
-        self.setMinimumHeight(500)
-        self.addresses = addresses
-        self.get_private_key_fn = get_private_key_fn
-        self.chain_id = chain_id
-
-        self._setup_ui()
-        self._refresh_balances()
-
-    def _setup_ui(self):
-        layout = self.content_layout
-
-        # Network selector
-        network_layout = QHBoxLayout()
-        network_layout.addWidget(QLabel("Network:"))
-        self.network_combo = QComboBox()
-        from ..networks import NETWORKS
-        for cid, network in NETWORKS.items():
-            self.network_combo.addItem(network.display_name, cid)
-            if cid == self.chain_id:
-                self.network_combo.setCurrentIndex(self.network_combo.count() - 1)
-        self.network_combo.currentIndexChanged.connect(self._on_network_changed)
-        self.network_combo.setFixedWidth(180)
-        network_layout.addWidget(self.network_combo)
-        network_layout.addStretch()
-        layout.addLayout(network_layout)
-
-        # Sponsor (pays gas)
-        sponsor_group = QGroupBox("Sponsor (pays gas)")
-        sponsor_layout = QFormLayout(sponsor_group)
-        self.sponsor_combo = QComboBox()
-        self.sponsor_combo.setFont(QFont(Theme.MONO_FONT, 9))
-        sponsor_layout.addRow("Address:", self.sponsor_combo)
-        self.sponsor_balance_label = QLabel("")
-        self.sponsor_balance_label.setProperty("role", "muted")
-        sponsor_layout.addRow("", self.sponsor_balance_label)
-        layout.addWidget(sponsor_group)
-
-        # Recipient
-        recipient_group = QGroupBox("Recipient (receives all USDG)")
-        recipient_layout = QVBoxLayout(recipient_group)
-
-        self.use_internal_radio = QRadioButton("Use wallet address")
-        self.use_internal_radio.setChecked(True)
-        self.use_internal_radio.toggled.connect(self._on_recipient_mode_changed)
-        recipient_layout.addWidget(self.use_internal_radio)
-
-        self.recipient_combo = QComboBox()
-        self.recipient_combo.setFont(QFont(Theme.MONO_FONT, 9))
-        recipient_layout.addWidget(self.recipient_combo)
-
-        self.use_external_radio = QRadioButton("Use external address")
-        self.use_external_radio.toggled.connect(self._on_recipient_mode_changed)
-        recipient_layout.addWidget(self.use_external_radio)
-
-        self.external_input = QLineEdit()
-        self.external_input.setPlaceholderText("0x...")
-        self.external_input.setFont(QFont(Theme.MONO_FONT, 9))
-        self.external_input.setEnabled(False)
-        recipient_layout.addWidget(self.external_input)
-
-        layout.addWidget(recipient_group)
-
-        # Donors (sources)
-        donor_group = QGroupBox("Donors (sweep FROM these addresses)")
-        donor_layout = QVBoxLayout(donor_group)
-
-        # Select all / deselect all
-        btn_row = QHBoxLayout()
-        select_all_btn = QPushButton("Select All")
-        select_all_btn.clicked.connect(self._select_all_donors)
-        btn_row.addWidget(select_all_btn)
-
-        deselect_all_btn = QPushButton("Deselect All")
-        deselect_all_btn.clicked.connect(self._deselect_all_donors)
-        btn_row.addWidget(deselect_all_btn)
-
-        btn_row.addStretch()
-
-        self.total_label = QLabel("Selected: 0.000000 USDG")
-        self.total_label.setProperty("role", "total")
-        btn_row.addWidget(self.total_label)
-
-        donor_layout.addLayout(btn_row)
-
-        # Donor list with checkboxes
-        self.donor_list = QListWidget()
-        self.donor_list.setFont(QFont(Theme.MONO_FONT, 9))
-        self.donor_list.setMinimumHeight(150)
-        self.donor_list.itemChanged.connect(self._on_donor_selection_changed)
-        donor_layout.addWidget(self.donor_list)
-
-        layout.addWidget(donor_group)
-
-        # Status
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        self.status_label.setVisible(False)
-        layout.addWidget(self.status_label)
-
-        # Progress (hidden by default)
-        self.progress_label = QLabel("")
-        self.progress_label.setVisible(False)
-        layout.addWidget(self.progress_label)
-
-        # Buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
-
-        self.sweep_btn = QPushButton("Sweep USDG")
-        self.sweep_btn.setDefault(True)
-        self.sweep_btn.clicked.connect(self._execute_sweep)
-        btn_layout.addWidget(self.sweep_btn)
-
-        layout.addLayout(btn_layout)
-
-    def _on_network_changed(self):
-        """Handle network change."""
-        self.chain_id = self.network_combo.currentData()
-        self._refresh_balances()
-
-    def _on_recipient_mode_changed(self):
-        """Toggle between internal and external recipient."""
-        use_internal = self.use_internal_radio.isChecked()
-        self.recipient_combo.setEnabled(use_internal)
-        self.external_input.setEnabled(not use_internal)
-
-    def _refresh_balances(self):
-        """Refresh all balance displays for current network."""
-        from ..networks import NETWORKS, BalanceFetcher, TOKENS
-        from web3 import Web3
-
-        network = NETWORKS.get(self.chain_id)
-        if not network:
-            return
-
-        # Clear and repopulate combos
-        self.sponsor_combo.clear()
-        self.recipient_combo.clear()
-        self.donor_list.clear()
-
-        self._balances = {}  # address -> (usdg_balance, native_balance)
-
-        try:
-            fetcher = BalanceFetcher(network)
-            usdg_config = TOKENS.get("USDG")
-            usdg_addr = usdg_config.addresses.get(self.chain_id) if usdg_config else None
-
-            for addr_entry in self.addresses:
-                address = addr_entry.address
-                try:
-                    balances = fetcher.get_all_balances(address)
-                    native_bal = 0.0
-                    usdg_bal = 0.0
-                    usdg_raw = 0
-                    native_failed = False
-                    usdg_failed = False
-
-                    for bal in balances:
-                        if bal.symbol == network.native_symbol:
-                            native_bal = bal.formatted
-                            native_failed = bal.fetch_failed
-                        elif bal.symbol == "USDG":
-                            usdg_bal = bal.formatted
-                            usdg_raw = bal.raw
-                            usdg_failed = bal.fetch_failed
-
-                    self._balances[address] = {
-                        'native': native_bal,
-                        'usdg': usdg_bal,
-                        'usdg_raw': usdg_raw,
-                        'entry': addr_entry,
-                        'native_failed': native_failed,
-                        'usdg_failed': usdg_failed,
-                    }
-
-                    short_addr = f"{address[:8]}...{address[-6:]}"
-                    name = addr_entry.name if addr_entry.name else ""
-                    name_display = f" [{name}]" if name else ""
-
-                    # Sponsor combo - show name + native balance or "--" if failed
-                    if native_failed:
-                        sponsor_text = f"{short_addr}{name_display}  (-- {network.native_symbol})"
-                    else:
-                        sponsor_text = f"{short_addr}{name_display}  ({native_bal:.6f} {network.native_symbol})"
-                    self.sponsor_combo.addItem(sponsor_text, address)
-
-                    # Recipient combo - show name
-                    self.recipient_combo.addItem(f"{short_addr}{name_display}", address)
-
-                    # Donor list - show name + USDG balance or "--" if failed
-                    if usdg_failed:
-                        item = QListWidgetItem(f"{short_addr}{name_display}    -- USDG (RPC error)")
-                        item.setForeground(Qt.GlobalColor.red)
-                    else:
-                        item = QListWidgetItem(f"{short_addr}{name_display}    {usdg_bal:.6f} USDG")
-                        # Gray out if confirmed zero
-                        if usdg_bal == 0:
-                            item.setForeground(Qt.GlobalColor.gray)
-                    item.setData(Qt.ItemDataRole.UserRole, address)
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    # Auto-check if has USDG (and fetch succeeded)
-                    item.setCheckState(Qt.CheckState.Checked if usdg_bal > 0 and not usdg_failed else Qt.CheckState.Unchecked)
-                    self.donor_list.addItem(item)
-
-                except Exception as e:
-                    # Still add to combos even if balance fetch fails entirely
-                    short_addr = f"{address[:8]}...{address[-6:]}"
-                    name = addr_entry.name if addr_entry.name else ""
-                    name_display = f" [{name}]" if name else ""
-                    self.sponsor_combo.addItem(f"{short_addr}{name_display}  (-- RPC error)", address)
-                    self.recipient_combo.addItem(f"{short_addr}{name_display}", address)
-                    self._balances[address] = {
-                        'native': 0.0,
-                        'usdg': 0.0,
-                        'usdg_raw': 0,
-                        'entry': addr_entry,
-                        'native_failed': True,
-                        'usdg_failed': True,
-                    }
-                    # Add to donor list with error indicator
-                    item = QListWidgetItem(f"{short_addr}{name_display}    -- USDG (RPC error)")
-                    item.setData(Qt.ItemDataRole.UserRole, address)
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    item.setCheckState(Qt.CheckState.Unchecked)
-                    item.setForeground(Qt.GlobalColor.red)
-                    self.donor_list.addItem(item)
-
-            self._update_totals()
-
-        except Exception as e:
-            # If fetcher fails entirely, still populate addresses without balances
-            for addr_entry in self.addresses:
-                address = addr_entry.address
-                short_addr = f"{address[:8]}...{address[-6:]}"
-                name = addr_entry.name if addr_entry.name else ""
-                name_display = f" [{name}]" if name else ""
-                self.sponsor_combo.addItem(f"{short_addr}{name_display}  (RPC error)", address)
-                self.recipient_combo.addItem(f"{short_addr}{name_display}", address)
-                self._balances[address] = {
-                    'native': 0.0,
-                    'usdg': 0.0,
-                    'usdg_raw': 0,
-                    'entry': addr_entry
-                }
-            FramelessMessageBox.warning(self, "Error", f"Failed to fetch balances: {e}")
-
-    def _select_all_donors(self):
-        """Select all donors with non-zero balance."""
-        for i in range(self.donor_list.count()):
-            item = self.donor_list.item(i)
-            addr = item.data(Qt.ItemDataRole.UserRole)
-            if addr in self._balances and self._balances[addr]['usdg'] > 0:
-                item.setCheckState(Qt.CheckState.Checked)
-        self._update_totals()
-
-    def _deselect_all_donors(self):
-        """Deselect all donors."""
-        for i in range(self.donor_list.count()):
-            item = self.donor_list.item(i)
-            item.setCheckState(Qt.CheckState.Unchecked)
-        self._update_totals()
-
-    def _on_donor_selection_changed(self, item):
-        """Handle donor checkbox change."""
-        self._update_totals()
-
-    def _update_totals(self):
-        """Update the total selected amount."""
-        total = 0.0
-        count = 0
-        for i in range(self.donor_list.count()):
-            item = self.donor_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                addr = item.data(Qt.ItemDataRole.UserRole)
-                if addr in self._balances:
-                    total += self._balances[addr]['usdg']
-                    count += 1
-
-        self.total_label.setText(f"Selected: {count} addresses, {total:.6f} USDG")
-        self.sweep_btn.setText(f"Sweep {total:.6f} USDG")
-        self.sweep_btn.setEnabled(count > 0 and total > 0)
-
-    def _get_selected_donors(self) -> list:
-        """Get list of selected donor addresses with balances."""
-        donors = []
-        for i in range(self.donor_list.count()):
-            item = self.donor_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                addr = item.data(Qt.ItemDataRole.UserRole)
-                if addr in self._balances and self._balances[addr]['usdg_raw'] > 0:
-                    donors.append({
-                        'address': addr,
-                        'entry': self._balances[addr]['entry'],
-                        'usdg_raw': self._balances[addr]['usdg_raw'],
-                        'usdg': self._balances[addr]['usdg']
-                    })
-        return donors
-
-    def _execute_sweep(self):
-        """Execute the sweep operation."""
-        from ..networks import NETWORKS, TOKENS
-        from web3 import Web3
-        from eth_account import Account
-        from ..services.eip3009 import sign_transfer_authorization
-        import secrets
-        import time
-
-        # Get inputs
-        sponsor_addr = self.sponsor_combo.currentData()
-        if not sponsor_addr:
-            FramelessMessageBox.warning(self, "Error", "Please select a sponsor address.")
-            return
-
-        if self.use_internal_radio.isChecked():
-            recipient_addr = self.recipient_combo.currentData()
-        else:
-            recipient_addr = self.external_input.text().strip()
-
-        if not recipient_addr or not recipient_addr.startswith("0x") or len(recipient_addr) != 42:
-            FramelessMessageBox.warning(self, "Error", "Please enter a valid recipient address.")
-            return
-
-        donors = self._get_selected_donors()
-        if not donors:
-            FramelessMessageBox.warning(self, "Error", "Please select at least one donor address.")
-            return
-
-        # Confirm
-        total_usdg = sum(d['usdg'] for d in donors)
-        if not FramelessMessageBox.question(
-            self,
-            "Confirm Sweep",
-            f"Sweep {total_usdg:.6f} USDG from {len(donors)} address(es)\n\n"
-            f"To: {recipient_addr[:16]}...{recipient_addr[-8:]}\n"
-            f"Gas paid by: {sponsor_addr[:16]}...{sponsor_addr[-8:]}\n\n"
-            "This will execute multiple transactions. Continue?",
-            default_no=True
-        ):
-            return
-
-        # Disable UI
-        self.sweep_btn.setEnabled(False)
-        self.sweep_btn.setText("Sweeping...")
-        self.status_label.setVisible(True)
-        self.progress_label.setVisible(True)
-
-        try:
-            network = NETWORKS.get(self.chain_id)
-            usdg_config = TOKENS.get("USDG")
-            usdg_address = usdg_config.addresses.get(self.chain_id)
-
-            if not network or not usdg_address:
-                raise ValueError("Network or USDG not configured")
-
-            # Connect to network
-            w3 = Web3(Web3.HTTPProvider(network.rpc_url))
-            if not w3.is_connected():
-                raise ValueError(f"Could not connect to {network.display_name}")
-
-            # Get sponsor private key
-            sponsor_entry = self._balances[sponsor_addr]['entry']
-            sponsor_pkey = self.get_private_key_fn(sponsor_entry.id)
-            if not sponsor_pkey:
-                raise ValueError("Could not get sponsor private key")
-            if isinstance(sponsor_pkey, bytes):
-                sponsor_pkey = "0x" + sponsor_pkey.hex()
-
-            sponsor_account = Account.from_key(sponsor_pkey)
-
-            # USDG contract ABI for transferWithAuthorization
-            twa_abi = [{
-                "inputs": [
-                    {"name": "from", "type": "address"},
-                    {"name": "to", "type": "address"},
-                    {"name": "value", "type": "uint256"},
-                    {"name": "validAfter", "type": "uint256"},
-                    {"name": "validBefore", "type": "uint256"},
-                    {"name": "nonce", "type": "bytes32"},
-                    {"name": "v", "type": "uint8"},
-                    {"name": "r", "type": "bytes32"},
-                    {"name": "s", "type": "bytes32"}
-                ],
-                "name": "transferWithAuthorization",
-                "outputs": [],
-                "stateMutability": "nonpayable",
-                "type": "function"
-            }]
-
-            usdg_contract = w3.eth.contract(
-                address=Web3.to_checksum_address(usdg_address),
-                abi=twa_abi
-            )
-
-            # Process each donor
-            successful = 0
-            failed = 0
-            tx_hashes = []
-
-            for idx, donor in enumerate(donors):
-                self.progress_label.setText(f"Processing {idx + 1}/{len(donors)}: {donor['address'][:10]}...")
-                QApplication.processEvents()
-
-                try:
-                    # Get donor private key
-                    donor_pkey = self.get_private_key_fn(donor['entry'].id)
-                    if not donor_pkey:
-                        raise ValueError("Could not get donor private key")
-                    if isinstance(donor_pkey, bytes):
-                        donor_pkey = "0x" + donor_pkey.hex()
-
-                    # Sign authorization
-                    now = int(time.time())
-                    valid_after = now - 60
-                    valid_before = now + 3600
-                    nonce_bytes = secrets.token_bytes(32)
-
-                    signature = sign_transfer_authorization(
-                        private_key=donor_pkey,
-                        chain_id=self.chain_id,
-                        token_address=usdg_address,
-                        token_name="USD Coin",
-                        token_version="2",
-                        from_address=donor['address'],
-                        to_address=recipient_addr,
-                        value=donor['usdg_raw'],
-                        valid_after=valid_after,
-                        valid_before=valid_before,
-                        nonce=nonce_bytes
-                    )
-
-                    # Parse signature into v, r, s
-                    sig_bytes = bytes.fromhex(signature[2:] if signature.startswith("0x") else signature)
-                    r = sig_bytes[:32]
-                    s = sig_bytes[32:64]
-                    v = sig_bytes[64]
-
-                    # Build transaction from sponsor
-                    nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(sponsor_addr))
-                    gas_price = w3.eth.gas_price
-
-                    tx = usdg_contract.functions.transferWithAuthorization(
-                        Web3.to_checksum_address(donor['address']),
-                        Web3.to_checksum_address(recipient_addr),
-                        donor['usdg_raw'],
-                        valid_after,
-                        valid_before,
-                        nonce_bytes,
-                        v,
-                        r,
-                        s
-                    ).build_transaction({
-                        'from': Web3.to_checksum_address(sponsor_addr),
-                        'nonce': nonce,
-                        'gasPrice': gas_price,
-                        'chainId': self.chain_id,
-                    })
-
-                    # Estimate gas
-                    gas_estimate = w3.eth.estimate_gas(tx)
-                    tx['gas'] = int(gas_estimate * 1.2)
-
-                    # Sign and send
-                    signed_tx = sponsor_account.sign_transaction(tx)
-                    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                    tx_hashes.append(tx_hash.hex())
-                    successful += 1
-
-                    self.status_label.setText(f"Sent: ${donor['usdg']:.6f} from {donor['address'][:10]}...")
-                    self.status_label.setProperty("role", "accent")
-
-                except Exception as e:
-                    failed += 1
-                    self.status_label.setText(f"Failed: {donor['address'][:10]}... - {e}")
-                    self.status_label.setProperty("role", "error")
-
-                QApplication.processEvents()
-
-            # Summary
-            self.progress_label.setText(f"Complete: {successful} successful, {failed} failed")
-
-            if successful > 0:
-                FramelessMessageBox.information(
-                    self,
-                    "Sweep Complete",
-                    f"Successfully swept {successful} address(es).\n"
-                    f"Failed: {failed}\n\n"
-                    f"Transactions:\n" + "\n".join(tx_hashes[:5]) +
-                    ("\n..." if len(tx_hashes) > 5 else "")
-                )
-                self.accept()
-            else:
-                FramelessMessageBox.warning(self, "Sweep Failed", "All transfers failed.")
-
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            self.status_label.setProperty("role", "error")
-            FramelessMessageBox.critical(self, "Sweep Failed", str(e))
-
-        finally:
-            self.sweep_btn.setEnabled(True)
-            self.sweep_btn.setText("Sweep USDG")
+    def scrub(self):
+        """Blank the revealed key/seed; see utils.scrub_dialog for why."""
+        from ..utils import scrub_dialog
+        scrub_dialog(self)
+
+    def close(self):
+        # accept()/reject() hide the dialog, and Qt does not deliver a
+        # closeEvent to a hidden widget - so scrub on close() itself too.
+        self.scrub()
+        return super().close()
+
+    def closeEvent(self, event):
+        self.scrub()
+        super().closeEvent(event)
 
 
 # ============================================
@@ -3934,6 +3261,7 @@ class SendDialog(FramelessDialog):
         chain_id: int,
         preselect_from: str = None,  # Pre-select this From address
         preselect_asset: str = None,  # Pre-select this asset symbol
+        rpc_url: str = None,  # Effective endpoint from core; None uses the built-in one
     ):
         super().__init__("Send", parent, width=480)
         self.setMinimumHeight(420)
@@ -3941,6 +3269,7 @@ class SendDialog(FramelessDialog):
         self.balances_by_address = balances_by_address
         self.get_private_key_fn = get_private_key_fn
         self.chain_id = chain_id
+        self._rpc_url = rpc_url
         self.preselect_from = preselect_from
         self.preselect_asset = preselect_asset
 
@@ -4116,23 +3445,19 @@ class SendDialog(FramelessDialog):
             self.amount_input.setMaximum(bal.formatted)
             self.amount_input.setSuffix(f" {bal.symbol}")
 
-            # Set decimals based on asset
-            if bal.symbol in ("ETH",):
-                self.amount_input.setDecimals(8)
-            elif bal.symbol in ("USDG", "USDT"):
-                self.amount_input.setDecimals(6)
-            else:
-                self.amount_input.setDecimals(min(bal.decimals, 8))
+            # Input precision from the token's decimals, not its symbol: a token
+            # that merely calls itself "USDG" must not borrow USDG's 6 dp. Capped
+            # at 8 for a sane spinbox step.
+            self.amount_input.setDecimals(min(bal.decimals, 8))
 
         self._update_gas_line()
 
     def _start_gas_fetch(self):
         """Kick off a background fetch of the current gas price."""
-        from ..networks import NETWORKS
         network = NETWORKS.get(self.chain_id)
         if not network:
             return
-        self._gas_fetcher = _GasPriceFetcher(network.rpc_url, self)
+        self._gas_fetcher = _GasPriceFetcher(self._rpc_url or network.rpc_url, self)
         self._gas_fetcher.done.connect(self._on_gas_price)
         self._gas_fetcher.start()
 
@@ -4143,12 +3468,11 @@ class SendDialog(FramelessDialog):
 
     def _update_gas_line(self):
         """Show an always-present network-fee estimate below the fields."""
-        from ..networks import NETWORKS
         network = NETWORKS.get(self.chain_id)
         native = network.native_symbol if network else "ETH"
 
         bal = self.asset_combo.currentData()
-        is_native = bool(bal) and bal.symbol == native
+        is_native = bool(bal) and bal.is_native
         # Rough transfer gas: native send vs ERC-20 transfer
         gas_limit = 21000 if is_native else 65000
 
@@ -4206,14 +3530,23 @@ class SendDialog(FramelessDialog):
             return
 
         # Confirm
-        from ..networks import NETWORKS
         network = NETWORKS.get(self.chain_id)
         network_name = network.display_name if network else f"Chain {self.chain_id}"
 
+        # Show exactly what the transfer will move: the same 8-dp quantized
+        # value the send path computes. ',.8g' rounded to 8 SIGNIFICANT digits
+        # (the 9th digit of a large amount changed silently) and rendered big
+        # balances in scientific notation.
+        from decimal import Decimal
+        amount_str = (f"{Decimal(str(amount)).quantize(Decimal('0.00000001')):,f}"
+                      .rstrip("0").rstrip("."))
+        # Show the contract address for an ERC-20; the native coin has none.
+        asset_line = (f"{amount_str} {asset.symbol}" if asset.is_native
+                      else f"{amount_str} {asset.symbol}\nToken: {asset.token_address}")
         if not FramelessMessageBox.question(
             self,
             "Confirm Send",
-            f"Send {amount:,.8g} {asset.symbol} to:\n\n"
+            f"Send {asset_line} to:\n\n"
             f"{to_addr[:16]}...{to_addr[-8:]}\n\n"
             f"From: {entry.name}\n"
             f"Network: {network_name}\n\n"
@@ -4231,13 +3564,12 @@ class SendDialog(FramelessDialog):
         try:
             from web3 import Web3
             from eth_account import Account
-            from decimal import Decimal, ROUND_DOWN
 
             if not network:
                 raise ValueError(f"Network not found: {self.chain_id}")
 
             # Connect to network
-            w3 = Web3(Web3.HTTPProvider(network.rpc_url))
+            w3 = Web3(Web3.HTTPProvider(self._rpc_url or network.rpc_url))
             if not w3.is_connected():
                 raise ValueError(f"Could not connect to {network.display_name}")
 
@@ -4251,7 +3583,8 @@ class SendDialog(FramelessDialog):
 
             account = Account.from_key(pkey)
 
-            if asset.symbol == network.native_symbol:
+            # Route on is_native, not the display symbol.
+            if asset.is_native:
                 # Native token transfer (ETH)
                 self._send_native(w3, account, from_checksum, to_checksum, amount, asset, network)
             else:
@@ -4295,7 +3628,7 @@ class SendDialog(FramelessDialog):
             gas_estimate = w3.eth.estimate_gas(tx)
             tx['gas'] = int(gas_estimate * 1.2)  # 20% buffer
         except Exception as e:
-            raise ValueError(f"Gas estimation failed: {e}")
+            raise ValueError(f"Gas estimation failed: {e}") from e
 
         self.status_label.setText("Signing transaction...")
         QApplication.processEvents()
@@ -4338,14 +3671,13 @@ class SendDialog(FramelessDialog):
 
         token_address = asset.token_address
 
-        # Convert amount to raw units
-        amount_decimal = Decimal(str(amount)).quantize(
-            Decimal(10) ** (-asset.decimals),
-            rounding=ROUND_DOWN
-        )
-        amount_raw = int(amount_decimal * (10 ** asset.decimals))
-
-        # ERC-20 transfer ABI
+        # ERC-20 ABI: transfer, plus decimals() so the amount is scaled by the
+        # token contract's own decimals rather than the block explorer's. The two
+        # usually agree, but the explorer's value is metadata that can be stale or
+        # missing (networks.py substitutes 18 when it cannot read it); when they
+        # differ, scaling by the wrong one signs a quantity the user never saw.
+        # The displayed number is what was approved - it must be signed in the
+        # units the contract will actually interpret.
         erc20_abi = [
             {
                 "constant": False,
@@ -4356,6 +3688,13 @@ class SendDialog(FramelessDialog):
                 "name": "transfer",
                 "outputs": [{"name": "", "type": "bool"}],
                 "type": "function"
+            },
+            {
+                "constant": True,
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"name": "", "type": "uint8"}],
+                "type": "function"
             }
         ]
 
@@ -4363,6 +3702,22 @@ class SendDialog(FramelessDialog):
             address=w3.to_checksum_address(token_address),
             abi=erc20_abi
         )
+
+        # Decimals from the contract, not the indexer-supplied Balance.
+        try:
+            token_decimals = int(contract.functions.decimals().call())
+        except Exception as e:
+            token_decimals = asset.decimals
+            logger.warning(
+                "Could not read decimals() from %s; falling back to the "
+                "indexer's value %d: %s", token_address, token_decimals, e)
+
+        # Convert amount to raw units using the contract's decimals
+        amount_decimal = Decimal(str(amount)).quantize(
+            Decimal(10) ** (-token_decimals),
+            rounding=ROUND_DOWN
+        )
+        amount_raw = int(amount_decimal * (10 ** token_decimals))
 
         self.status_label.setText("Estimating gas...")
         QApplication.processEvents()
@@ -4382,7 +3737,7 @@ class SendDialog(FramelessDialog):
             gas_estimate = w3.eth.estimate_gas(tx)
             tx['gas'] = int(gas_estimate * 1.2)  # 20% buffer
         except Exception as e:
-            raise ValueError(f"Gas estimation failed: {e}")
+            raise ValueError(f"Gas estimation failed: {e}") from e
 
         self.status_label.setText("Signing transaction...")
         QApplication.processEvents()
@@ -4456,8 +3811,11 @@ class AddressDetailsDialog(FramelessDialog):
         addr_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         info_layout.addRow("Address:", addr_label)
 
-        # Source info
-        if entry.seed_id:
+        # Source info. Hardware addresses have no seed_id either, so they must
+        # be checked before falling through to the imported-key case.
+        if entry.is_hardware:
+            source_text = f"{entry.device_label} ({entry.device_path})"
+        elif entry.seed_id:
             source_text = f"Derived from {entry.seed_id}, index #{entry.index}"
         else:
             source_text = "Imported private key"
@@ -4531,3 +3889,72 @@ class AddressDetailsDialog(FramelessDialog):
         if FramelessMessageBox.question(self, "Delete Address", warning_msg, default_no=True):
             self.on_delete()
             self.accept()
+
+
+class TradeProgressDialog(FramelessDialog):
+    """Shown while an approved trade executes.
+
+    Execution is not quick: the pool is re-quoted, an ERC-20 approval may be
+    submitted and waited on, the swap is simulated, and then the swap itself is
+    submitted and waited on. Each wait is a block confirmation, so the whole
+    thing runs from a few seconds to a few minutes. Somebody who has just
+    authorised money to move needs to see that it is under way, or they will
+    reasonably conclude the app has died.
+
+    Deliberately has no Cancel: once a transaction is broadcast there is nothing
+    left to cancel, and offering the button would say otherwise. The dialog also
+    refuses to close early, so the caller can never be left waiting on a worker
+    with no window to report into.
+    """
+
+    def __init__(self, summary: str, parent=None):
+        """
+        Args:
+            summary: One-line description of the trade, e.g. "10 USDG -> WETH"
+        """
+        super().__init__("Executing Trade", parent)
+        self.setFixedWidth(400)
+
+        self._closable = False
+
+        layout = self.content_layout
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 24, 24, 24)
+
+        heading = QLabel(summary)
+        heading.setProperty("role", "heading")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+
+        note = QLabel(
+            "Waiting for the network to confirm.\n"
+            "This can take a minute or two."
+        )
+        note.setProperty("role", "muted")
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(note)
+
+        layout.addSpacing(8)
+
+        self.status_label = QLabel("Submitting...")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        layout.addStretch()
+
+    def set_status(self, text: str, is_error: bool = False):
+        """Update the status line as the trade moves through its steps."""
+        self.status_label.setText(text)
+        self.status_label.setProperty("role", "error" if is_error else "")
+        set_role(self.status_label)
+
+    def allow_close(self):
+        """Permit the dialog to close. Called once the trade has finished."""
+        self._closable = True
+
+    def reject(self):
+        """Ignore the close button and Escape while the trade is in flight."""
+        if self._closable:
+            super().reject()

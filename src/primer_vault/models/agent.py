@@ -19,24 +19,75 @@ import hmac
 import hashlib
 import secrets
 import string
-from datetime import datetime, date, timezone
-from dataclasses import dataclass, asdict, field
+from datetime import datetime, date, timedelta, timezone
+from dataclasses import dataclass, asdict
 from typing import Optional
 
-# Encryption imports (same as wallet encryption)
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from argon2.low_level import hash_secret_raw, Type
+
+from ..wallet.crypto import AES_IV_SIZE
+from ..version import __version__
 
 
-# ============================================
-# Encryption Constants (same as wallet/crypto.py)
-# ============================================
+def encrypt_with_key_aad(key: bytes, plaintext: str, aad: str) -> tuple[str, str, str]:
+    """Encrypt under a raw key, binding `aad` so the ciphertext is not portable."""
+    iv = secrets.token_bytes(AES_IV_SIZE)
+    blob = AESGCM(key).encrypt(iv, plaintext.encode('utf-8'), aad.encode('utf-8'))
+    return blob[:-16].hex(), iv.hex(), blob[-16:].hex()
 
-ARGON2_TIME_COST = 3
-ARGON2_MEMORY_COST = 65536  # 64 MB
-ARGON2_PARALLELISM = 4
-ARGON2_HASH_LEN = 32  # 256 bits for AES-256
-AES_IV_SIZE = 12  # 96 bits (recommended for GCM)
+
+def decrypt_with_key_aad(key: bytes, ciphertext_hex: str, iv_hex: str,
+                         tag_hex: str, aad: str) -> str:
+    """Decrypt a value produced by encrypt_with_key_aad."""
+    blob = bytes.fromhex(ciphertext_hex) + bytes.fromhex(tag_hex)
+    return AESGCM(key).decrypt(
+        bytes.fromhex(iv_hex), blob, aad.encode('utf-8')).decode('utf-8')
+
+
+#: Least time that must pass before an allowance renews.
+#:
+#: The reset is deliberately keyed to the local day, because "my daily limit"
+#: means the user's day - a limit renewing at four in the afternoon because that
+#: is midnight UTC reads as broken. Timestamps stay UTC, since a record has to be
+#: comparable to a chain and to other machines.
+#:
+#: A local day is 23 to 25 hours, so requiring 20 clears every legitimate one
+#: while refusing the shortcuts: a clock set back, or a laptop carried across
+#: enough timezones, would otherwise hand out a second allowance the same day.
+MIN_HOURS_BETWEEN_RESETS = 20
+
+
+def daily_allowance_is_due(last_date: str, last_at: str) -> bool:
+    """True if a new daily allowance should start now.
+
+    Two conditions, and both are needed:
+
+    - the local date has moved *forward* past the one recorded. Comparing for
+      mere inequality also fired when the date moved back, so a clock correction
+      or a flight west renewed the allowance;
+    - at least MIN_HOURS_BETWEEN_RESETS have passed since the last renewal. The
+      date alone cannot see this, and without it a flight east crosses midnight
+      early and renews after a few hours.
+
+    Args:
+        last_date: local date of the last reset, ISO (may be empty)
+        last_at: UTC instant of the last reset, ISO (may be empty)
+    """
+    today = date.today().isoformat()
+    if not last_date:
+        return True
+    if today <= last_date:
+        return False
+    if not last_at:
+        # No instant recorded, so elapsed time cannot be checked. Renew rather
+        # than refuse: refusing would never renew, since the instant is only
+        # written by a renewal.
+        return True
+    try:
+        elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(last_at)
+    except ValueError:
+        return True
+    return elapsed >= timedelta(hours=MIN_HOURS_BETWEEN_RESETS)
 
 
 def generate_agent_id() -> str:
@@ -127,54 +178,29 @@ def hash_bearer_token(token: str) -> str:
 # Agent Secret Encryption
 # ============================================
 
-def _derive_key(password: str, salt: bytes) -> bytes:
-    """Derive an encryption key from password using Argon2id."""
-    return hash_secret_raw(
-        secret=password.encode('utf-8'),
-        salt=salt,
-        time_cost=ARGON2_TIME_COST,
-        memory_cost=ARGON2_MEMORY_COST,
-        parallelism=ARGON2_PARALLELISM,
-        hash_len=ARGON2_HASH_LEN,
-        type=Type.ID
-    )
-
-
-def encrypt_agent_secret(shared_secret_hex: str, password: str, agent_id: str) -> tuple[str, str, str, str]:
+def encrypt_agent_secret(shared_secret_hex: str, data_key: bytes, agent_id: str) -> tuple[str, str, str]:
     """
-    Encrypt an agent's shared secret with a password.
+    Encrypt an agent's shared secret under the wallet's master key.
+
+    The master key is used rather than the wallet password, so changing the
+    password re-wraps that key and leaves this ciphertext valid.
 
     Args:
         shared_secret_hex: The shared secret to encrypt (hex string)
-        password: The encryption password (typically wallet password)
-        agent_id: The agent ID, used as AAD to bind ciphertext to this agent
+        data_key: The unlocked wallet's master key
+        agent_id: The agent ID, bound in as associated data
 
     Returns:
-        (encrypted_hex, iv_hex, tag_hex, salt_hex)
+        (encrypted_hex, iv_hex, tag_hex)
     """
-    salt = secrets.token_bytes(16)
-    key = _derive_key(password, salt)
-    iv = secrets.token_bytes(AES_IV_SIZE)
-
-    # Use agent_id as Associated Authenticated Data (AAD) for domain separation
-    # This ensures the ciphertext can only be decrypted for this specific agent
-    aad = agent_id.encode('utf-8')
-
-    aesgcm = AESGCM(key)
-    ciphertext_and_tag = aesgcm.encrypt(iv, shared_secret_hex.encode('utf-8'), aad)
-
-    ciphertext = ciphertext_and_tag[:-16]
-    tag = ciphertext_and_tag[-16:]
-
-    return ciphertext.hex(), iv.hex(), tag.hex(), salt.hex()
+    return encrypt_with_key_aad(data_key, shared_secret_hex, agent_id)
 
 
 def decrypt_agent_secret(
     encrypted_hex: str,
     iv_hex: str,
     tag_hex: str,
-    salt_hex: str,
-    password: str,
+    data_key: bytes,
     agent_id: str
 ) -> str:
     """
@@ -184,31 +210,17 @@ def decrypt_agent_secret(
         encrypted_hex: Encrypted secret (hex string)
         iv_hex: AES-GCM IV (hex string)
         tag_hex: AES-GCM auth tag (hex string)
-        salt_hex: Argon2id salt (hex string)
-        password: The encryption password
-        agent_id: The agent ID, used as AAD (must match encryption)
+        data_key: The unlocked wallet's master key
+        agent_id: The agent ID, bound in as associated data (must match)
 
     Returns:
         The decrypted shared secret (hex string)
 
     Raises:
-        Exception if password is wrong, agent_id doesn't match, or data is corrupted
+        Exception if the key is wrong, the agent_id does not match, or the
+        data is corrupted
     """
-    salt = bytes.fromhex(salt_hex)
-    key = _derive_key(password, salt)
-
-    ciphertext = bytes.fromhex(encrypted_hex)
-    iv = bytes.fromhex(iv_hex)
-    tag = bytes.fromhex(tag_hex)
-    ciphertext_and_tag = ciphertext + tag
-
-    # Use agent_id as AAD - must match what was used during encryption
-    aad = agent_id.encode('utf-8')
-
-    aesgcm = AESGCM(key)
-    plaintext = aesgcm.decrypt(iv, ciphertext_and_tag, aad)
-
-    return plaintext.decode('utf-8')
+    return decrypt_with_key_aad(data_key, encrypted_hex, iv_hex, tag_hex, agent_id)
 
 
 def generate_intent_mandate(
@@ -273,10 +285,11 @@ def generate_intent_mandate(
             "address": wallet_address,
         },
 
-        # Issuer (Vault app)
+        # Issuer (Vault app). This is the app's version - the schema's own
+        # version is the "ap2.primer/v0.1" above, and the two move separately.
         "issuer": {
             "type": "VaultDesktop",
-            "version": "1.0",
+            "version": __version__,
         },
     }
 
@@ -325,8 +338,8 @@ class Agent:
     - "bearer": Agent sends token directly (simpler, less secure)
       auth_key stores sha256 hash of the token for verification
 
-    For HMAC mode, the secret is encrypted at rest using AES-256-GCM with
-    Argon2id key derivation, using the wallet password as the encryption key.
+    For HMAC mode, the secret is encrypted at rest using AES-256-GCM under the
+    wallet's master key, with the agent ID bound in as associated data.
     """
     id: str                          # Short agent ID for API use (e.g., "ABC123")
     name: str
@@ -339,7 +352,6 @@ class Agent:
     # Encryption metadata for auth_key (only used in HMAC mode)
     auth_key_iv: Optional[str] = None      # AES-GCM IV (hex)
     auth_key_tag: Optional[str] = None     # AES-GCM auth tag (hex)
-    auth_key_salt: Optional[str] = None    # Argon2id salt (hex)
 
     # Commission settings (None if uncommissioned)
     policy_id: Optional[str] = None
@@ -347,11 +359,13 @@ class Agent:
 
     # Spending tracking (x402 payments)
     spent_today_micro: int = 0  # Micro-USDG (6 decimals: 1_000_000 = $1.00)
-    last_reset_date: str = ""
+    last_reset_date: str = ""   # Local date of the last reset
+    last_reset_at: str = ""     # UTC instant of the last reset
 
     # Trading volume tracking
     trading_volume_today_usd: float = 0.0  # USD volume traded today
-    last_trading_reset_date: str = ""      # Calendar date for daily reset
+    last_trading_reset_date: str = ""      # Local date of the last reset
+    last_trading_reset_at: str = ""        # UTC instant of the last reset
 
     # AP2 IntentMandate VDC (optional, generated on commission)
     intent_mandate: Optional[dict] = None
@@ -363,7 +377,6 @@ class Agent:
         encrypted_auth_key: str,
         auth_key_iv: Optional[str] = None,
         auth_key_tag: Optional[str] = None,
-        auth_key_salt: Optional[str] = None,
         auth_mode: str = "hmac",
         agent_id: Optional[str] = None
     ) -> "Agent":
@@ -375,7 +388,6 @@ class Agent:
             encrypted_auth_key: For HMAC: encrypted shared secret | For Bearer: sha256(token)
             auth_key_iv: AES-GCM IV (hex) - required for HMAC mode
             auth_key_tag: AES-GCM auth tag (hex) - required for HMAC mode
-            auth_key_salt: Argon2id salt (hex) - required for HMAC mode
             auth_mode: "hmac" (default, more secure) or "bearer" (simpler, less secure)
             agent_id: Optional pre-generated agent ID (required for HMAC mode AAD)
         """
@@ -387,10 +399,10 @@ class Agent:
             status="uncommissioned",
             created_at=datetime.now(timezone.utc).isoformat(),
             last_reset_date=date.today().isoformat(),
+            last_reset_at=datetime.now(timezone.utc).isoformat(),
             auth_mode=auth_mode,
             auth_key_iv=auth_key_iv,
             auth_key_tag=auth_key_tag,
-            auth_key_salt=auth_key_salt,
         )
 
     def commission(self, policy_id: str, wallet_address: str) -> None:
@@ -408,10 +420,19 @@ class Agent:
         if self.policy_id:
             self.status = "active"
 
+    def spend_allowance_is_due(self) -> bool:
+        """True if this agent's payment allowance should renew now."""
+        return daily_allowance_is_due(self.last_reset_date, self.last_reset_at)
+
     def reset_daily_spend(self) -> None:
-        """Reset daily spending (call at midnight)."""
+        """Start a new daily payment allowance.
+
+        Records both the local date the allowance belongs to and the instant it
+        began, because the date alone cannot say how long ago that was.
+        """
         self.spent_today_micro = 0
         self.last_reset_date = date.today().isoformat()
+        self.last_reset_at = datetime.now(timezone.utc).isoformat()
         if self.status == "limit_reached":
             self.status = "active"
 
@@ -419,10 +440,16 @@ class Agent:
         """Record spending in micro-USDG (6 decimals)."""
         self.spent_today_micro += micro
 
+    def trading_allowance_is_due(self) -> bool:
+        """True if this agent's trading allowance should renew now."""
+        return daily_allowance_is_due(
+            self.last_trading_reset_date, self.last_trading_reset_at)
+
     def reset_daily_trading_volume(self) -> None:
-        """Reset daily trading volume (call at midnight)."""
+        """Start a new daily trading allowance."""
         self.trading_volume_today_usd = 0.0
         self.last_trading_reset_date = date.today().isoformat()
+        self.last_trading_reset_at = datetime.now(timezone.utc).isoformat()
 
     def add_trading_volume(self, usd_amount: float) -> None:
         """Record trading volume in USD."""
@@ -467,26 +494,25 @@ class Agent:
         """Format today's spending as USDG with 6 decimal precision."""
         return f"{self.spent_today_micro / 1_000_000:.6f} USDG"
 
-    def decrypt_auth_key(self, password: str) -> str:
+    def decrypt_auth_key(self, data_key: bytes) -> str:
         """
-        Decrypt the agent's auth key (shared secret) using the wallet password.
+        Decrypt the agent's shared secret using the wallet's master key.
 
         Returns:
             The decrypted shared secret (hex string) for HMAC verification
 
         Raises:
             ValueError if encryption metadata is missing
-            Exception if password is wrong or agent_id doesn't match
+            Exception if the key is wrong or agent_id doesn't match
         """
-        if not self.auth_key_iv or not self.auth_key_tag or not self.auth_key_salt:
+        if not self.auth_key_iv or not self.auth_key_tag:
             raise ValueError("Agent auth key encryption metadata is missing")
 
         return decrypt_agent_secret(
             self.auth_key,
             self.auth_key_iv,
             self.auth_key_tag,
-            self.auth_key_salt,
-            password,
+            data_key,
             self.id
         )
 
