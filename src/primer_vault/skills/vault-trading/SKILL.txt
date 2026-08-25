@@ -23,9 +23,11 @@ The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:4663`).
 
 ## Know your limits before you trade
 
-`POST /mandate` returns the limits you are held to, authenticated exactly like
-`/sign` and `/trade`. Check it at the start of a task rather than discovering a
-ceiling by hitting it.
+`POST /mandate` returns the limits you are held to, plus your `wallet_address`,
+authenticated exactly like `/sign` and `/trade`. Check it at the start of a task
+rather than discovering a ceiling by hitting it. To size trades against what you
+actually hold, `POST /balances` (same credential) returns your address and its
+on-chain balances (native ETH + tokens).
 
 ```json
 "policy": {

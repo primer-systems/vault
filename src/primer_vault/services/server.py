@@ -601,7 +601,12 @@ def get_branded_html(port: int) -> str:
             <tr>
               <td><code>/mandate</code></td>
               <td><span class="method method-post">POST</span></td>
-              <td>An agent&#39;s policy limits and Intent Mandate (signed)</td>
+              <td>An agent&#39;s wallet address, policy limits and Intent Mandate (signed)</td>
+            </tr>
+            <tr>
+              <td><code>/balances</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>The agent&#39;s wallet address and on-chain balances (native + tokens)</td>
             </tr>
             <tr>
               <td><code>/trade</code></td>
@@ -722,7 +727,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     # the right one rather than a bare 404.
     # Note: /sign/status/{id} and /receipt/{id} are dynamic paths handled separately
     GET_ENDPOINTS = frozenset(["/", "/agent", "/sign/helper", "/status", "/health"])
-    POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade"])
+    POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade", "/balances"])
 
     def _send_method_not_allowed(self, allowed_methods: list[str]):
         """Send 405 Method Not Allowed response."""
@@ -1280,6 +1285,25 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     status_code = 200
                 else:
                     status_code = get_http_status_for_error(result.get("code"))
+                self._send_json_response(status_code, result)
+            else:
+                self._send_json_response(503, {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"})
+
+        elif self.path == "/balances":
+            # The agent's wallet address and on-chain balances (requires authentication)
+            agent_id = request_data.get("agent_id")
+            signature = request_data.get("signature")
+
+            if not agent_id:
+                self._send_json_response(400, {"status": "error", "error": "Missing agent_id", "code": "MISSING_AGENT_ID"})
+                return
+            if not signature:
+                self._send_json_response(400, {"status": "error", "error": "Missing signature", "code": "MISSING_SIGNATURE"})
+                return
+
+            if _signing_service:
+                result = _signing_service.handle_get_balances(agent_id, signature)
+                status_code = 200 if result.get("status") == "ok" else get_http_status_for_error(result.get("code"))
                 self._send_json_response(status_code, result)
             else:
                 self._send_json_response(503, {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"})

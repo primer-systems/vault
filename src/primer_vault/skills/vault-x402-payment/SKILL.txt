@@ -370,7 +370,8 @@ Codes where the right move isn't obvious:
 |----------|--------|---------|
 | `/health` | GET | Check if Vault is running |
 | `/status` | GET | Get server status (JSON) |
-| `/mandate` | POST | Get your Intent Mandate and spending limits |
+| `/mandate` | POST | Get your wallet address, Intent Mandate and spending limits |
+| `/balances` | POST | Get your wallet address and on-chain balances (native + tokens) |
 | `/sign` | POST | Forward Payment-Required header for signing |
 | `/sign/status/{request_id}` | GET | Check status of pending request |
 | `/sign/helper` | GET | Python signing helper script |

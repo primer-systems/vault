@@ -98,6 +98,7 @@ class Vault:
         self._signing_service.set_wallet_provider(self.get_wallet_for_address)
         self._signing_service.set_wallet_status_checker(self.is_wallet_unlocked)
         self._signing_service.set_rpc_resolver(self.get_rpc_url)
+        self._signing_service.set_balance_provider(self.get_agent_balances)
         self._setup_signing_callbacks()
 
         # Apply persisted settings to signing service
@@ -292,6 +293,18 @@ class Vault:
             return custom
         network = NETWORKS.get(chain_id)
         return network.rpc_url if network else None
+
+    def get_agent_balances(self, address: str) -> list:
+        """Native + token balances for `address` on the default chain, using the
+        user's configured RPC. Backs the agent /balances endpoint. Raises on a
+        fetch failure; the endpoint turns that into a graceful reply."""
+        from ..networks import MultiNetworkBalanceFetcher, DEFAULT_NETWORK
+
+        rpc = self.get_rpc_url(DEFAULT_NETWORK)
+        custom_rpcs = {DEFAULT_NETWORK: rpc} if rpc else {}
+        fetcher = MultiNetworkBalanceFetcher(
+            networks=[DEFAULT_NETWORK], custom_rpcs=custom_rpcs)
+        return fetcher.get_all_balances(address).get(DEFAULT_NETWORK, [])
 
     @property
     def event_bus(self) -> EventBus:

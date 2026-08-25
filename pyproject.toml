@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "primer-vault"
-version = "0.2.0"
+version = "0.2.1"
 description = "Self-custodial execution wallet for AI agents on Robinhood Chain"
 readme = "README.md"
 requires-python = ">=3.11"

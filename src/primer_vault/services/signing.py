@@ -242,6 +242,7 @@ class SigningService:
         self._on_transaction_updated: Optional[Callable] = None
         self._on_hardware_sign_needed: Optional[Callable] = None  # For hardware wallet signing
         self._wallet_provider = None  # Function to get unlocked wallet by address
+        self._balance_provider = None  # Function: address -> list[Balance] (agent /balances)
         self._wallet_status_checker = None  # Function that returns True if any wallet is loaded
         self._rpc_resolver: Optional[Callable] = None  # Vault.get_rpc_url, injected by the core
         # Returns USD an agent has promised to trades not yet recorded. Injected
@@ -645,6 +646,12 @@ class SigningService:
         """Set the wallet provider function (gets unlocked wallet by address)."""
         self._wallet_provider = provider
 
+    def set_balance_provider(self, provider):
+        """Set the balance provider: address -> list[Balance] on the agent's
+        chain. Used by the agent /balances endpoint. May raise on a failed fetch;
+        the endpoint turns that into a graceful "balances unavailable"."""
+        self._balance_provider = provider
+
     def set_reserved_volume_provider(self, provider):
         """Set the callable that reports an agent's in-flight trading volume."""
         self._reserved_volume_provider = provider
@@ -943,42 +950,32 @@ class SigningService:
             "agent_status": agent.status,
         }
 
-    def handle_get_mandate(self, agent_id: str, signature: str) -> dict:
-        """
-        Get an agent's Intent Mandate and policy summary.
+    def _authenticate_agent_read(self, agent_id: str, signature: str):
+        """Authenticate a signed agent read request (/mandate, /balances).
 
-        Requires authentication (signature) to prevent information disclosure.
-
-        Returns the mandate (if any) plus current policy constraints so the agent
-        can make informed decisions about which x402 endpoints to use.
+        Returns ``(agent, wallet, None)`` on success, or ``(None, None, error)``
+        on failure. Bearer credentials are verified before the wallet is
+        consulted, so a wrong token or a locked wallet cannot become a "keys in
+        memory" oracle - the same handling /sign uses. Shared between the read
+        endpoints so their auth cannot drift apart.
         """
         if not self._policy_store:
-            return {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"}
+            return None, None, {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"}
 
         agent = self._policy_store.get_agent_by_id(agent_id)
         if not agent:
-            return {"status": "error", "error": "Agent not found", "code": "AGENT_NOT_FOUND"}
+            return None, None, {"status": "error", "error": "Agent not found", "code": "AGENT_NOT_FOUND"}
 
         # Check if daily spending needs to be reset (new calendar day)
         self._check_daily_reset(agent)
 
         if agent.status == "uncommissioned":
-            return {
-                "status": "error",
-                "error": "Agent not commissioned",
-                "code": "AGENT_NOT_COMMISSIONED"
-            }
-
+            return None, None, {"status": "error", "error": "Agent not commissioned", "code": "AGENT_NOT_COMMISSIONED"}
         if agent.status == "suspended":
-            return {
-                "status": "error",
-                "error": "Agent suspended",
-                "code": "AGENT_SUSPENDED"
-            }
+            return None, None, {"status": "error", "error": "Agent suspended", "code": "AGENT_SUSPENDED"}
 
-        # Verify authentication
         if not self._wallet_provider:
-            return {"status": "error", "error": "Wallet provider not set", "code": "NO_WALLET_PROVIDER"}
+            return None, None, {"status": "error", "error": "Wallet provider not set", "code": "NO_WALLET_PROVIDER"}
 
         # For bearer auth: verify token BEFORE the wallet check — bearer doesn't
         # need the wallet key, so a wrong token must return AUTH_FAILED, and a
@@ -987,16 +984,12 @@ class SigningService:
         if agent.auth_mode == "bearer":
             auth_result = self._verify_mandate_auth(agent, agent_id, signature, None)
             if auth_result:
-                return {
-                    "status": "error",
-                    "error": auth_result,
-                    "code": "AUTH_FAILED"
-                }
+                return None, None, {"status": "error", "error": auth_result, "code": "AUTH_FAILED"}
 
         wallet: "VaultWallet" = self._wallet_provider(agent.wallet_address)
         if not wallet:
             if self._wallet_status_checker and self._wallet_status_checker():
-                return {
+                return None, None, {
                     "status": "error",
                     "error": "Agent's wallet address is not available in the unlocked wallet. Check that the correct wallet is open.",
                     "code": "WALLET_ADDRESS_NOT_FOUND"
@@ -1006,28 +999,40 @@ class SigningService:
             # WALLET_LOCKED would hand it the same lock oracle. A bearer caller
             # was already verified above, so it has earned the honest answer.
             if agent.auth_mode == "bearer":
-                return {
-                    "status": "error",
-                    "error": "Wallet is locked. Open Vault and unlock the wallet.",
-                    "code": "WALLET_LOCKED"
-                }
+                return None, None, {"status": "error", "error": "Wallet is locked. Open Vault and unlock the wallet.", "code": "WALLET_LOCKED"}
             self._emit_activity(f"Auth failed for {agent.name}: wallet locked", True)
-            return {
-                "status": "error",
-                "error": "Authentication failed",
-                "code": "AUTH_FAILED"
-            }
+            return None, None, {"status": "error", "error": "Authentication failed", "code": "AUTH_FAILED"}
 
         # For HMAC auth: verify signature (needs the wallet key to decrypt the
         # agent's shared secret). Bearer was already verified above.
         if agent.auth_mode != "bearer":
             auth_result = self._verify_mandate_auth(agent, agent_id, signature, wallet.data_key)
             if auth_result:
-                return {
-                    "status": "error",
-                    "error": auth_result,
-                    "code": "AUTH_FAILED"
-                }
+                return None, None, {"status": "error", "error": auth_result, "code": "AUTH_FAILED"}
+
+        return agent, wallet, None
+
+    @staticmethod
+    def _wallet_id_for(wallet, address: str):
+        """The address-book id (A001, ...) for an address, or None."""
+        try:
+            entry = wallet.get_address_by_address(address)
+            return entry.id if entry else None
+        except Exception:
+            return None
+
+    def handle_get_mandate(self, agent_id: str, signature: str) -> dict:
+        """
+        Get an agent's Intent Mandate and policy summary.
+
+        Requires authentication (signature) to prevent information disclosure.
+
+        Returns the mandate (if any) plus current policy constraints so the agent
+        can make informed decisions about which x402 endpoints to use.
+        """
+        agent, wallet, err = self._authenticate_agent_read(agent_id, signature)
+        if err:
+            return err
 
         policy = self._policy_store.get_policy(agent.policy_id) if agent.policy_id else None
 
@@ -1055,6 +1060,10 @@ class SigningService:
             "status": "ok",
             "agent_name": agent.name,
             "agent_id": agent.id,
+            # The address the agent signs from, always - so an agent no longer has
+            # to infer it from a rejection message before it can look up balances.
+            "wallet_address": agent.wallet_address,
+            "wallet_id": self._wallet_id_for(wallet, agent.wallet_address),
             "spent_today_micro": agent.spent_today_micro,
             "remaining_today_micro": remaining_today_micro,
             "policy": policy_summary,
@@ -1075,6 +1084,58 @@ class SigningService:
             result["mandate"] = None
             result["mandate_note"] = "No Intent Mandate has been generated for this agent. Check back later or contact your administrator."
 
+        return result
+
+    @staticmethod
+    def _balance_to_dict(b) -> dict:
+        """One Balance -> a JSON-able holding. `raw` is a string because a token
+        balance can exceed JSON's safe integer range."""
+        return {
+            "symbol": b.symbol,
+            "token_address": b.token_address,  # None for native ETH
+            "decimals": b.decimals,
+            "raw": str(b.raw),
+            "formatted": b.formatted,
+            "is_native": b.is_native,
+            "usd_value": b.usd_value,  # may be None
+        }
+
+    def handle_get_balances(self, agent_id: str, signature: str) -> dict:
+        """Return the agent's on-chain balances (native + tokens) for the wallet
+        it is commissioned to. Same authentication as /mandate.
+
+        Read-only and no keys: the address is public and the agent signs from it.
+        A failed balance fetch (block explorer down) returns ok with
+        ``balances: null`` and a reason, rather than an error - the agent still
+        learns its address, and a down indexer is not the agent's fault.
+        """
+        agent, wallet, err = self._authenticate_agent_read(agent_id, signature)
+        if err:
+            return err
+
+        result = {
+            "status": "ok",
+            "wallet_address": agent.wallet_address,
+            "wallet_id": self._wallet_id_for(wallet, agent.wallet_address),
+        }
+
+        if not self._balance_provider:
+            result["balances"] = None
+            result["balances_error"] = "Balance lookup is not available on this instance"
+            return result
+
+        try:
+            balances = self._balance_provider(agent.wallet_address)
+        except Exception as e:
+            logger.warning(f"Balance fetch failed for {agent.wallet_address}: {e}")
+            result["balances"] = None
+            result["balances_error"] = "Could not read balances (the block explorer may be unavailable)"
+            return result
+
+        result["balances"] = [
+            self._balance_to_dict(b) for b in balances
+            if not getattr(b, "fetch_failed", False)
+        ]
         return result
 
     def _trading_summary(self, agent: "Agent", policy: "SpendPolicy") -> dict:

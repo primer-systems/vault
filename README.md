@@ -98,6 +98,11 @@ shown under DeFi Trading below. For production, register with `--auth hmac`
 instead; HMAC requests are signed `SIG:<unix-time>:<hex>` and the exact
 format is served at `http://localhost:4663/agent`.
 
+A commissioned agent can learn what it's working with, no keys involved:
+`POST /mandate` returns its wallet address and live policy limits, and
+`POST /balances` returns that address and its on-chain balances (native +
+tokens). Both take the same credential as `/sign`.
+
 ### Policy System
 
 Policies define what agents can do. Two independent lanes:

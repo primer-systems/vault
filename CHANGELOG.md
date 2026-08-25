@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+- **An agent can read its own address and balances.** `/mandate` now returns the
+  agent's `wallet_address` (and `wallet_id`) in its live response, so an agent no
+  longer has to infer the address it signs from. A new authenticated
+  `POST /balances` returns that address plus its on-chain holdings (native +
+  tokens), behind the same credential as `/mandate`, and degrades gracefully if
+  the block explorer is unavailable. Read-only; no keys involved.
+
 ## 0.2.0
 
 ### Added
