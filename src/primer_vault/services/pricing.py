@@ -8,7 +8,7 @@ Two prices are deliberately kept separate (see the trading plan):
     so a reputable off-chain source is safe and avoids thin-pool manipulation.
 
 USDG is treated as $1. A trade's notional is the value of its base-asset leg.
-This module is Qt-free (GUI / CLI / headless).
+This module is Qt-free, so it ships in both editions.
 """
 
 import json

@@ -411,8 +411,9 @@ agent_id = os.environ["PRIMER_VAULT_AGENT_ID"]
 token = os.environ["PRIMER_VAULT_AGENT_TOKEN"]
 timestamp = int(time.time())
 
-# Sign over action + agent_id + timestamp
-msg_data = {"action": "get_mandate", "agent_id": agent_id, "timestamp": timestamp}
+# Sign over action + agent_id + timestamp. This same shape is also used
+# for /balances - one shared read-only check, one action tag.
+msg_data = {"action": "agent_read", "agent_id": agent_id, "timestamp": timestamp}
 msg = json.dumps(msg_data, separators=(',', ':'), sort_keys=True).encode()
 sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
 

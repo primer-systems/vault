@@ -141,7 +141,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # The desktop binary is the window and nothing else. Neither of these is
+        # reachable from `primer_vault_entry.py` today, so PyInstaller already
+        # leaves them out - but "already leaves them out" is a property of the
+        # current import graph, not a rule. One `from ..terminal import ...`
+        # inside `ui/` would silently pull the terminal stack back into the
+        # binary, which is exactly what the 0.3 split removed. Listed here, that
+        # import fails the build instead.
+        'primer_vault.terminal',
+        'prompt_toolkit',
+    ],
     noarchive=False,
     optimize=0,
 )

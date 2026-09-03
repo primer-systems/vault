@@ -29,7 +29,6 @@ CORE_OWNED = {
     "server_port", "custom_port_enabled",   # settings.json: server.default_port
     "rate_limit",                           # settings.json: server.rate_limit_per_minute
     "replay_window_seconds",                # settings.json: signing.max_request_age_seconds
-    "admin_api_mode",                       # settings.json: security.admin_api_mode
     "allow_lan", "verify_settlements",      # settings.json: server / signing
     "rhc_rpc",                              # settings.json: rpc.<chain>
     "wallet_path",                          # the core's wallet_path.txt
@@ -93,7 +92,6 @@ def test_a_dialog_answer_is_filtered_before_it_is_stored(tmp_path, monkeypatch):
         "server_port": 5000,
         "rate_limit": 60,
         "replay_window_seconds": 120,
-        "admin_api_mode": "open",
         "rhc_rpc": "https://example.invalid",
         "verify_settlements": False,
     })
@@ -180,6 +178,58 @@ def test_the_dialog_shows_the_replay_window_actually_in_force(qt_app, core):
         assert dialog.replay_window_input.value() == 60
     finally:
         dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# One key, one default
+# ---------------------------------------------------------------------------
+
+#: Settings read in more than one place in `ui/`, with the default every one of
+#: them must use. A key read with two different fallbacks behaves differently
+#: depending on which code path ran, which is not a thing anyone can debug from
+#: the outside: the file on disk looks the same either way.
+#:
+#: `auto_start_server` is here because it drifted. A dead `set_settings()` in
+#: SettingsTab read it with a default of False while the window, the settings
+#: tab and the network dialog all read it with True. Nothing called the dead
+#: method, so nothing broke - but the next person to wire it up would have
+#: turned the agent server's auto-start off for every user whose settings file
+#: predates the key, and the symptom would have been "it used to start on its
+#: own" with nothing in the file to explain it.
+SHARED_DEFAULTS = {
+    "auto_start_server": "True",
+    "sound_enabled": "True",
+    "toast_enabled": "True",
+    "flash_taskbar": "True",
+    "minimize_to_tray": "False",
+    "close_to_tray": "False",
+    "start_minimized": "False",
+}
+
+
+@pytest.mark.parametrize("key,expected", sorted(SHARED_DEFAULTS.items()))
+def test_every_read_of_a_setting_uses_the_same_default(key, expected):
+    import re
+
+    ui_dir = Path(__file__).parent.parent / "src" / "primer_vault" / "ui"
+    pattern = re.compile(
+        r"""\.get\(\s*["']""" + re.escape(key) + r"""["']\s*,\s*(\w+)\s*\)""")
+
+    found = []
+    for path in sorted(ui_dir.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            match = pattern.search(line)
+            if match:
+                found.append((f"{path.name}:{lineno}", match.group(1)))
+
+    assert found, f"{key} is no longer read anywhere - drop it from SHARED_DEFAULTS"
+
+    wrong = [f"  {where} defaults to {value}" for where, value in found
+             if value != expected]
+    assert not wrong, (
+        f"'{key}' should default to {expected} everywhere it is read, so that the "
+        f"same settings file produces the same behaviour whichever path reads "
+        f"it:\n" + "\n".join(wrong))
 
 
 if __name__ == "__main__":

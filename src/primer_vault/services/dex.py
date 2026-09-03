@@ -1,7 +1,7 @@
 """
 DEX adapters — Uniswap v3/v4 interaction for the trading engine.
 
-Qt-free; used by the trading service in GUI, CLI, and headless modes.
+Qt-free; used by the trading service in both editions.
 
 DexAdapter is an abstract base class; DexAdapterV3 (this module) and DexAdapterV4
 (dex_v4.py) implement it. Read paths (metadata, quote, simulate) are safe to call

@@ -237,8 +237,14 @@ class DataDirectoryError(RuntimeError):
 def get_app_dir() -> Path:
     """Get the application data directory, creating it if needed.
 
-    Two locations, deliberately:
+    Three locations, in order:
 
+    - `PRIMER_VAULT_DATA_DIR`, if set. An environment variable rather than a
+      flag because the thing that starts Vault on a server is a service
+      manager, which cannot type one - and because everything a machine must
+      remember across a reboot has to live somewhere the reboot cannot lose.
+      This is also how one machine runs two independent Vaults: the instance
+      lock, the wallet and the control channel are all scoped to this folder.
     - Frozen builds keep data in `data/` beside the executable. Nothing was
       installed, so nothing is left behind on the machine, and the whole thing
       travels on a USB stick. The path is resolved at run time, so the drive
@@ -252,7 +258,10 @@ def get_app_dir() -> Path:
             build has no console to print to - so the failure has to arrive as
             something an interface can show, not as a bare OSError.
     """
-    if getattr(sys, 'frozen', False):
+    override = os.environ.get("PRIMER_VAULT_DATA_DIR")
+    if override:
+        app_dir = Path(override).expanduser()
+    elif getattr(sys, 'frozen', False):
         # Running as compiled (PyInstaller) — keep data next to the executable
         app_dir = Path(sys.executable).parent / "data"
     else:
@@ -307,39 +316,6 @@ def get_logs_dir() -> Path:
     logs_dir = get_app_dir() / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir
-
-
-def scrub_dialog(dialog, attrs: tuple = ()) -> None:
-    """Blank every text-bearing widget in a closed dialog, None the named
-    attributes, and schedule the dialog for destruction.
-
-    Qt keeps a parented dialog alive for as long as its parent lives, and the
-    wallet dialogs are parented to widgets that live for the whole session -
-    so a seed phrase, private key or password left in a widget or attribute
-    survives close() and outlives lock(). Locking the wallet cannot reach
-    these copies; the dialog has to drop them itself.
-
-    Call it from the dialog's closeEvent (covers the user closing the window)
-    AND from the caller after exec() returns and the needed values were read
-    (accept()/reject() do not send a closeEvent). Safe to call twice.
-
-    Python cannot zero immutable strings, so this drops references and clears
-    widget buffers - the same limit lock() itself has.
-    """
-    from PyQt6.QtWidgets import QLabel, QLineEdit, QPlainTextEdit, QTextEdit
-
-    for w in dialog.findChildren(QLineEdit):
-        w.clear()
-    for w in dialog.findChildren(QTextEdit):
-        w.clear()
-    for w in dialog.findChildren(QPlainTextEdit):
-        w.clear()
-    for w in dialog.findChildren(QLabel):
-        w.setText("")
-    for name in attrs:
-        if hasattr(dialog, name):
-            setattr(dialog, name, None)
-    dialog.deleteLater()
 
 
 def redact_urls(text: str) -> str:

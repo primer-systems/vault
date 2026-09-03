@@ -56,7 +56,8 @@ def test_console_does_not_keep_the_exported_key_after_close(qapp, core):
     main_window = QWidget()
 
     console = ConsoleWindow(core, main_window)
-    console._handle_input(f"address export {addr_id}")
+    console._handle_input(
+        f"address export {addr_id} --password {TEST_PASSWORD}")
     console._handle_input("YES")
 
     # Premise: the export really did put the raw key in the output pane.
@@ -85,7 +86,8 @@ def test_locking_the_wallet_clears_the_key_from_the_open_console(qapp, core):
 
     main_window = QWidget()
     console = ConsoleWindow(core, main_window)
-    console._handle_input(f"address export {addr_id}")
+    console._handle_input(
+        f"address export {addr_id} --password {TEST_PASSWORD}")
     console._handle_input("YES")
 
     assert TEST_PKEY in console.output.toPlainText(), (

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 pytest.importorskip("PyQt6")
 
-# wallet.dialogs and ui.tabs import each other; import the ui side first.
+# wallet_dialogs and tabs both live in ui/ now; import order is no longer delicate.
 import primer_vault.ui.dialogs  # noqa: F401
 
 from primer_vault.wallet.crypto import VaultWallet
@@ -48,7 +48,7 @@ def _drain(qapp):
 
 def test_creation_derivation_browser_does_not_strand_the_seed(qapp):
     from PyQt6.QtWidgets import QWidget
-    from primer_vault.wallet.dialogs import (
+    from primer_vault.ui.wallet_dialogs import (
         CreateWalletWizard, DerivationBrowserDialog)
 
     wallet_tab = QWidget()  # stands in for WalletTab, which lives all session

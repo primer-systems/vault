@@ -35,7 +35,6 @@ class AgentCommands:
         the same way; doing it here rather than at each call site is what stops
         the two drifting apart again.
 
-        Uploads directly rather than through the CoreClient proxy.
         """
         try:
             response = _requests.post(

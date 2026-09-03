@@ -18,15 +18,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from .crypto import (VaultWallet, MIN_PASSWORD_LENGTH, WeakPasswordError,
-                     validate_wallet_password, CorruptedWalletFile,
-                     UnsupportedWalletVersion)
+from ..wallet.crypto import (VaultWallet, MIN_PASSWORD_LENGTH, WeakPasswordError,
+                             validate_wallet_password, CorruptedWalletFile,
+                             UnsupportedWalletVersion)
 from eth_account.hdaccount import generate_mnemonic
 
-# Import shared clipboard helper and frameless dialogs from ui module
-from ..ui.dialogs import copy_sensitive_to_clipboard
-from ..ui.theme import Theme, FramelessDialog, FramelessMessageBox, set_role
-from ..utils import scrub_dialog
+from .dialogs import copy_sensitive_to_clipboard
+from .theme import Theme, FramelessDialog, FramelessMessageBox, set_role
+from .scrub import scrub_dialog
 
 
 # ============================================
@@ -271,7 +270,7 @@ class SeedSelectionDialog(FramelessDialog):
 # Derivation Browser Dialog
 # ============================================
 
-from .address_source import AddressSource, SeedAddressSource, LedgerAddressSource  # noqa: E402
+from ..wallet.address_source import AddressSource, SeedAddressSource, LedgerAddressSource  # noqa: E402
 
 
 @dataclass
@@ -302,7 +301,7 @@ def run_ledger_address_picker(wallet: VaultWallet, parent) -> Optional[LedgerPic
     Returns:
         The user's selection, or None if they cancelled at either step.
     """
-    from ..ui.ledger_dialog import LedgerConnectDialog
+    from .ledger_dialog import LedgerConnectDialog
 
     connect = LedgerConnectDialog(parent)
     if not connect.exec() or not connect.device:
@@ -499,7 +498,7 @@ class DerivationBrowserDialog(FramelessDialog):
 
     def _start_loader(self):
         """Kick off a background fetch for the current range."""
-        from ..ui.ledger_dialog import LedgerWorker
+        from .ledger_dialog import LedgerWorker
 
         self._reload_pending = False
         self._loader = LedgerWorker(
@@ -800,7 +799,7 @@ class NewSeedDialog(FramelessDialog):
         self.accept()
 
     def scrub(self):
-        """Drop the generated phrase; see utils.scrub_dialog for why."""
+        """Drop the generated phrase; see ui/scrub.py for why."""
         scrub_dialog(self, attrs=("seed_phrase", "_generated_seed"))
 
     def close(self):
@@ -880,7 +879,7 @@ class ImportSeedToWalletDialog(FramelessDialog):
         self.accept()
 
     def scrub(self):
-        """Drop the typed phrase; see utils.scrub_dialog for why."""
+        """Drop the typed phrase; see ui/scrub.py for why."""
         scrub_dialog(self, attrs=("seed_phrase",))
 
     def close(self):
@@ -988,7 +987,7 @@ class ImportPrivateKeyToWalletDialog(FramelessDialog):
             self.error_label.setText(f"Invalid private key: {str(e)}")
 
     def scrub(self):
-        """Drop the typed key; see utils.scrub_dialog for why."""
+        """Drop the typed key; see ui/scrub.py for why."""
         scrub_dialog(self, attrs=("private_key",))
 
     def close(self):
@@ -1603,7 +1602,7 @@ class CreateWalletWizard(FramelessDialog):
 
     def scrub(self):
         """Drop the chosen password, generated/typed seed and imported key;
-        see utils.scrub_dialog for why. The caller reads these after exec()
+        see ui/scrub.py for why. The caller reads these after exec()
         and calls this once the wallet is created."""
         scrub_dialog(self, attrs=("password", "seed_phrase", "private_key",
                                   "_generated_seed"))
@@ -2041,7 +2040,7 @@ class ChangePasswordDialog(FramelessDialog):
             self.error_label.setText(f"Failed to change password: {e}")
 
     def scrub(self):
-        """Blank the three password fields; see utils.scrub_dialog for why.
+        """Blank the three password fields; see ui/scrub.py for why.
 
         self.wallet is the core's own wallet, not a private copy - it must
         stay usable, so only the widgets are cleared."""

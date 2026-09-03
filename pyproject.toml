@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "primer-vault"
-version = "0.2.1"
+version = "0.3.0"
 description = "Self-custodial execution wallet for AI agents on Robinhood Chain"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,7 +33,6 @@ classifiers = [
 # For 0.x projects the cap is the next minor, because that is where those
 # projects put their breaking changes.
 dependencies = [
-    "PyQt6>=6.10,<7",
     "cryptography>=50.0,<51",
     "argon2-cffi>=25.1,<26",
     "eth-account>=0.13.7,<0.14",
@@ -46,10 +45,28 @@ dependencies = [
     "requests>=2.33,<3",
     "platformdirs>=4.10,<5",
     "ledgereth>=0.10,<0.11",
+    # The terminal is this edition's entire interface, so it has to behave like
+    # one: arrow keys, history, Ctrl-R, tab completion. Python ships `readline`
+    # on Linux and macOS and nothing on Windows, so a cross-platform prompt
+    # needs a library. This one also prints the live event feed above the input
+    # line without eating a half-typed command, which the feed needs anyway -
+    # one dependency covering both, rather than hand-rolling the harder half.
+    "prompt_toolkit>=3.0,<4",
+]
+
+[project.optional-dependencies]
+# The desktop edition, and only it, needs Qt. It ships as a binary from GitHub
+# releases; `pip install primer-vault` is the Terminal edition and pulls none of
+# this. Installing 100MB of graphics libraries onto a machine with no screen was
+# the concrete cost of the two editions sharing one dependency list.
+desktop = [
+    "PyQt6>=6.10,<7",
 ]
 
 [project.scripts]
-primer-vault = "primer_vault:main"
+# The pip package is the Terminal edition. The Desktop edition ships as a
+# binary from GitHub releases and enters through src/primer_vault_entry.py.
+primer-vault = "primer_vault.app_terminal:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/primer_vault"]

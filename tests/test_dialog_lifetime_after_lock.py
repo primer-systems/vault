@@ -23,7 +23,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 pytest.importorskip("PyQt6")
 
-# primer_vault.wallet.dialogs and primer_vault.ui.tabs import each other, so
+# primer_vault.ui.wallet_dialogs and primer_vault.ui.tabs import each other, so
 # whichever is imported first has to be the ui side or the cycle bites. Not a
 # defect, just an import-order fact this test has to respect.
 import primer_vault.ui.dialogs  # noqa: F401  (breaks the wallet/ui import cycle)
@@ -47,7 +47,7 @@ def test_unlock_dialog_strands_a_second_unlocked_wallet(qapp, tmp_path):
     """VaultWalletUnlockDialog decrypts the wallet itself and keeps it.
 
     Production wiring: ui/tabs.py constructs it with the WalletTab as
-    parent. on_unlock (wallet/dialogs.py) assigns the fully decrypted
+    parent. on_unlock (ui/wallet_dialogs.py) assigns the fully decrypted
     VaultWallet to self.wallet and calls accept() - it never clears it.
 
     That object is a SECOND VaultWallet, separate from the one Vault.lock_wallet
@@ -55,7 +55,7 @@ def test_unlock_dialog_strands_a_second_unlocked_wallet(qapp, tmp_path):
     _decrypted_seeds still hold the plaintext recovery phrase.
     """
     from PyQt6.QtWidgets import QWidget
-    from primer_vault.wallet.dialogs import VaultWalletUnlockDialog
+    from primer_vault.ui.wallet_dialogs import VaultWalletUnlockDialog
 
     wallet_path = tmp_path / "test.wallet"
     source = VaultWallet.create(TEST_PASSWORD)
@@ -151,12 +151,12 @@ def test_import_seed_dialog_retains_phrase_after_close(qapp):
     """The typed recovery phrase survives the import dialog closing.
 
     Production wiring: ui/tabs.py constructs ImportSeedToWalletDialog with
-    the WalletTab as parent. on_import (wallet/dialogs.py) stores the
+    the WalletTab as parent. on_import (ui/wallet_dialogs.py) stores the
     phrase on self.seed_phrase, and the QTextEdit the user typed it into keeps
     its own copy. Neither is cleared.
     """
     from PyQt6.QtWidgets import QWidget
-    from primer_vault.wallet.dialogs import ImportSeedToWalletDialog
+    from primer_vault.ui.wallet_dialogs import ImportSeedToWalletDialog
 
     wallet_tab = QWidget()  # stands in for WalletTab
 

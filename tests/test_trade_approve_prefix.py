@@ -18,6 +18,7 @@ trade path.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,25 +35,31 @@ LARGE = "3f9e8d7c-0000-4000-8000-000000000002"   # 20 WETH, ~$60,000, queued sec
 
 
 def _trade(trade_id, amount_in, notional):
-    """A pending trade in the CoreClient dict shape TradeCommands normalises."""
-    return {
-        "id": trade_id,
-        "agent_id": "ABC123",
-        "token_in": WETH,
-        "token_out": USDG,
-        "amount_in": amount_in,
-        "fee_tier": 3000,
-        "quote": {
-            "notional_usdg": notional,
-            "symbol_in": "WETH",
-            "symbol_out": "USDG",
-            "amount_out_expected": int(notional * 1_000_000),
-            "amount_out_min": int(notional * 1_000_000 * 0.995),
-            "token_out_decimals": 6,
-            "price_impact_pct": 0.31,
-            "effective_slippage_bps": 50,
-        },
-    }
+    """A pending trade in the shape the engine returns: (request, quote).
+
+    There is only one shape now. Commands run against a real `Vault` even when
+    the operator is attached from another terminal - only the rendered output
+    crosses the control channel - so there is no dict variant to normalise.
+    """
+    request = SimpleNamespace(
+        id=trade_id,
+        agent_id="ABC123",
+        token_in=WETH,
+        token_out=USDG,
+        amount_in=amount_in,
+        fee_tier=3000,
+    )
+    quote = SimpleNamespace(
+        notional_usdg=notional,
+        symbol_in="WETH",
+        symbol_out="USDG",
+        amount_out_expected=int(notional * 1_000_000),
+        amount_out_min=int(notional * 1_000_000 * 0.995),
+        token_out_decimals=6,
+        price_impact_pct=0.31,
+        effective_slippage_bps=50,
+    )
+    return (request, quote)
 
 
 class FakeCore:

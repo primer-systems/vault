@@ -24,7 +24,26 @@ class ApprovalCommands:
             return CommandResult.ok("pending - List all pending approval requests")
 
         pending = self.core.get_pending_requests()
+        # Trades and lending requests wait in their own queues and are answered
+        # by their own commands. Counted here so `pending` never says "nothing"
+        # while something is in fact waiting for a person.
+        other = []
+        for label, getter, command in (
+                ("trade", "get_pending_trades", "trade pending"),
+                ("lending request", "get_pending_positions", "position pending")):
+            try:
+                count = len(getattr(self.core, getter)())
+            except Exception:
+                continue
+            if count:
+                other.append(
+                    f"  {count} {label}{'s' if count != 1 else ''} also waiting "
+                    f"- see '{command}'")
+
         if not pending:
+            if other:
+                return CommandResult.ok(
+                    "No pending payment requests.\n" + "\n".join(other))
             return CommandResult.ok("No pending requests.")
 
         lines = ["Pending Requests:"]
@@ -38,6 +57,8 @@ class ApprovalCommands:
             # tail is the half people actually compare against a known-good copy.
             # `approve` acts on what this line showed, so it has to show enough.
             lines.append(f"            -> {req.recipient}")
+
+        lines.extend(other)
 
         return CommandResult.ok("\n".join(lines), data={"pending": [
             {

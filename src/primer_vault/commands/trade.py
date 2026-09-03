@@ -1,21 +1,20 @@
 """
 Trade command implementations: list pending trades, approve, reject.
 
-Drives the manual-approval loop from the console/CLI while there's no GUI trade
-dialog yet: an agent POSTs /trade, it lands pending, and the user approves or
-rejects here. Approving executes the swap on-chain.
+Drives the manual-approval loop: an agent POSTs /trade, it lands pending, and
+the operator approves or rejects here. Approving executes the swap on-chain.
 
-Works with both direct Vault core (returns TradeRequest/TradeQuote objects)
-and CoreClient (returns dicts from Admin API).
+Runs against a real `Vault`, always. A command typed into an attached terminal
+executes on the engine's side of the control channel and only its output
+crosses the wire, so there is no second shape of data to handle here.
 """
 
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 from .result import CommandResult
 
 if TYPE_CHECKING:
     from ..core import Vault
-    from ..client.core_client import CoreClient
     from .handler import CommandHandler
 
 
@@ -39,7 +38,7 @@ def _get(obj, key, default=None):
 class TradeCommands:
     """Trade approval commands (console/CLI)."""
 
-    def __init__(self, core: Union["Vault", "CoreClient"], handler: "CommandHandler"):
+    def __init__(self, core: "Vault", handler: "CommandHandler"):
         self.core = core
         self.handler = handler
 
@@ -62,35 +61,17 @@ class TradeCommands:
         return CommandResult.fail(f"Unknown trade command: {sub}")
 
     def _normalize_pending(self, pending):
-        """Normalize pending trades to a consistent format.
-
-        Direct Vault returns list of (TradeRequest, TradeQuote) tuples.
-        CoreClient returns list of dicts with nested 'quote' field.
-        """
+        """Flatten (TradeRequest, TradeQuote) pairs into rows to print."""
         result = []
-        for item in pending:
-            if isinstance(item, tuple):
-                # Direct Vault: (request, quote)
-                request, quote = item
-                entry = {
-                    "id": request.id,
-                    "agent_id": request.agent_id,
-                    "token_in": request.token_in,
-                    "token_out": request.token_out,
-                    "amount_in": request.amount_in,
-                    "fee_tier": request.fee_tier,
-                }
-            else:
-                # CoreClient: dict with nested quote
-                quote = item.get("quote", {})
-                entry = {
-                    "id": item.get("id"),
-                    "agent_id": item.get("agent_id"),
-                    "token_in": item.get("token_in"),
-                    "token_out": item.get("token_out"),
-                    "amount_in": item.get("amount_in"),
-                    "fee_tier": item.get("fee_tier"),
-                }
+        for request, quote in pending:
+            entry = {
+                "id": request.id,
+                "agent_id": request.agent_id,
+                "token_in": request.token_in,
+                "token_out": request.token_out,
+                "amount_in": request.amount_in,
+                "fee_tier": request.fee_tier,
+            }
             # The terms the approval exists to let a person judge - the same
             # numbers the GUI dialog shows. amount_out_min is the one the swap
             # enforces on-chain; price impact is usually why it escalated.

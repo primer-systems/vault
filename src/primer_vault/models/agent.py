@@ -20,7 +20,7 @@ import hashlib
 import secrets
 import string
 from datetime import datetime, date, timedelta, timezone
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -367,6 +367,24 @@ class Agent:
     last_trading_reset_date: str = ""      # Local date of the last reset
     last_trading_reset_at: str = ""        # UTC instant of the last reset
 
+    # DeFi operation tracking. A count, not a value: the DeFi lane bounds its
+    # money with a limit on the position itself, read from chain, and this
+    # bounds gas instead - a deposit costs ~369,000 of it, and a loop that
+    # deposits and withdraws moves no net value while draining the wallet.
+    defi_ops_today: int = 0                # Deposits + withdrawals today
+    last_defi_reset_date: str = ""         # Local date of the last reset
+    last_defi_reset_at: str = ""           # UTC instant of the last reset
+
+    #: Venues this agent has supplied to, ever. Vault addresses and market ids.
+    #:
+    #: Exposure is measured by reading positions back off the chain, which means
+    #: knowing where to look. The curated list answers that while the agent is
+    #: restricted to it; with the restriction off there is no list, so without
+    #: this the exposure cap would stop counting at exactly the moment the venue
+    #: gate is open. Appended on a successful supply and never pruned - a venue
+    #: that leaves the curated set is still somewhere the money is.
+    defi_venues: list[str] = field(default_factory=list)
+
     # AP2 IntentMandate VDC (optional, generated on commission)
     intent_mandate: Optional[dict] = None
 
@@ -451,6 +469,38 @@ class Agent:
         self.last_trading_reset_date = date.today().isoformat()
         self.last_trading_reset_at = datetime.now(timezone.utc).isoformat()
 
+    def defi_reset_due(self) -> bool:
+        """True if today's DeFi operation count should start again."""
+        return daily_allowance_is_due(
+            self.last_defi_reset_date, self.last_defi_reset_at)
+
+    def reset_daily_defi_ops(self) -> None:
+        """Start a new day's DeFi operation count."""
+        self.defi_ops_today = 0
+        self.last_defi_reset_date = date.today().isoformat()
+        self.last_defi_reset_at = datetime.now(timezone.utc).isoformat()
+
+    def add_defi_op(self, count: int = 1) -> None:
+        """Record DeFi operations against today's count."""
+        self.defi_ops_today += count
+
+    def remember_defi_venue(self, venue_id: str) -> bool:
+        """Note that money went here. True if this is the first time.
+
+        Case-insensitive, because a vault address arrives however the agent
+        spelled it and the same venue recorded twice would be counted twice.
+        """
+        if not venue_id:
+            return False
+        if any(v.lower() == venue_id.lower() for v in self.defi_venues):
+            return False
+        self.defi_venues.append(venue_id)
+        return True
+
+    def format_defi_ops_today(self) -> str:
+        """Format today's DeFi operation count for display."""
+        return str(self.defi_ops_today)
+
     def add_trading_volume(self, usd_amount: float) -> None:
         """Record trading volume in USD."""
         self.trading_volume_today_usd += usd_amount
@@ -483,6 +533,22 @@ class Agent:
         # Ensure trading reset date exists (default to empty if missing)
         if "last_trading_reset_date" not in data:
             data["last_trading_reset_date"] = ""
+
+        # Absent from every agent written before the DeFi lane existed, which is
+        # the normal case. A bool passes an isinstance check for int and would
+        # become a count of one, so it is excluded explicitly.
+        defi_ops = data.get("defi_ops_today", 0)
+        if not isinstance(defi_ops, int) or isinstance(defi_ops, bool) or defi_ops < 0:
+            raise ValueError(
+                f"defi_ops_today must be a non-negative integer, got {defi_ops}")
+        data["defi_ops_today"] = int(defi_ops)
+        if "last_defi_reset_date" not in data:
+            data["last_defi_reset_date"] = ""
+
+        venues = data.get("defi_venues") or []
+        if not isinstance(venues, list) or any(not isinstance(v, str) for v in venues):
+            raise ValueError(f"defi_venues must be a list of strings, got {venues!r}")
+        data["defi_venues"] = list(venues)
 
         status = data.get("status", "")
         if status not in cls.VALID_STATUSES:

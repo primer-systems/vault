@@ -1,5 +1,108 @@
 # Changelog
 
+## 0.3.0
+
+Vault is now two published editions over one shared engine, and adds Morpho
+lending as a third policy lane alongside x402 payments and trading.
+
+### Added
+- **Morpho lending.** An agent can supply USDG to a Morpho vault and withdraw
+  it again, gated by its own policy rules — a per-deposit cap, a total-exposure
+  cap as a dollar figure and/or a percent of USDG held, a daily operation
+  ceiling, and an auto-approve threshold — through the HTTP API
+  (`POST /position`, `GET /position/status/{id}`, `POST /venues`), the CLI
+  (`position pending|approve|reject`, `venues`), and a Morpho tab in the
+  desktop policy dialog. Venues are resolved live from the chain: a trusted
+  curator address resolves to the vaults it curates and the markets it has
+  capped, re-checked on every read rather than cached, since a curator can be
+  reassigned at any time. "Restrict to Steakhouse," on by default, is the
+  venue control for this release. Exposure is read from chain on every check,
+  never accumulated locally, so it always agrees with what Morpho's own
+  interface shows for the same wallet. Every write is simulated on-chain
+  before it is offered for approval, and the full round trip — supply and
+  withdraw — is now live-tested on mainnet.
+- **A skill file for Morpho**, `skills/vault-morpho/SKILL.txt`, alongside the
+  existing agent docs — auth, `/venues`, `/position` supply and withdraw,
+  denominations, error codes, polling.
+- **Two editions.** **Vault Desktop** is the window, downloaded from Releases.
+  **Vault Terminal** is `pip install primer-vault` and ships without Qt — the
+  graphics library moved to a `desktop` extra, so it installs cleanly on a
+  machine with no screen. Both run the same engine, the same policies and the
+  same agent API, from the same source tree at the same version.
+- **One command, no modes.** `primer-vault` opens a session; `primer-vault
+  <command>` runs one and exits. Whether the process is the engine or attaches
+  to one already running is decided automatically by the instance lock.
+- **A live feed in the terminal.** Approval requests, signatures and trades
+  print as they happen, above whatever you are typing.
+- **Hardware wallet support in the terminal.** Ledger signing, and now
+  enrolment too: `address ledger list` reads addresses off the device,
+  `address ledger add <index>` enrols them, and `address ledger verify` checks
+  a stored address against the connected device — so a screenless machine can
+  set up a Ledger without a desktop session. Both editions derive through the
+  same code, so the same index always means the same address.
+- **A local control channel.** A second `primer-vault` against a running
+  engine attaches to it instead of being refused, which is what makes a Vault
+  started by the system at boot manageable at all.
+- **`primer-vault install-service`.** Registers Vault with systemd or Windows
+  Task Scheduler so it starts at boot.
+- **`startup-wallet` and `start-agent-api` settings**, so a rebooted machine
+  comes back serving. The password comes from `PRIMER_VAULT_PASSWORD`, never
+  from `settings.json`.
+- **`--json`.** Any command, or a piped batch, can print one JSON object per
+  command — `success`, `output`, `error`, and the structured `data` behind it —
+  instead of formatted text, for scripting against Vault without parsing
+  prose. Exit codes are unchanged.
+- **Proper line editing in the terminal** (history, Ctrl-R, tab completion),
+  which also keeps the live feed from eating a half-typed command.
+- **A CI job that installs the terminal edition with no Qt at all** and runs
+  the full non-GUI test suite against it.
+- **Wallet tab: an address chip replaces the address table.** A toolbar chip
+  drops the address list down on click, returning the space the old table
+  always reserved to what the selected address actually holds. Details and
+  Send moved behind a `⋯` beside the chip, and the address grew an inline
+  copy icon.
+
+### Changed
+- **Private key export requires the password every time**, even when the
+  wallet is already open.
+- **Approvals behave identically regardless of how Vault was started.** A
+  request that needs a human always queues, always appears in the live feed,
+  and expires on its timeout.
+- **History records one row per on-chain transaction, not per operation.** A
+  trade or a Morpho lend that needs a prior ERC-20 approval is two separate
+  transactions on-chain; each now settles and appears independently — in
+  History, the CLI, both CSV exports, and the agent-facing `/trade/status` and
+  `/position/status` responses (`approval_tx_hash`) — rather than sharing one
+  row.
+
+### Removed
+- **The Admin API and its client (~2,500 lines).** Replaced by the local
+  control channel above, which is not reachable over the network, is scoped
+  to the data directory, and needs no separate open/closed mode.
+- `config set admin-api`, the `--admin-open` flag, port 4664, and the
+  Settings → Security row that configured them.
+
+### Fixed
+- **A locked wallet is refused at intake**, rather than discovered only after
+  a human has approved a request that was never going to work. A locked-wallet
+  failure that slips through later is now reported accurately too, instead of
+  as a generic error.
+- **A node's outright rejection of a transaction is reported as exactly
+  that.** A synchronous rejection before broadcast (insufficient gas, a stale
+  nonce) is now distinguished from a timeout or dropped connection, where
+  whether anything reached the network is genuinely unknown: "Rejected before
+  broadcast: {reason}. Nothing was sent by this attempt."
+- **A pending trade or Morpho position stays reachable through approval.**
+  Approving a request could take real time — a re-quote, a policy re-check,
+  and up to two on-chain confirmations — and a status check landing in that
+  window used to report the request as not found. It now reports the request
+  as executing until the real result is ready.
+- The desktop build excludes the terminal stack explicitly, rather than
+  relying on it never being imported.
+- Qt no longer appears anywhere in the shared engine — the wallet dialogs
+  that depended on it moved into the desktop UI layer, and the rule keeping
+  Qt out of shared code now covers every shared package.
+
 ## 0.2.1
 
 ### Added

@@ -428,7 +428,7 @@ class TestNoPasswordIsNotOfferedInTheApp:
         minute later is the same hole with an extra step, so no dialog offers
         it."""
         dialogs = (Path(__file__).parent.parent / "src" / "primer_vault"
-                   / "wallet" / "dialogs.py").read_text(encoding="utf-8")
+                   / "ui" / "wallet_dialogs.py").read_text(encoding="utf-8")
         assert "no_password_check" not in dialogs
         assert "No password" not in dialogs
 
@@ -436,7 +436,7 @@ class TestNoPasswordIsNotOfferedInTheApp:
         """tabs.py may still pass the sentinel to load_wallet, to open a wallet
         made via the CLI. It must not be reachable as a creation choice."""
         dialogs = (Path(__file__).parent.parent / "src" / "primer_vault"
-                   / "wallet" / "dialogs.py").read_text(encoding="utf-8")
+                   / "ui" / "wallet_dialogs.py").read_text(encoding="utf-8")
         assert "NO_PASSWORD_SENTINEL" not in dialogs
 
 

@@ -1,4 +1,4 @@
-# Vault v0.2.0
+# Vault v0.3.0
 
 ![Tests](https://github.com/primer-systems/Vault/actions/workflows/test.yml/badge.svg)
 
@@ -21,25 +21,34 @@ AI agents need to transact on-chain, but giving an agent your private key is dan
 
 ## Quick Start
 
-```bash
-# Download the desktop app (no install needed) — this is the GUI only
-# https://github.com/primer-systems/Vault/releases
-#   For a terminal inside the app, use File → Console.
+Vault ships as two editions. They share one engine — the same keys, policies,
+signing and agent API — and differ only in how a person drives it.
 
-# Or install the command line — adds the `primer-vault` command (CLI + daemon)
-pip install primer-vault
+**Vault Desktop** — a window. Download and run; nothing to install.
 
-# Run
-primer-vault                    # GUI mode (default)
-primer-vault --cli              # Interactive terminal — pip install only
-primer-vault --headless         # Daemon mode (no GUI) — pip install only
+```
+https://github.com/primer-systems/Vault/releases
 ```
 
-The downloaded `Vault.exe` / `Vault` binary is the **GUI application only** — it
-has no terminal attached, so `--cli` cannot run from it and `--headless` would
-run with no console output. Use **File → Console** inside the window for a
-terminal, or `pip install primer-vault` for the command line and the headless
-daemon.
+**Vault Terminal** — one command, in any terminal, on any machine, with or
+without a screen.
+
+```bash
+pip install primer-vault
+
+primer-vault                    # a session: prompt, live feed, every command
+primer-vault status             # run one command and exit
+primer-vault install-service    # run Vault at boot (once, then never again)
+```
+
+There are no mode flags. If Vault is already running on this data directory —
+started by you, or by the system at boot — both forms attach to it instead of
+starting a second one. Closing your terminal never stops an engine you did not
+start.
+
+The two editions are separate programs. The downloaded binary is the window and
+contains no terminal interface; the pip package is the terminal and contains no
+graphics library. Install whichever fits the machine, or both.
 
 ### First run — "unknown publisher" warnings
 
@@ -78,11 +87,12 @@ Agents are isolated identities with unique credentials. Each agent has:
 - **Policy** — Assigned spending/trading rules
 - **Wallet Address** — Signs from a specific address
 
-Agent and wallet commands run in the Vault console (`primer-vault --cli`),
+Agent and wallet commands run in the terminal edition (`primer-vault`), or in
+the desktop window's built-in console (**File → Console**),
 where the wallet stays unlocked between commands:
 
 ```bash
-primer-vault --cli
+primer-vault
 > wallet create main                  # first run: creates and opens it (prompts for a password)
 > agent register MyAgent --auth bearer
 > agent commission MyAgent standard A001
@@ -199,7 +209,7 @@ seed, and its first address. Additional seeds and addresses are managed in the
 console (or the window):
 
 ```bash
-primer-vault --cli
+primer-vault
 > wallet open main
 > seed create --words 24
 > address create
@@ -211,11 +221,25 @@ Addresses can be backed by a Ledger device instead of an encrypted seed. The
 private keys stay on the device — Vault stores only the address and its
 derivation path, and every signature is produced on the Ledger itself.
 
-Add one from the wallet tab: **+ Add Address → Connect Ledger**. Pick a
+**Desktop** — **+ Add Address → Connect Ledger** in the wallet tab. Pick a
 derivation path, then choose addresses in the same browser used for software
 seeds — same layout, same inline renaming, same start-index and Load More.
 Addresses are read from the device in the background, so the dialog stays
 responsive while it works.
+
+**Terminal** — `address ledger`, which splits the same job the way the terminal
+already splits seed derivation: look, then commit an index.
+
+```bash
+address ledger list                          # read the first five off the device
+address ledger list --path-type bip44 --count 10
+address ledger add 0 "Trading desk"          # enrol one, named
+address ledger add 0,1,2                     # enrol several
+```
+
+Both editions derive through the same code, so index 0 on one is index 0 on the
+other. Addresses already in the wallet are marked in the listing rather than
+enrolled twice.
 
 | Path type | Template | Matches |
 |---|---|---|
@@ -241,20 +265,28 @@ Requirements:
 - **Blind signing must be enabled** (Ethereum app → Settings → Blind signing).
   Vault signs EIP-712 payment authorizations and DEX calldata, neither of which
   the device can decode on its own.
-- GUI mode only. Headless and CLI have no way to prompt for a device
-  confirmation, so they return `LEDGER_SIGN_NOT_AVAILABLE` for Ledger addresses.
+- Both editions can drive a Ledger: the desktop shows a dialog, the terminal
+  prints the same prompts. What neither can do is press the buttons for you, so
+  a machine running unattended cannot sign from a hardware address — requests
+  against one come back `LEDGER_SIGN_NOT_AVAILABLE`. Unattended machines want
+  software-held keys.
 
-Use **Verify on Ledger** in the wallet tab to confirm the connected device still
-derives a stored address before relying on it.
+Before relying on a stored address, confirm the connected device still derives
+it: **Verify on Ledger** in the desktop's wallet tab, or `address ledger verify
+<address>` in the terminal. A mismatch means a different device, or the same one
+restored from a different recovery phrase.
 
 ### Approval Workflow
 
 Requests below threshold → auto-approved. Above threshold → human approval dialog.
 
-- GUI shows modal dialog with full details
-- CLI uses `pending` / `approve` / `reject` commands
-- Headless mode approves over the Admin API, which a headless daemon has to be
-  started with `--admin-open` to expose (see **Admin API Security** below)
+- The desktop shows a modal dialog with the full details.
+- The terminal prints the request as it arrives and takes `pending` /
+  `approve <id>` / `reject <id>`.
+- Nothing tries to work out whether a person is actually watching. A request
+  that needs approval always queues, always appears in the feed, and expires on
+  its own timeout if nobody answers — so an agent gets the same treatment
+  whether or not somebody happens to be at the terminal.
 
 ---
 
@@ -284,7 +316,7 @@ Agent hits paywall → 402 + Payment-Required header
               Vault verifies on-chain, stores receipt
 ```
 
-Any agent framework can integrate via HTTP to `localhost:4663`. Bearer tokens for simplicity, HMAC-SHA256 for production security. The desktop window and `--headless` open this port automatically; in `--cli` mode, run `server start` in the console to open it (and `server status` / `server stop` to manage it).
+Any agent framework can integrate via HTTP to `localhost:4663`. Bearer tokens for simplicity, HMAC-SHA256 for production security. The desktop window opens this port automatically; in the terminal edition, `server start` opens it (`server status` / `server stop` to manage it), and `config set start-agent-api on` makes it come up by itself at launch — which is what a machine with nobody sitting at it needs.
 
 ### Protocol Support
 
@@ -441,108 +473,141 @@ Agents can trade with native ETH directly:
 
 ---
 
-## Deployment Modes
+## Running Vault
 
-### GUI Mode (Default)
+### Vault Desktop
 
 ![Vault GUI](https://github.com/primer-systems/Vault/blob/main/docs/screenshot.png?raw=true)
 
-Desktop application with tabs for agents, policies, wallet, and history.
+A window, with tabs for agents, policies, wallet and history. Download it from
+[Releases](https://github.com/primer-systems/Vault/releases) and run it; there is
+nothing to install.
 
-```bash
-primer-vault
-```
-
-Features:
-- Interactive approval dialogs
-- Real-time activity log
-- Built-in terminal console (File → Console)
+- Approval dialogs with the full request details
+- Live activity log
+- A console panel for the same commands the terminal edition takes (File →
+  Console)
 - System tray integration
 
-### CLI Mode
+Nothing outside the process can drive it. Anyone who wants Vault in a terminal
+installs the terminal edition, which runs its own engine.
 
-Interactive terminal or single commands for scripting.
+### Vault Terminal
+
+One command, and no modes.
 
 ```bash
-# Interactive REPL
-primer-vault --cli
-
-# Single commands
-primer-vault agent list
-primer-vault wallet status
+primer-vault                         # a session: prompt, live feed, all commands
+primer-vault agent list              # run one command and exit
 primer-vault policy create test --day 100
 
-# Scriptable with flags
-primer-vault wallet create main --password "a-strong-passphrase" --yes
+# For scripts, supply the answers a command would otherwise ask for. Prefer the
+# environment variable to --password: a password on the command line is
+# readable by every other user on the machine, and your shell records it.
+PRIMER_VAULT_PASSWORD="a-strong-passphrase" primer-vault wallet create main --yes
 ```
 
-### Headless Mode
+Whether this process *is* the engine or *talks to* one is not something you
+choose. Only one process may hold a data directory — two would each save whole
+files and erase the other's spend records and seeds — so `primer-vault` starts
+an engine if none is running and attaches to the running one if there is.
+Either way you get the same prompt and the same commands.
 
-Daemon with no GUI — agent API only.
+The agent API is a command like any other: `server start`, `server status`,
+`server stop`. To have it come up by itself, `config set start-agent-api on`.
+
+### Running on a server
+
+A program started inside a terminal dies when that terminal closes. To keep
+Vault running after you log out, and to bring it back after a reboot, register
+it with the machine's service manager:
 
 ```bash
-# Pass the password via the environment, not a --password flag. On Linux and
-# macOS, command-line arguments are readable by any other user on the machine.
-export PRIMER_VAULT_PASSWORD="a-strong-passphrase"
-
-primer-vault --headless \
-  --agent-port 4663 \
-  --admin-port 4664 \
-  --wallet main
+primer-vault install-service     # sudo on Linux; Administrator on Windows
 ```
 
-`--allow-lan` opens the agent API to your whole local network instead of just this
-machine. Requests are still authenticated, but the connection is not encrypted, so
-agent tokens cross the network in cleartext. Use it only on a network you trust, or
-put a TLS-terminating proxy in front of it.
+Run once. It does not start Vault — it writes the systemd unit (or Windows
+scheduled task) that tells the OS to run the plain `primer-vault` command at
+boot, and exits. From then on you can type `primer-vault` at any time to attach
+to whatever the system started, and close that terminal without stopping it.
 
-### Admin API Security
+A machine that reboots comes back with a locked wallet and nobody to type the
+password. Two settings and one environment variable cover that:
 
-By default, the Admin API (port 4664) operates in **GUI-only mode**. This means:
+```bash
+primer-vault config set startup-wallet main
+primer-vault config set start-agent-api on
+```
 
-- Only the embedded GUI can access admin endpoints (create agents, modify policies, etc.)
-- CLI and headless modes will receive HTTP 403 with a clear error message
-- This protects against local malware that could otherwise create agents and obtain tokens
+Vault reads the password from an environment variable — it never opens a file
+looking for one. Something else has to put the value in the environment before
+Vault starts, and where you do that depends on how long you want it to last.
 
-**You usually don't need to change this.** The Admin API only matters when the GUI
-(or the headless daemon) is already running and a separate CLI process wants to share
-that same instance. If the GUI is *not* running, `primer-vault <command>` loads the
-core directly and never uses HTTP at all — every CLI command works with the default
-setting untouched.
+**Just this terminal**, for trying things out:
 
-Change it only if you want CLI commands to reach a *running* GUI or daemon. For
-an instance that is already running, open the Admin API in the window
-(**Settings → Preferences → Security → Admin API**), or restart a headless
-daemon with `--admin-open` — a headless daemon has no window to be driven from,
-so without one of these the CLI cannot talk to it. (`primer-vault config set
-admin-api open` sets the mode for the *next* start; it cannot flip an instance
-that is already running.)
+```bash
+export PRIMER_VAULT_PASSWORD="a-strong-passphrase"   # Linux and macOS
+$env:PRIMER_VAULT_PASSWORD="a-strong-passphrase"     # Windows PowerShell
+```
 
-| Mode | Who can access Admin API |
-|------|-------------------------|
-| GUI Only (default) | Only the embedded GUI |
-| Open | Any local process on port 4664 |
+Gone when you close the terminal.
 
-**What "Open" costs you.** The Admin API has no authentication of its own —
-GUI-only mode is the whole of the protection. Opened, any process running as you
-can read `/wallet/addresses`, create a policy with limits of its choosing, create
-an agent and receive its token in the response, commission that agent to your
-funded address, and start the server. While the wallet is unlocked that is a
-complete drain path with no dialog and no confirmation. Open it deliberately, on
-a machine you trust, and close it again.
+**Every boot, on Linux.** Put the value in a file:
 
-In both modes, requests carrying a browser `Origin` header are rejected, so a web page
-you have open cannot issue commands to Vault in the background.
+```ini
+# /etc/primer-vault.env  —  chmod 600, and outside the Vault data directory.
+PRIMER_VAULT_PASSWORD=a-strong-passphrase
+```
 
-### Single Instance
+and point the service at it by uncommenting one line in
+`/etc/systemd/system/primer-vault.service`, which `install-service` wrote:
 
-One Vault instance owns a data folder at a time. On the default setting a
-running instance is driven only from its own window; the CLI can detect that an
-instance is running but cannot command it, and every command explains how to
-change that. To drive a running instance from the CLI, open the Admin API (port
-4664): Settings → Preferences → Security in the window, or — for a headless
-server — restart it with `--admin-open`. Once open, CLI commands drive the same
-instance and changes made in the terminal appear live in the window.
+```ini
+EnvironmentFile=/etc/primer-vault.env
+```
+
+systemd reads that file and hands the value to Vault every time it starts it.
+
+**Every boot, on Windows.** There is no equivalent file. Set it once under
+System Properties → Environment Variables → System variables → New, with the
+name `PRIMER_VAULT_PASSWORD`.
+
+`PRIMER_VAULT_DATA_DIR` moves the whole data directory, which is how one machine
+runs two independent Vaults: the instance lock, the wallet and the control
+channel are all scoped to that folder, so two of them share nothing.
+
+The password is deliberately not a setting. `settings.json` lives in the data
+directory beside the wallet file, so a password stored there would be readable
+by anyone who copies that folder — which is the one attack the wallet's
+encryption still defends against once a machine runs unattended. Storing it in
+the service configuration instead is the trade every unattended signing service
+makes; make it deliberately.
+
+`--allow-lan` on the agent API opens it to your whole local network instead of
+just this machine. Requests are still authenticated, but the connection is not
+encrypted, so agent tokens cross the network in cleartext. Use it only on a
+network you trust, or put a TLS-terminating proxy in front of it.
+
+### Control channel
+
+The terminal edition reaches a running engine over a loopback socket on an
+ephemeral port, recorded in `control.json` in the data directory alongside a
+token. It carries command lines and rendered replies — never keys, and never a
+mirror of the engine's API — and nothing outside that data directory can use it.
+It is not on the network, so there is nothing to firewall.
+
+This replaces the Admin API, which listened on a fixed port with no
+authentication of its own and had to ship switched off to be safe.
+
+### One instance per data folder
+
+One Vault owns a data folder at a time, enforced by an OS file lock that is
+released the instant the holding process dies. A second `primer-vault` does not
+fail — it attaches to the first one over the control channel, and changes made
+in the terminal appear live in the window.
+
+The lock is per data directory, not global: a portable build on a USB stick and
+a pip install on the same machine share no state and may run side by side.
 
 ---
 
@@ -557,14 +622,23 @@ instance and changes made in the terminal appear live in the window.
 │  • Wallet crypto (HD wallets, AES-256-GCM encryption)   │
 └─────────────────────────────────────────────────────────┘
                           ▲
-                          │ (direct calls or HTTP)
-          ┌───────────────┼───────────────┐
-          │               │               │
-┌─────────▼─────┐  ┌──────▼──────┐  ┌────▼────────┐
-│  GUI Mode     │  │  CLI Mode   │  │  Headless   │
-│  (PyQt6)      │  │  (terminal) │  │  (daemon)   │
-└───────────────┘  └─────────────┘  └─────────────┘
+                          │ method calls, in process
+              ┌───────────┴───────────┐
+              │                       │
+    ┌─────────▼─────────┐   ┌─────────▼─────────┐
+    │  Vault Desktop    │   │  Vault Terminal   │
+    │  (PyQt6 window)   │   │  (prompt + feed)  │
+    └───────────────────┘   └─────────┬─────────┘
+                                      │ local control channel
+                            ┌─────────▼─────────┐
+                            │  attached session │
+                            └───────────────────┘
 ```
+
+Each edition is one process holding one engine. The control channel exists only
+so a second terminal can reach an engine that already holds the data directory —
+it carries command lines and printed replies, and the commands themselves always
+run against a real `Vault`.
 
 ### Data Directory
 
@@ -655,8 +729,8 @@ your balances; CoinGecko values ETH-denominated trades against your policy
 limits. Both fail gracefully, and a failed price lookup escalates a trade to
 manual approval rather than valuing it with a stale number.
 
-Vault also *listens* on two loopback ports: `4663` for agents and `4664` for the
-CLI to reach a running instance. The Admin API (`4664`) is always bound to
+Vault also *listens* on `4663` for agents, and on an ephemeral loopback port for
+a second terminal to attach to a running engine. Both are bound to
 loopback and never accepts a connection from another machine. The agent API
 (`4663`) does too, unless you pass `--allow-lan`, which exposes only that port to
 your local network. Both refuse any request a web page initiated.
@@ -790,10 +864,13 @@ pip install pytest
 pytest tests/ -v
 
 # Run from source
-primer-vault                    # GUI
-primer-vault --cli              # CLI
-primer-vault --headless         # Daemon
+python -m primer_vault          # Vault Terminal
+python -m primer_vault --help
 ```
+
+The desktop edition enters through `src/primer_vault_entry.py` and needs the
+`desktop` extra (`pip install -e ".[desktop]"`), which is the only thing that
+pulls in Qt.
 
 ---
 

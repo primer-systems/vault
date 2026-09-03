@@ -55,6 +55,7 @@ class GUIApprovalHandler(QObject):
     # Signals to safely cross from HTTP thread to Qt main thread
     _approval_requested = pyqtSignal(object)
     _trade_approval_requested = pyqtSignal(object, object)  # (TradeRequest, TradeQuote)
+    _position_approval_requested = pyqtSignal(object, object)  # (PositionRequest, PositionQuote)
 
     def __init__(self, main_window: "MainWindow"):
         super().__init__(parent=main_window)
@@ -62,6 +63,7 @@ class GUIApprovalHandler(QObject):
         self._pending_dialogs: dict[str, QDialog] = {}
         self._approval_requested.connect(self._show_approval)
         self._trade_approval_requested.connect(self._show_trade_approval)
+        self._position_approval_requested.connect(self._show_position_approval)
 
     def request_approval(self, request: SigningRequest) -> None:
         """
@@ -82,6 +84,14 @@ class GUIApprovalHandler(QObject):
         """
         self._trade_approval_requested.emit(request, quote)
 
+    def request_position_approval(self, request, quote) -> None:
+        """Called when a Morpho supply or withdrawal needs manual approval.
+
+        The dialog calls core.approve_position() or core.reject_position() when
+        the user decides.
+        """
+        self._position_approval_requested.emit(request, quote)
+
     def _show_approval(self, request: SigningRequest) -> None:
         """Show approval dialog on the Qt main thread."""
         self._main_window.on_approval_needed(request)
@@ -89,6 +99,10 @@ class GUIApprovalHandler(QObject):
     def _show_trade_approval(self, request, quote) -> None:
         """Show trade approval dialog on the Qt main thread."""
         self._main_window.on_trade_approval_needed(request, quote)
+
+    def _show_position_approval(self, request, quote) -> None:
+        """Show lending approval dialog on the Qt main thread."""
+        self._main_window.on_position_approval_needed(request, quote)
 
     def on_approval_resolved(self, request_id: str, approved: bool, reason: Optional[str] = None) -> None:
         """
@@ -586,14 +600,13 @@ class MainWindow(QMainWindow):
     #: What may live in gui_settings.json - how this window looks and behaves,
     #: and nothing else.
     #:
-    #: Everything the daemon or the CLI also has to know belongs to the core's
+    #: Everything the terminal edition also has to know belongs to the core's
     #: settings.json instead, and is read from there: the server port, the
-    #: agent API's rate limit, the replay window, the admin API mode, the RPC
-    #: endpoint, and which wallet is open. Each of those was once kept here as
-    #: well, and each of the duplicates went wrong in its own way - a port the
-    #: window used but a headless run did not, a rate limit that reached
-    #: nothing, a replay window displayed as one value while another was
-    #: enforced.
+    #: agent API's rate limit, the replay window, the RPC endpoint, and which
+    #: wallet is open. Each of those was once kept here as well, and each of the
+    #: duplicates went wrong in its own way - a port the window used but an
+    #: unattended engine did not, a rate limit that reached nothing, a replay
+    #: window displayed as one value while another was enforced.
     #:
     #: `auto_lock_minutes` is the one security setting that stays, because
     #: auto-lock is a window that has been sitting idle; a daemon has no such
@@ -1383,14 +1396,228 @@ class MainWindow(QMainWindow):
                 tx_hash = response.get("tx_hash", "")
                 short_hash = f"{tx_hash[:10]}..." if tx_hash else ""
                 self.update_activity(f"Trade executed: {request.amount_in} {sym_in} → {sym_out} {short_hash}")
-            elif response.get("status") == "failed":
-                self.update_activity(f"Trade failed: {response.get('reason', 'Unknown error')}", is_error=True)
-                FramelessMessageBox.warning(self, "Trade Failed", response.get("reason", "Unknown error"))
+            elif response.get("status") in ("failed", "error"):
+                # "error" covers a guard clause caught here rather than inside
+                # execute_trade (e.g. the wallet locked between approval and
+                # this click) - same message shape either way, `reason` for
+                # one and `error` for the other, so both are read.
+                reason = response.get("reason") or response.get("error", "Unknown error")
+                self.update_activity(f"Trade failed: {reason}", is_error=True)
+                FramelessMessageBox.warning(self, "Trade Failed", reason)
             else:
                 self.update_activity(f"Trade approved: {request.amount_in} {sym_in} → {sym_out}")
         else:
             self.core.reject_trade(request.id, "User rejected")
             self.update_activity(f"Trade rejected: {request.amount_in} {sym_in} → {sym_out}", is_warning=True)
+
+    def on_position_approval_needed(self, request, quote):
+        """Handle a Morpho supply or withdrawal that needs manual approval."""
+        agent = (self.core.get_agent_by_id(request.agent_id)
+                 if hasattr(self.core, "get_agent_by_id") else None)
+        agent_name = agent.name if agent else request.agent_id
+
+        amount = self._lend_amount(quote)
+        symbol = self._lend_unit(quote)
+        verb = "supply" if request.action == "supply" else "withdraw"
+        venue = quote.venue_name or quote.venue[:16]
+
+        self.update_activity(
+            f"Lending approval needed: {agent_name} wants to {verb} "
+            f"{amount} {symbol} — {venue}",
+            is_warning=True)
+
+        if self._settings.get("toast_enabled", True):
+            if hasattr(self, "tray") and self.tray.isVisible():
+                self.tray.showMessage(
+                    "Lending Approval Required",
+                    f"{agent_name} wants to {verb} {amount} {symbol}",
+                    QSystemTrayIcon.MessageIcon.Information, 5000)
+
+        if self._settings.get("sound_enabled", True):
+            try:
+                import winsound
+                winsound.PlaySound("SystemExclamation",
+                                   winsound.SND_ALIAS | winsound.SND_ASYNC)
+            except (ImportError, RuntimeError):
+                pass
+
+        if self._settings.get("flash_taskbar", True):
+            try:
+                QApplication.alert(self, 0)
+            except Exception:
+                pass
+
+        self.show_position_approval_dialog(request, quote, agent_name)
+
+    @staticmethod
+    def _lend_amount(quote) -> str:
+        """The amount actually named by this request, as a human figure.
+
+        A share-denominated exit is keyed to `quote.shares`, not `quote.assets`
+        - the asset figure is only this quote's estimate of it and will have
+        moved by the time it settles, which is the whole reason a
+        share-denominated exit exists. Integer arithmetic throughout: the
+        asset is 6dp and a vault share 18dp, and a float loses the low digits
+        of the second.
+        """
+        from decimal import Decimal
+        if quote.by_shares:
+            return f"{Decimal(int(quote.shares)) / (10 ** int(quote.share_decimals)):f}"
+        return f"{Decimal(int(quote.assets)) / (10 ** int(quote.asset_decimals)):f}"
+
+    @staticmethod
+    def _lend_unit(quote) -> str:
+        """The unit label matching `_lend_amount`: shares, or the asset symbol."""
+        return "shares" if quote.by_shares else MainWindow._display_asset_symbol(quote)
+
+    @staticmethod
+    def _display_asset_symbol(quote) -> str:
+        """The asset's symbol, sanitised.
+
+        A symbol is free text the token's own contract returns. Strip control
+        characters and cap the length so it cannot write lines of its own into
+        the dialog, and fall back to the address, which is the real identity.
+        """
+        cleaned = "".join(
+            c for c in (quote.asset_symbol or "") if c.isprintable())[:16].strip()
+        return cleaned or format_address(quote.asset)
+
+    def show_position_approval_dialog(self, request, quote, agent_name: str):
+        """Show dialog to approve/reject a Morpho supply or withdrawal."""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+
+        amount = self._lend_amount(quote)
+        unit = self._lend_unit(quote)
+        symbol = self._display_asset_symbol(quote)
+        supplying = request.action == "supply"
+        verb = "supply" if supplying else "withdraw"
+
+        def human(atomic) -> str:
+            from decimal import Decimal
+            if atomic is None:
+                return "unknown"
+            return f"{Decimal(int(atomic)) / (10 ** int(quote.asset_decimals)):,.2f}"
+
+        # Without a dollar figure the limits could not be applied, which is
+        # often why this dialog is open. Say so - someone reading a row of
+        # limits is entitled to know when none of them were checked.
+        if quote.notional_usd:
+            value_str = f"${quote.notional_usd:.2f}"
+            unvalued_warning = ""
+        else:
+            value_str = "Could not be valued"
+            unvalued_warning = (
+                "\n\nThis could not be priced, so your per-deposit and exposure "
+                "limits could NOT be checked against it. Approving means "
+                "accepting it on the numbers above alone.")
+
+        # What the venue could return right now, which moves with other
+        # people's borrowing and is the thing nobody else shows. Worth seeing
+        # before a supply as well as a withdrawal.
+        exit_line = ""
+        if quote.venue_withdrawable is not None:
+            exit_line = (f"Venue can return now: "
+                         f"{human(quote.venue_withdrawable)} {symbol}\n")
+
+        steps_line = ""
+        if quote.approvals_needed:
+            steps_line = (f"Token approvals first: {quote.approvals_needed}, "
+                          f"then the {verb}\n")
+
+        # The transaction is keyed to whichever denomination was named above;
+        # the other is only this quote's estimate of it and will have moved
+        # by settlement - say so rather than let the two numbers look equally
+        # authoritative.
+        estimate_line = ""
+        if quote.by_shares:
+            estimate_line = (
+                f"Estimated in {symbol}: {human(quote.assets)} "
+                f"(will move before settlement)\n")
+
+        kind = "Vault" if quote.venue_kind == "vault" else "Market"
+        message = (
+            f"Agent '{agent_name}' is requesting to {verb} on Morpho.\n\n"
+            f"{verb.title()}: {amount} {unit}\n"
+            f"{estimate_line}"
+            f"{kind}: {quote.venue_name or ''}\n"
+            f"  {quote.venue}\n"
+            f"Asset:\n  {quote.asset}\n\n"
+            f"Value: {value_str}\n"
+            f"Already held here: {human(quote.current_position_assets)} {symbol}\n"
+            f"{exit_line}"
+            f"{steps_line}"
+            f"{unvalued_warning}")
+
+        dlg = FramelessMessageBox(
+            "Lending Approval Required", message, ["Approve", "Reject"],
+            parent=self, default_button=1, icon_type="question")
+        dlg.exec()
+
+        summary = f"{verb} {amount} {unit}"
+        if dlg.result_index() == 0:
+            response = self._execute_position_with_progress(request.id, summary)
+            status = response.get("status")
+            if status == "executed":
+                tx_hash = response.get("tx_hash", "")
+                short_hash = f"{tx_hash[:10]}..." if tx_hash else ""
+                self.update_activity(f"Lending executed: {summary} {short_hash}")
+            elif status in ("failed", "error"):
+                # "error" covers a guard clause caught here rather than inside
+                # execute_position (e.g. the wallet locked between approval
+                # and this click) - same message shape either way, `reason`
+                # for one and `error` for the other, so both are read.
+                reason = response.get("reason") or response.get("error", "Unknown error")
+                # Whether resending unchanged is sensible is the difference
+                # between a venue short of liquidity today and a request that
+                # can never work.
+                if response.get("retryable"):
+                    reason += "\n\nThis one is worth trying again later."
+                self.update_activity(f"Lending failed: {reason}", is_error=True)
+                FramelessMessageBox.warning(self, "Lending Failed", reason)
+            else:
+                self.update_activity(f"Lending approved: {summary}")
+        else:
+            self.core.reject_position(request.id, "User rejected")
+            self.update_activity(f"Lending rejected: {summary}", is_warning=True)
+
+    def _execute_position_with_progress(self, request_id: str, summary: str) -> dict:
+        """Run an approved lending operation on a worker, behind a progress dialog.
+
+        Same reasoning as the trading path: approve_position() re-reads the
+        venue, may submit a token approval, simulates, submits, and waits for a
+        receipt after each - minutes of blocking work on a slow chain, and the
+        Qt event loop cannot be held for it. Going through a worker also keeps
+        the Ledger prompt arriving by queued signal, exactly as it does when an
+        operation is auto-approved over HTTP.
+        """
+        from .dialogs import TradeProgressDialog
+        from .ledger_dialog import LedgerWorker
+
+        dialog = TradeProgressDialog(summary, self)
+        outcome = {}
+
+        def on_finished(result):
+            outcome["result"] = result
+            dialog.allow_close()
+            dialog.accept()
+
+        def on_error(message):
+            outcome["result"] = {"status": "failed", "reason": message}
+            dialog.allow_close()
+            dialog.accept()
+
+        worker = LedgerWorker(lambda: self.core.approve_position(request_id))
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        worker.start()
+        dialog.exec()
+        worker.wait()
+
+        return outcome.get("result") or {
+            "status": "failed",
+            "reason": "Vault could not confirm this operation. Check the log."}
 
     def _execute_trade_with_progress(self, request_id: str, summary: str) -> dict:
         """Run an approved trade on a worker thread, behind a progress dialog.
@@ -1762,8 +1989,6 @@ class MainWindow(QMainWindow):
             self.core.set_max_request_age(replay_window)
 
             # Apply admin API mode setting
-            if "admin_api_mode" in new_settings:
-                self.core.settings_manager.set_admin_api_mode(new_settings["admin_api_mode"])
 
             # Apply appearance / theme
             self.apply_theme(new_settings.get("theme", "light"))

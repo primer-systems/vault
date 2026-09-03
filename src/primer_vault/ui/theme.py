@@ -231,8 +231,8 @@ def _scrollbar_styles(p: dict) -> str:
     """
 
 
-def _label_roles(p: dict) -> str:
-    """Semantic label roles: muted, hint, error, success, etc."""
+def _label_roles(p: dict, font: str) -> str:
+    """Semantic label roles, plus the wallet address chip and its dropdown."""
     return f"""
     QLabel[role="muted"]   {{ color: {p['muted']}; }}
     QLabel[role="hint"]    {{ color: {p['muted']}; font-size: 11px; font-style: italic; }}
@@ -267,6 +267,67 @@ def _label_roles(p: dict) -> str:
 
     /* Section toggle checkboxes (bold, used as lane headers in dialogs) */
     QCheckBox[role="section-toggle"] {{ font-weight: bold; }}
+
+    /* The wallet's address chip and the list it drops down.
+       Styled to match QComboBox exactly - same input background, border and
+       arrow - so it reads as the same kind of control as every other dropdown
+       in the app, not a bespoke one. */
+    QToolButton[role="address-chip"] {{
+        font-family: "{font}";
+        font-size: 11px;
+        color: {p['text']};
+        background: {p['input_bg']};
+        border: 1px solid {p['line2']};
+        border-radius: 4px;
+        padding: 5px 8px;
+        text-align: left;
+    }}
+    QToolButton[role="address-chip"]:hover {{ border-color: {p['accent']}; }}
+    QToolButton[role="address-chip"]:disabled {{ color: {p['dim']}; }}
+
+    /* The menu button beside the chip: same height and border so the pair
+       reads as one control rather than a control and a stray button. */
+    QToolButton[role="chip-action"] {{
+        color: {p['muted']};
+        background: {p['raised']};
+        border: 1px solid {p['line2']};
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 12px;
+    }}
+    QToolButton[role="chip-action"]:hover {{
+        color: {p['text']};
+        border-color: {p['accent']};
+    }}
+    QToolButton[role="chip-action"]:disabled {{ color: {p['dim']}; }}
+
+    /* A bare glyph that sits inline with text - no chrome until hovered. */
+    QToolButton[role="icon-button"] {{
+        color: {p['muted']};
+        background: transparent;
+        border: none;
+        padding: 0px 4px;
+        font-size: 13px;
+    }}
+    QToolButton[role="icon-button"]:hover {{ color: {p['accent']}; }}
+
+    QFrame[role="dropdown"] {{
+        background: {p['bg']};
+        border: 1px solid {p['line2']};
+    }}
+    QListWidget[role="address-list"] {{
+        background: {p['bg']};
+        color: {p['text']};
+        border: none;
+    }}
+    QListWidget[role="address-list"]::item {{
+        padding: 4px 6px;
+    }}
+    QListWidget[role="address-list"]::item:selected {{
+        background: {p['accent_soft']};
+        color: {p['text']};
+    }}
+    QListWidget[role="address-list"]::item:hover {{ background: {p['alt']}; }}
     """
 
 
@@ -453,7 +514,7 @@ def build_qss(palette: dict) -> str:
         _container_styles(palette),
         _checkbox_styles(palette),
         _scrollbar_styles(palette),
-        _label_roles(palette),
+        _label_roles(palette, font),
         _special_containers(palette, font),
         _titlebar_styles(palette, is_dark),
         _dark_islands(palette, font, is_dark),

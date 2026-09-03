@@ -1,12 +1,22 @@
 """
 Transaction model.
 
-Records payment signing requests, trades, and transfers.
+Records payment signing requests, trades, transfers, lending operations, and
+the token approvals that precede a trade or a lend.
+
+One row is one on-chain transaction. A trade or a lend that needs a prior
+ERC-20 approval is two rows, not one - the approval is a real transaction
+with its own hash and its own settled/failed outcome, and folding it into the
+row for the transaction it enabled is how a settled approval used to end up
+attached to a "failed" record. Rows are not linked to each other; each is
+independently verifiable, the way any other wallet's activity list works.
 
 Transaction types:
 - x402: Payment for API access via x402 protocol
 - trade: Token swap via Uniswap
 - transfer: Outbound token transfer
+- lend: Morpho supply/withdraw
+- approve: ERC-20 allowance grant preceding a trade or a lend
 
 Status lifecycle:
 - received: Request received from agent
@@ -35,6 +45,8 @@ STATUS_FAILED = "failed"
 TYPE_X402 = "x402"
 TYPE_TRADE = "trade"
 TYPE_TRANSFER = "transfer"
+TYPE_LEND = "lend"
+TYPE_APPROVE = "approve"
 
 
 @dataclass
@@ -50,7 +62,7 @@ class Transaction:
     network: str                      # Network identifier (CAIP-2 or v1 name)
     status: str                       # received | signed | rejected | submitted | settled | failed
     auto_approved: bool               # Was this auto-approved by policy?
-    type: str = TYPE_X402             # x402 | trade | transfer
+    type: str = TYPE_X402             # x402 | trade | transfer | lend
     wallet_address: Optional[str] = None  # Wallet used for signing
     wallet_id: Optional[str] = None   # Wallet ID (W001, etc.)
     tx_hash: Optional[str] = None     # On-chain tx hash if settled
@@ -92,6 +104,15 @@ class Transaction:
     transfer_token: Optional[str] = None   # Token address (transfer, None = native)
     transfer_symbol: Optional[str] = None  # Token symbol (transfer)
     transfer_amount: Optional[str] = None  # Amount transferred (raw string)
+    # Approve-specific fields. Not the trade/lend columns: an approval has no
+    # counterparty amount to receive, and reusing token_in/symbol_in the way
+    # create_lend reuses them for lending is what made lend rows render wrong
+    # everywhere that didn't know the reuse convention. amount_in (above) is
+    # reused for the amount approved - that one field means "the input side
+    # of whatever this row is" consistently across trade/lend/approve.
+    approve_asset: Optional[str] = None    # Token address the allowance is on
+    approve_symbol: Optional[str] = None   # Token symbol, for display
+    approve_spender: Optional[str] = None  # Contract address granted the allowance
 
     @classmethod
     def create(
@@ -202,6 +223,97 @@ class Transaction:
         )
 
     @classmethod
+    def create_lend(
+        cls,
+        agent_id: str,
+        agent_name: str,
+        agent_code: str,
+        network: str,
+        action: str,
+        venue: str,
+        venue_name: str,
+        asset: str,
+        symbol: str,
+        amount_in: str,
+        wallet_address: str,
+        wallet_id: Optional[str] = None,
+        auto_approved: bool = False,
+    ) -> "Transaction":
+        """Create a supply/withdraw record.
+
+        Reuses the trade columns rather than adding lending-specific ones: the
+        history table already renders `symbol_in`/`symbol_out` as "out" and
+        "in", and a supply moves USDG out to a venue while a withdrawal moves it
+        back. `pool` carries the venue, the same way it carries a trade's pool.
+        """
+        supplying = action == "supply"
+        return cls(
+            id=str(uuid.uuid4()),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_code=agent_code,
+            amount_micro=0,
+            recipient="",
+            network=network,
+            status=STATUS_RECEIVED,
+            auto_approved=auto_approved,
+            type=TYPE_LEND,
+            wallet_address=wallet_address,
+            wallet_id=wallet_id,
+            token_in=asset if supplying else venue,
+            token_out=venue if supplying else asset,
+            symbol_in=symbol if supplying else venue_name,
+            symbol_out=venue_name if supplying else symbol,
+            amount_in=amount_in,
+            pool=venue,
+        )
+
+    @classmethod
+    def create_approve(
+        cls,
+        agent_id: str,
+        agent_name: str,
+        agent_code: str,
+        network: str,
+        asset: str,
+        symbol: str,
+        spender: str,
+        amount: str,
+        wallet_address: str,
+        wallet_id: Optional[str] = None,
+        auto_approved: bool = False,
+    ) -> "Transaction":
+        """Create a record for one ERC-20 approval, the transaction that
+        precedes a trade or a lend when the wallet has not already granted
+        enough allowance.
+
+        Its own row, not folded into the trade/lend it enables: an approval
+        is a real transaction with its own hash, and can settle even when the
+        transaction it was for then fails - which is exactly the case this
+        exists to represent correctly.
+        """
+        return cls(
+            id=str(uuid.uuid4()),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_code=agent_code,
+            amount_micro=0,
+            recipient="",
+            network=network,
+            status=STATUS_RECEIVED,
+            auto_approved=auto_approved,
+            type=TYPE_APPROVE,
+            wallet_address=wallet_address,
+            wallet_id=wallet_id,
+            approve_asset=asset,
+            approve_symbol=symbol,
+            approve_spender=spender,
+            amount_in=amount,
+        )
+
+    @classmethod
     def create_transfer(
         cls,
         agent_id: str,
@@ -272,7 +384,7 @@ class Transaction:
 
     # Valid status values for validation
     VALID_STATUSES = (STATUS_RECEIVED, STATUS_SIGNED, STATUS_REJECTED, STATUS_SUBMITTED, STATUS_SETTLED, STATUS_FAILED)
-    VALID_TYPES = (TYPE_X402, TYPE_TRADE, TYPE_TRANSFER)
+    VALID_TYPES = (TYPE_X402, TYPE_TRADE, TYPE_TRANSFER, TYPE_LEND, TYPE_APPROVE)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Transaction":
@@ -332,28 +444,62 @@ class Transaction:
     # Type-aware display helpers (for unified history display)
     # -------------------------------------------------------------------------
 
-    def display_out(self) -> str:
-        """What was spent/sent (unified column for all types)."""
+    @staticmethod
+    def _short(address: Optional[str]) -> str:
+        """An address truncated for a table cell, or '—' if there isn't one."""
+        return address[:10] + "…" if address and len(address) > 12 else (address or "—")
+
+    def lend_is_supply(self) -> bool:
+        """create_lend stores no explicit direction - infer it from which side
+        of token_in/token_out is the venue (`pool`), the same way the amount
+        columns were built."""
+        return self.pool is not None and self.pool == self.token_out
+
+    def display_activity(self) -> str:
+        """One human sentence describing this row, for the history table, both
+        CSV exports, and the CLI - the single place this formatting lives."""
+        if self.type == TYPE_APPROVE:
+            asset = self.approve_symbol or "?"
+            return f"Approve {asset} for {self._short(self.approve_spender)}"
+        if self.type == TYPE_TRADE:
+            amount = self.amount_in or "?"
+            sym_in = self.symbol_in or "?"
+            sym_out = self.symbol_out or "?"
+            if self.amount_out:
+                return f"Swap {amount} {sym_in} for {self.amount_out} {sym_out}"
+            return f"Swap {amount} {sym_in} for {sym_out}"
+        if self.type == TYPE_LEND:
+            supplying = self.lend_is_supply()
+            action = "Supply" if supplying else "Withdraw"
+            verb = "to" if supplying else "from"
+            amount = self.amount_in or "?"
+            asset = self.symbol_in if supplying else self.symbol_out
+            venue = self.symbol_out if supplying else self.symbol_in
+            return f"{action} {amount} {asset or '?'} {verb} {venue or '?'}"
+        if self.type == TYPE_TRANSFER:
+            sym = self.transfer_symbol or "ETH"
+            amount = self.transfer_amount or "?"
+            return f"Send {amount} {sym} to {self._short(self.recipient)}"
+        # x402
+        return f"Pay {self.resource or self.request_url or 'unknown resource'}"
+
+    def display_amount(self) -> str:
+        """The single value this row moved, or '—' for a row that moves
+        nothing (an approval grants an allowance, it does not transfer value)."""
+        if self.type == TYPE_APPROVE:
+            return "—"
         if self.type == TYPE_TRADE:
             sym = self.symbol_in or "?"
-            return f"{self.amount_in} {sym}" if self.amount_in else "?"
-        elif self.type == TYPE_TRANSFER:
+            return f"{self.amount_in} {sym}" if self.amount_in else "—"
+        if self.type == TYPE_LEND:
+            supplying = self.lend_is_supply()
+            asset = self.symbol_in if supplying else self.symbol_out
+            return f"{self.amount_in} {asset or '?'}" if self.amount_in else "—"
+        if self.type == TYPE_TRANSFER:
             sym = self.transfer_symbol or "ETH"
-            return f"{self.transfer_amount} {sym}" if self.transfer_amount else "?"
-        else:  # x402
-            return self.format_amount()
-
-    def display_in(self) -> str:
-        """What was received (unified column for all types)."""
-        if self.type == TYPE_TRADE:
-            sym = self.symbol_out or "?"
-            return f"{self.amount_out} {sym}" if self.amount_out else "?"
-        elif self.type == TYPE_TRANSFER:
-            # Transfers out don't "receive" anything
-            return "—"
-        else:  # x402
-            # For x402, the "in" is the resource/API access
-            return self.resource or self.request_url or "—"
+            return f"{self.transfer_amount} {sym}" if self.transfer_amount else "—"
+        # x402
+        return self.format_amount()
 
     def display_type_label(self) -> str:
         """Human-readable type label."""
@@ -361,14 +507,9 @@ class Transaction:
             TYPE_X402: "x402",
             TYPE_TRADE: "Trade",
             TYPE_TRANSFER: "Transfer",
+            TYPE_LEND: "Lend",
+            TYPE_APPROVE: "Approve",
         }.get(self.type, self.type)
-
-    def display_counterparty(self) -> str:
-        """Who we transacted with (recipient for transfers/x402, pool for trades)."""
-        if self.type == TYPE_TRADE:
-            return self.pool[:10] + "…" if self.pool and len(self.pool) > 12 else (self.pool or "—")
-        else:
-            return self.recipient[:10] + "…" if self.recipient and len(self.recipient) > 12 else (self.recipient or "—")
 
     @property
     def is_pending(self) -> bool:

@@ -72,18 +72,23 @@ def test_released_directory_can_be_reopened(temp_data_dir):
 # a second bind to a busy admin port fails, also on Windows
 # ---------------------------------------------------------------------------
 
-def test_second_admin_api_bind_on_same_port_is_refused():
-    """On Windows, SO_REUSEADDR let a second bind to an actively-listening
-    port succeed, so 'bind failed = another instance' never fired. The server
-    now uses SO_EXCLUSIVEADDRUSE on Windows instead.
+def test_second_agent_api_bind_on_same_port_is_refused():
+    """On Windows, SO_REUSEADDR let a second bind to an actively-listening port
+    succeed, so "bind failed" never fired and Vault would announce an agent API
+    that something else was answering. The server uses SO_EXCLUSIVEADDRUSE on
+    Windows instead.
+
+    This used to be checked on the admin API, which no longer exists. The agent
+    API is where it matters now - and it always mattered more, since that is
+    the port agents actually send money through.
     """
-    from primer_vault.daemon.admin_api import ThreadedAdminServer, AdminRequestHandler
+    from primer_vault.services.server import ThreadedHTTPServer, AgentRequestHandler
 
     port = 19731  # arbitrary high port unlikely to be in use
-    first = ThreadedAdminServer(("127.0.0.1", port), AdminRequestHandler)
+    first = ThreadedHTTPServer(("127.0.0.1", port), AgentRequestHandler)
     try:
         with pytest.raises(OSError):
-            second = ThreadedAdminServer(("127.0.0.1", port), AdminRequestHandler)
+            second = ThreadedHTTPServer(("127.0.0.1", port), AgentRequestHandler)
             second.server_close()
     finally:
         first.server_close()

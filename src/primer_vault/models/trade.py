@@ -9,7 +9,7 @@ legs the agent submits itself.
 V4 trades require additional fields: tick_spacing and hooks (to identify the pool).
 Version is inferred from field presence if not explicitly specified.
 
-This module is pure data (Qt-free), usable from the GUI, CLI, and headless daemon.
+This module is pure data (Qt-free), usable from either edition.
 """
 
 import re
@@ -272,6 +272,11 @@ class TradeResult:
     #: Stable identifier for the failure, so a caller can branch on something
     #: other than the wording of `reason`. Absent on success.
     code: Optional[str] = None
+    #: Hash of the ERC-20 approval this attempt sent, if one was needed and it
+    #: settled - independent of whether the swap itself then succeeded. An
+    #: approval that lands is a fact worth reporting even when `tx_hash`
+    #: above (the swap's) ends up None or belongs to a later revert.
+    approval_tx_hash: Optional[str] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)

@@ -28,6 +28,7 @@ from ..utils import is_browser_request, is_rebound_host
 from ..version import __version__
 
 if TYPE_CHECKING:
+    from .defi import DefiService
     from .signing import SigningService
     from .trading import TradingService
 
@@ -66,6 +67,9 @@ _signing_service: Optional["SigningService"] = None
 
 # Global trading service reference (set by AgentServer.set_trading_service)
 _trading_service: Optional["TradingService"] = None
+
+# Global DeFi service reference (set by AgentServer.set_defi_service)
+_defi_service: Optional["DefiService"] = None
 
 
 class RateLimiter:
@@ -135,7 +139,6 @@ rate_limiter = RateLimiter()
 #
 # This is the complete directory of every code the Vault emits, across the
 # agent API (this file, signing.py, trading.py), the admin API
-# (daemon/admin_api.py), and the bundled client (client/core_client.py).
 # Endpoints that pick their status another way (an explicit status argument,
 # or the status field of a service result) do not consult this map for those
 # responses, but every code still gets an entry here so the directory stays
@@ -170,7 +173,7 @@ ERROR_CODE_TO_HTTP_STATUS = {
     "MISSING_REQUEST_ID": 400,
     "MISSING_EVENT": 400,
     "FIELD_NOT_PERMITTED": 400,
-    # Admin API validation and operation failures (admin_api.py sends these
+    # Control-channel validation and operation failures (these codes are
     # with an explicit 400; listed here so the directory is complete)
     "MISSING_NAME": 400,
     "MISSING_FIELDS": 400,
@@ -351,14 +354,14 @@ def _load_skill(skill_name: str) -> Optional[str]:
 
 
 def get_agent_instructions() -> str:
-    """Serve combined agent instructions for both Vault skills.
+    """Serve combined agent instructions for every Vault skill.
 
-    Trading first (Vault's primary purpose), then x402 payments. The skills stay
-    as two separate, independently-installable files; this only joins them for the
-    single /agent onboarding page.
+    Trading first (Vault's primary purpose), then lending, then x402 payments.
+    The skills stay separate, independently-installable files; this only joins
+    them for the single /agent onboarding page.
     """
     sections = []
-    for skill_name in ("vault-trading", "vault-x402-payment"):
+    for skill_name in ("vault-trading", "vault-morpho", "vault-x402-payment"):
         section = _load_skill(skill_name)
         if section:
             sections.append(section)
@@ -369,9 +372,9 @@ def get_agent_instructions() -> str:
     header = (
         "# Primer Vault — Agent Instructions\n\n"
         "Primer Vault holds the user's crypto keys and enforces their limits, so "
-        "you never handle keys directly. It does two things: **trading** (Uniswap "
-        "swaps on Robinhood Chain) and **x402 payments** (paying for APIs). Both "
-        "capabilities are documented below.\n"
+        "you never handle keys directly. It does three things: **trading** (Uniswap "
+        "swaps on Robinhood Chain), **lending** (supplying USDG on Morpho) and "
+        "**x402 payments** (paying for APIs). All three are documented below.\n"
     )
     return header + "\n\n---\n\n" + "\n\n---\n\n".join(sections)
 
@@ -619,6 +622,21 @@ def get_branded_html(port: int) -> str:
               <td>Poll for a trade result</td>
             </tr>
             <tr>
+              <td><code>/venues</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>Morpho venues this agent&#39;s policy permits, and what it holds in them</td>
+            </tr>
+            <tr>
+              <td><code>/position</code></td>
+              <td><span class="method method-post">POST</span></td>
+              <td>Supply to or withdraw from a Morpho vault or market</td>
+            </tr>
+            <tr>
+              <td><code>/position/status/{{id}}</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>Poll for a Morpho supply/withdraw result</td>
+            </tr>
+            <tr>
               <td><code>/sign</code></td>
               <td><span class="method method-post">POST</span></td>
               <td>Submit an x402 request for signing</td>
@@ -727,7 +745,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     # the right one rather than a bare 404.
     # Note: /sign/status/{id} and /receipt/{id} are dynamic paths handled separately
     GET_ENDPOINTS = frozenset(["/", "/agent", "/sign/helper", "/status", "/health"])
-    POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade", "/balances"])
+    POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade",
+                                "/balances", "/position", "/venues"])
 
     def _send_method_not_allowed(self, allowed_methods: list[str]):
         """Send 405 Method Not Allowed response."""
@@ -1012,6 +1031,25 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
                     self._send_json_response(200, result)
             else:
                 self._send_json_response(503, {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"})
+        elif base_path.startswith("/position/status/"):
+            # Position status endpoint: GET /position/status/{request_id}
+            request_id = base_path[17:]  # Strip "/position/status/"
+            if not request_id:
+                self._send_json_response(400, {"status": "error", "error": "Missing request ID", "code": "MISSING_REQUEST_ID"})
+                return
+            if not UUID_PATTERN.match(request_id):
+                self._send_json_response(400, {"status": "error", "error": "Invalid request ID format", "code": "INVALID_REQUEST_ID"})
+                return
+            if _defi_service:
+                result = _defi_service.get_position_status(request_id)
+                if result.get("code") == "REQUEST_NOT_FOUND":
+                    self._send_json_response(404, result)
+                elif result.get("status") == "pending":
+                    self._send_json_response(202, result)
+                else:
+                    self._send_json_response(200, result)
+            else:
+                self._send_json_response(503, {"status": "error", "error": "Service not ready", "code": "SERVICE_NOT_READY"})
         elif base_path.startswith("/receipt/"):
             # AP2 receipt endpoint: GET /receipt/{tx_id}
             tx_id = base_path[9:]  # Strip "/receipt/"
@@ -1221,6 +1259,77 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             else:
                 self._send_service_unavailable({"status": "error", "error": "Trading service not ready", "code": "SERVICE_NOT_READY"})
 
+        elif self.path == "/position":
+            agent_id = request_data.get("agent_id")
+            signature = request_data.get("signature")
+            position = request_data.get("position")
+
+            if not agent_id:
+                self._send_json_response(400, {"status": "error", "error": "Missing agent_id", "code": "MISSING_AGENT_ID"})
+                return
+            if not signature:
+                self._send_json_response(400, {"status": "error", "error": "Missing signature", "code": "MISSING_SIGNATURE"})
+                return
+            if not isinstance(position, dict):
+                self._send_json_response(400, {"status": "error", "error": "Missing position object", "code": "MISSING_POSITION"})
+                return
+
+            if _defi_service:
+                result = _defi_service.handle_position_request(
+                    agent_id, position, signature=signature)
+                status = result.get("status")
+                error_code = result.get("code")
+                if status == "executed":
+                    status_code = 200
+                elif status == "pending":
+                    status_code = 202
+                elif error_code == "WALLET_LOCKED":
+                    self._send_service_unavailable(result)
+                    return
+                elif error_code == "INSUFFICIENT_LIQUIDITY":
+                    # The venue cannot free the amount today but may tomorrow.
+                    # 503 with Retry-After says "come back", which is exactly
+                    # what this failure means and what 400 or 500 would not.
+                    self._send_service_unavailable(result, retry_after=60)
+                    return
+                elif status == "rejected":
+                    # Understood and refused - policy, shape, or a venue nobody
+                    # curates. Changing the request is what helps.
+                    status_code = 400
+                elif status == "failed":
+                    # Accepted, then something went wrong here or on-chain. The
+                    # request was fine, so a 400 would send the caller off to
+                    # fix something that was never wrong.
+                    status_code = 500
+                else:
+                    status_code = get_http_status_for_error(error_code) if error_code else 200
+                self._send_json_response(status_code, result)
+            else:
+                self._send_service_unavailable({"status": "error", "error": "DeFi service not ready", "code": "SERVICE_NOT_READY"})
+
+        elif self.path == "/venues":
+            # Which venues this agent's policy permits, so an agent can find out
+            # rather than discover it by being refused. Authenticated the same
+            # way everything else is: the answer depends on the caller's policy.
+            agent_id = request_data.get("agent_id")
+            signature = request_data.get("signature")
+            if not agent_id:
+                self._send_json_response(400, {"status": "error", "error": "Missing agent_id", "code": "MISSING_AGENT_ID"})
+                return
+            if not signature:
+                self._send_json_response(400, {"status": "error", "error": "Missing signature", "code": "MISSING_SIGNATURE"})
+                return
+            if _defi_service:
+                result = _defi_service.handle_venues_request(agent_id, signature)
+                code = result.get("code")
+                if code == "WALLET_LOCKED":
+                    self._send_service_unavailable(result)
+                    return
+                status_code = get_http_status_for_error(code) if code else 200
+                self._send_json_response(status_code, result)
+            else:
+                self._send_service_unavailable({"status": "error", "error": "DeFi service not ready", "code": "SERVICE_NOT_READY"})
+
         elif self.path == "/callback":
             # Agent callback to report transaction status
             agent_id = request_data.get("agent_id")
@@ -1424,6 +1533,11 @@ class AgentServer:
         """Set the trading service for handling /trade requests."""
         global _trading_service
         _trading_service = trading_service
+
+    def set_defi_service(self, defi_service: "DefiService") -> None:
+        """Set the DeFi service for handling /position and /venues requests."""
+        global _defi_service
+        _defi_service = defi_service
 
     def start(self, port: int = 4663, allow_lan: bool = False) -> bool:
         """

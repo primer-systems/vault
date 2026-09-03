@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import math
 
 from .result import CommandResult
-from ..models.policy import TradingRules
+from ..models.policy import DefiRules, TradingRules
 
 
 def _parse_limit_float(s: str) -> float:
@@ -117,7 +117,8 @@ Use 'policy <subcommand> --help' for detailed options."""
             per_req_str = f"${per_req:.2f}" if per_req is not None else "unlimited"
             x402_str = " [x402]" if policy.x402_enabled else ""
             trading_str = " [trading]" if policy.is_trading_enabled() else ""
-            lines.append(f"  {policy.name}  daily: ${daily:.2f}  max: {per_req_str}  auto: ${auto:.2f}{x402_str}{trading_str}")
+            morpho_str = " [morpho]" if policy.is_defi_enabled() else ""
+            lines.append(f"  {policy.name}  daily: ${daily:.2f}  max: {per_req_str}  auto: ${auto:.2f}{x402_str}{trading_str}{morpho_str}")
 
         return CommandResult.ok("\n".join(lines), data={"policies": [
             {
@@ -128,6 +129,7 @@ Use 'policy <subcommand> --help' for detailed options."""
                 "per_request_max": p.per_request_max_micro / 1_000_000 if p.per_request_max_micro is not None else None,
                 "auto_approve_below": (p.auto_approve_below_micro / 1_000_000) if p.auto_approve_below_micro else 0,
                 "trading_enabled": p.is_trading_enabled(),
+                "morpho_enabled": p.is_defi_enabled(),
             }
             for p in policies
         ]})
@@ -236,11 +238,21 @@ Trading Options:
   --max-slip <percent>     Maximum slippage percent (default: 3.0)
   --max-impact <percent>   Max price impact incl. fee (default: 5.0)
 
+Morpho Lending Options:
+  --morpho                 Enable Morpho lending for this policy
+  --morpho-max <amount>    Maximum per deposit in USD (default: 100)
+  --morpho-total <amount>  Maximum deployed at once in USD (default: 500)
+  --morpho-percent <pct>   Also cap at this share of USDG held plus deployed
+  --morpho-ops <count>     Deposits + withdrawals per day (default: 20)
+  --morpho-auto <amount>   Auto-approve operations below this USD amount
+  --no-restrict            Allow any Morpho venue, not only Steakhouse's
+
 Examples:
   policy create standard
   policy create premium --day 500 --txn 50 --auto 5
   policy create trader --trading --trade-max 200 --trade-daily 1000 --trade-auto 25
-  policy create trading-only --no-x402 --trading --trade-max 100""")
+  policy create trading-only --no-x402 --trading --trade-max 100
+  policy create lender --no-x402 --morpho --morpho-max 50 --morpho-total 250""")
 
     def _create(self, args: list[str]) -> CommandResult:
         """Create a new policy."""
@@ -260,6 +272,13 @@ Examples:
 
         # Trading options
         trading_enabled = False
+        morpho_enabled = False
+        morpho_max = 100.0
+        morpho_total = 500.0
+        morpho_percent = None
+        morpho_ops = 20
+        morpho_auto = None
+        morpho_restrict = True
         trade_max = 100.0
         trade_daily = 500.0
         trade_auto = None
@@ -362,6 +381,53 @@ Examples:
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --max-impact: {args[i + 1]}")
                 i += 2
+            elif args[i] == "--morpho":
+                morpho_enabled = True
+                i += 1
+            elif args[i] == "--no-restrict":
+                morpho_restrict = False
+                i += 1
+            elif args[i] == "--morpho-max" and i + 1 < len(args):
+                try:
+                    morpho_max = _parse_limit_float(args[i + 1])
+                except ValueError:
+                    return CommandResult.fail(
+                        f"Invalid value for --morpho-max: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-total" and i + 1 < len(args):
+                try:
+                    morpho_total = _parse_limit_float(args[i + 1])
+                except ValueError:
+                    return CommandResult.fail(
+                        f"Invalid value for --morpho-total: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-percent" and i + 1 < len(args):
+                try:
+                    morpho_percent = _parse_limit_float(args[i + 1])
+                    if not 0 <= morpho_percent <= 100:
+                        return CommandResult.fail(
+                            f"Morpho percent must be 0-100: {args[i + 1]}")
+                except ValueError:
+                    return CommandResult.fail(
+                        f"Invalid value for --morpho-percent: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-ops" and i + 1 < len(args):
+                try:
+                    morpho_ops = int(args[i + 1])
+                    if morpho_ops < 1:
+                        return CommandResult.fail(
+                            "Morpho operations per day must be at least 1")
+                except ValueError:
+                    return CommandResult.fail(
+                        f"Invalid value for --morpho-ops: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-auto" and i + 1 < len(args):
+                try:
+                    morpho_auto = _parse_limit_float(args[i + 1])
+                except ValueError:
+                    return CommandResult.fail(
+                        f"Invalid value for --morpho-auto: {args[i + 1]}")
+                i += 2
             elif args[i].startswith("--"):
                 return CommandResult.fail(
                     f"Unknown option: {args[i]}\n"
@@ -383,6 +449,28 @@ Examples:
                 max_price_impact_percent=max_impact,
             )
 
+        # Morpho rules. The curator list is not a command-line option: it is
+        # the mechanism behind --no-restrict rather than a choice, and an
+        # address typed at a prompt is exactly the kind of thing nobody can
+        # check. Vault ships the list.
+        defi_rules = None
+        if morpho_enabled:
+            from ..networks import DEFAULT_NETWORK, get_morpho
+            config = get_morpho(DEFAULT_NETWORK)
+            defi_rules = DefiRules(
+                enabled=True,
+                restrict_to_steakhouse=morpho_restrict,
+                morpho_curators=list(config.default_curators) if config else [],
+                max_deposit_usd=morpho_max,
+                max_total_deployed_usd=morpho_total,
+                max_deployed_percent=morpho_percent,
+                max_ops_per_day=morpho_ops,
+                auto_approve_below_usd=morpho_auto,
+            )
+            ok, reason = defi_rules.validate()
+            if not ok:
+                return CommandResult.fail(reason)
+
         try:
             policy = self.core.create_policy(
                 name=name,
@@ -394,10 +482,17 @@ Examples:
                 blocked_domains=block_domains,
                 trading_rules=trading_rules,
                 x402_enabled=x402_enabled,
+                defi_rules=defi_rules,
             )
             x402_status = " [x402]" if x402_enabled else ""
             trading_status = " [trading]" if trading_rules else ""
-            return CommandResult.ok(f"Policy '{policy.name}' created{x402_status}{trading_status}.", data={"policy_id": policy.id})
+            morpho_status = ""
+            if defi_rules:
+                morpho_status = (" [morpho]" if defi_rules.restrict_to_steakhouse
+                                 else " [morpho: any venue]")
+            return CommandResult.ok(
+                f"Policy '{policy.name}' created{x402_status}{trading_status}{morpho_status}.",
+                data={"policy_id": policy.id})
         except ValueError as e:
             return CommandResult.fail(str(e))
 
@@ -425,12 +520,24 @@ Trading Options:
   --max-slip <percent>     Maximum slippage percent
   --max-impact <percent>   Max price impact incl. fee
 
-Only specified options will be changed.
+Morpho Lending Options:
+  --morpho <on|off>        Enable or disable Morpho lending
+  --restrict <on|off>      Restrict to Steakhouse's vaults, or allow any venue
+  --morpho-max <amount>    Maximum per deposit in USD
+  --morpho-total <amount>  Maximum deployed at once in USD
+  --morpho-percent <pct>   Also cap at this share of USDG held plus deployed (use 'off' to disable)
+  --morpho-ops <count>     Deposits + withdrawals per day
+  --morpho-auto <amount>   Auto-approve operations below this USD amount (use 'off' to disable)
+
+Only specified options will be changed. Enabling Morpho lending for the first
+time on a policy that has never had it seeds the same defaults as
+'policy create --morpho'.
 
 Examples:
   policy edit standard --day 200 --auto 10
   policy edit trader --trading on --trade-max 500
-  policy edit test --x402 off --trading on""")
+  policy edit test --x402 off --trading on
+  policy edit lender --morpho on --morpho-max 50 --morpho-total 250""")
 
     def _edit(self, args: list[str]) -> CommandResult:
         """Edit an existing policy."""
@@ -448,6 +555,7 @@ Examples:
         # rather than half-edited (it is the live store object).
         policy_changes = []       # (attr, value) on the policy itself
         trading_changes = []      # (attr, value) on its trading rules
+        defi_changes = []         # (attr, value) on its Morpho/DeFi rules
         i = 1
         while i < len(args):
             if args[i] == "--day" and i + 1 < len(args):
@@ -577,6 +685,81 @@ Examples:
                 except ValueError:
                     return CommandResult.fail(f"Invalid value for --max-impact: {args[i + 1]}")
                 i += 2
+            # Morpho lending options
+            elif args[i] == "--morpho" and i + 1 < len(args):
+                val = args[i + 1].strip().lower()
+                if val not in ("on", "off"):
+                    return CommandResult.fail(f"--morpho must be 'on' or 'off', got: {args[i + 1]}")
+                defi_changes.append(("enabled", val == "on"))
+                changes.append(f"morpho: {val}")
+                i += 2
+            elif args[i] == "--restrict" and i + 1 < len(args):
+                val = args[i + 1].strip().lower()
+                if val not in ("on", "off"):
+                    return CommandResult.fail(f"--restrict must be 'on' or 'off', got: {args[i + 1]}")
+                defi_changes.append(("restrict_to_steakhouse", val == "on"))
+                changes.append(f"restrict to Steakhouse: {val}")
+                i += 2
+            elif args[i] == "--morpho-max" and i + 1 < len(args):
+                try:
+                    value = _parse_limit_float(args[i + 1])
+                    if value < 0:
+                        return CommandResult.fail(f"Morpho max deposit cannot be negative: {args[i + 1]}")
+                    defi_changes.append(("max_deposit_usd", value))
+                    changes.append(f"morpho max deposit: ${value:.2f}")
+                except ValueError:
+                    return CommandResult.fail(f"Invalid value for --morpho-max: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-total" and i + 1 < len(args):
+                try:
+                    value = _parse_limit_float(args[i + 1])
+                    if value < 0:
+                        return CommandResult.fail(f"Morpho total deployed cannot be negative: {args[i + 1]}")
+                    defi_changes.append(("max_total_deployed_usd", value))
+                    changes.append(f"morpho max deployed: ${value:.2f}")
+                except ValueError:
+                    return CommandResult.fail(f"Invalid value for --morpho-total: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-percent" and i + 1 < len(args):
+                val = args[i + 1].strip().lower()
+                if val == "off":
+                    defi_changes.append(("max_deployed_percent", None))
+                    changes.append("morpho percent cap: off")
+                else:
+                    try:
+                        value = _parse_limit_float(args[i + 1])
+                        if not 0 <= value <= 100:
+                            return CommandResult.fail(f"Morpho percent must be 0-100: {args[i + 1]}")
+                        defi_changes.append(("max_deployed_percent", value))
+                        changes.append(f"morpho percent cap: {value}%")
+                    except ValueError:
+                        return CommandResult.fail(f"Invalid value for --morpho-percent: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-ops" and i + 1 < len(args):
+                try:
+                    value = int(args[i + 1])
+                    if value < 1:
+                        return CommandResult.fail("Morpho operations per day must be at least 1")
+                    defi_changes.append(("max_ops_per_day", value))
+                    changes.append(f"morpho ops/day: {value}")
+                except ValueError:
+                    return CommandResult.fail(f"Invalid value for --morpho-ops: {args[i + 1]}")
+                i += 2
+            elif args[i] == "--morpho-auto" and i + 1 < len(args):
+                val = args[i + 1].strip().lower()
+                if val == "off":
+                    defi_changes.append(("auto_approve_below_usd", None))
+                    changes.append("morpho auto: off")
+                else:
+                    try:
+                        value = _parse_limit_float(args[i + 1])
+                        if value < 0:
+                            return CommandResult.fail(f"Morpho auto-approve cannot be negative: {args[i + 1]}")
+                        defi_changes.append(("auto_approve_below_usd", value))
+                        changes.append(f"morpho auto: ${value:.2f}")
+                    except ValueError:
+                        return CommandResult.fail(f"Invalid value for --morpho-auto: {args[i + 1]}")
+                i += 2
             elif args[i].startswith("--"):
                 return CommandResult.fail(
                     f"Unknown option: {args[i]}\n"
@@ -596,6 +779,26 @@ Examples:
                 policy.trading_rules = TradingRules()
             for field_name, value in trading_changes:
                 setattr(policy.trading_rules, field_name, value)
+        if defi_changes:
+            if policy.defi_rules is None:
+                # Same seeding policy create uses: the curator list is not a
+                # choice offered here either (see policy create's comment),
+                # so a policy edited into its first Morpho rules starts
+                # trusting the same shipped curator create would have given it.
+                from ..networks import DEFAULT_NETWORK, get_morpho
+                config = get_morpho(DEFAULT_NETWORK)
+                # Same defaults as policy create, so a first `--morpho on`
+                # here succeeds validation the same way `policy create
+                # --morpho` does, rather than failing for want of an
+                # exposure limit nobody was asked to set.
+                policy.defi_rules = DefiRules(
+                    morpho_curators=list(config.default_curators) if config else [],
+                    max_total_deployed_usd=500.0)
+            for field_name, value in defi_changes:
+                setattr(policy.defi_rules, field_name, value)
+            ok, reason = policy.defi_rules.validate()
+            if not ok:
+                return CommandResult.fail(reason)
 
         try:
             self.core.update_policy(policy)

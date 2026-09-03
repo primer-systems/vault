@@ -1,3 +1,3 @@
-"""PyInstaller entry point for Vault. Must live outside the package."""
-from primer_vault.app import main
+"""PyInstaller entry point for Vault Desktop. Must live outside the package."""
+from primer_vault.app_desktop import main
 main()

@@ -270,6 +270,27 @@ class TestManualApproval:
         assert adapter.sent == []
         assert agent.trading_volume_today_usd == 0.0
 
+    def test_a_status_poll_during_execution_never_reads_not_found(self, monkeypatch):
+        """approve_trade pops the request from the pending queue before
+        execute_trade runs, which can take real time on a live chain. A poll
+        landing in that window must not read REQUEST_NOT_FOUND -
+        indistinguishable from an id that never existed - for a trade a
+        human just approved.
+        """
+        svc, _, _, _, rid = self._pending(monkeypatch)
+        seen_mid_flight = {}
+        real_execute = svc.execute_trade
+
+        def spying_execute(*args, **kwargs):
+            seen_mid_flight["status"] = svc.get_trade_status(rid)["status"]
+            return real_execute(*args, **kwargs)
+
+        monkeypatch.setattr(svc, "execute_trade", spying_execute)
+        result = svc.approve_trade(rid)
+
+        assert seen_mid_flight["status"] == "executing"
+        assert svc.get_trade_status(rid)["status"] == result["status"]
+
     def test_a_bookkeeping_failure_cannot_lose_a_completed_swap(self, monkeypatch):
         """Everything after the swap runs when the money has already moved, so
         it must not be able to throw away the fact that it did."""
@@ -432,10 +453,22 @@ class TestSignerAvailability:
         svc = self._service_with(is_hardware=False, tx_signer=None)
         assert svc._signer_unavailable(self._request()) is None
 
-    def test_a_locked_wallet_is_left_to_the_usual_path(self):
-        """Not this check's job - WALLET_LOCKED is reported where it always was."""
+    def test_a_locked_wallet_is_refused_here_too(self):
+        """Same shape of problem as a hardware signer with nothing to drive
+        it: without this, the trade would quote, pass policy, take a request
+        id, wait for a human to approve it, and only then fail - because
+        nothing checked whether anything could sign it in the first place."""
         from primer_vault.services.trading import TradingService
         svc = TradingService()
         svc.set_wallet_provider(lambda address: None)
         svc.set_hardware_tx_signer(None)
+        result = svc._signer_unavailable(self._request())
+        assert result is not None
+        assert result["code"] == "WALLET_LOCKED"
+
+    def test_no_wallet_provider_at_all_is_left_to_the_usual_path(self):
+        """No provider configured means Vault cannot even ask - a different,
+        earlier problem than a wallet that exists but is locked."""
+        from primer_vault.services.trading import TradingService
+        svc = TradingService()
         assert svc._signer_unavailable(self._request()) is None

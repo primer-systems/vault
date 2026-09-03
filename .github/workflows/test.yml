@@ -7,6 +7,52 @@ on:
     branches: [main, master, develop]
 
 jobs:
+
+  # The Terminal edition, installed the way a user installs it: `pip install
+  # primer-vault`, with no `[desktop]` extra and therefore no Qt on the machine
+  # at all. This is the only job that can prove the claim - every other job has
+  # PyQt6 installed, so a Qt import that leaked back into the shared tier would
+  # pass there and fail on every server.
+  #
+  # The file selection is computed rather than listed: every test that names
+  # neither Qt nor the ui package is a test the Terminal edition must pass. A
+  # hand-written list would rot the first time somebody added a test and
+  # forgot to add it here.
+  terminal-edition:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the Terminal edition only
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install pytest pytest-mock pytest-asyncio
+
+      - name: Prove Qt is genuinely absent
+        run: |
+          if python -c "import PyQt6" 2>/dev/null; then
+            echo "PyQt6 is installed; this job proves nothing. Check the"
+            echo "[project.optional-dependencies] split in pyproject.toml."
+            exit 1
+          fi
+          echo "PyQt6 is not installed, as expected"
+
+      - name: The terminal edition starts
+        run: python -m primer_vault --version
+
+      - name: Run every test that does not need Qt
+        run: |
+          FILES=$(grep -L -E "PyQt6|qapp|primer_vault\.ui" tests/test_*.py | tr '\n' ' ')
+          echo "Running: $FILES"
+          python -m pytest $FILES -q
+
   test:
     # Vault is a desktop application whose primary target is Windows, and the
     # release workflow builds macOS and Linux binaries too. Testing only on

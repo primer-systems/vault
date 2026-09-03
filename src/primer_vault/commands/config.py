@@ -4,7 +4,6 @@ Config commands - CLI interface for settings management.
 
 from typing import TYPE_CHECKING
 
-from ..core.settings import ADMIN_API_MODE_GUI_ONLY, ADMIN_API_MODE_OPEN
 from .result import CommandResult
 from ..networks import NETWORKS
 
@@ -52,7 +51,8 @@ class ConfigCommands:
             "  config get <setting>        Read one setting\n"
             "  config set <setting> <val>  Change one setting\n\n"
             "Settings:\n"
-            "  admin-api           open | gui-only  (who may drive a running instance)\n"
+            "  startup-wallet      wallet name, or none  (opened at launch)\n"
+            "  start-agent-api     on | off  (serve agents from launch)\n"
             "  verify-settlements  on | off\n"
             "  replay-window       seconds\n"
             "  default-port        agent API port\n"
@@ -62,8 +62,8 @@ class ConfigCommands:
             "  network <id>        on | off\n"
             "  rpc <id> <url|default>  set a chain's RPC endpoint, or 'default' to clear\n\n"
             "Examples:\n"
-            "  config set admin-api open\n"
-            "  config get admin-api")
+            "  config set startup-wallet main\n"
+            "  config set start-agent-api on")
 
     def _cmd_show(self, args: list[str]) -> CommandResult:
         """Show current settings."""
@@ -95,11 +95,11 @@ class ConfigCommands:
                      f"{' req/min' if limit else ''}")
 
         lines.append("")
-        lines.append("Security:")
-        mode = settings.security.admin_api_mode
-        lines.append(f"  admin-api: {mode}")
-        if mode == ADMIN_API_MODE_OPEN:
-            lines.append("    any local process can drive the Admin API")
+        lines.append("Startup:")
+        wallet = settings.startup.open_wallet
+        lines.append(f"  startup-wallet: {wallet if wallet else '(none)'}")
+        lines.append(f"  start-agent-api: "
+                     f"{'on' if settings.startup.start_agent_api else 'off'}")
 
         lines.append("")
         lines.append("Display:")
@@ -124,8 +124,13 @@ class ConfigCommands:
         setting = args[0].lower()
         settings = self.core.settings_manager
 
-        if setting == "admin-api":
-            return CommandResult.ok(f"admin-api: {settings.get_admin_api_mode()}")
+        if setting == "startup-wallet":
+            wallet = settings.get_startup_wallet()
+            return CommandResult.ok(f"startup-wallet: {wallet if wallet else '(none)'}")
+
+        if setting == "start-agent-api":
+            value = "on" if settings.get_start_agent_api() else "off"
+            return CommandResult.ok(f"start-agent-api: {value}")
 
         if setting == "verify-settlements":
             value = "on" if settings.get_verify_settlements() else "off"
@@ -196,7 +201,8 @@ class ConfigCommands:
                 "  allow-lan on|off             - Allow LAN connections\n"
                 "  default-network <chain_id>   - Set default network for display\n"
                 "  rpc <chain_id> <url|default> - Set custom RPC endpoint\n"
-                "  admin-api open|gui-only      - Who may drive the Admin API"
+                "  startup-wallet <name|none>   - Wallet to open at launch\n"
+                "  start-agent-api on|off       - Serve agents from launch"
             )
 
         setting = args[0].lower()
@@ -262,7 +268,7 @@ class ConfigCommands:
 
         elif setting == "rate-limit":
             # Reachable without a screen on purpose: the ceiling matters most on
-            # a headless box, which is the one most likely to be exposed.
+            # an unattended box, which is the one most likely to be exposed.
             try:
                 per_minute = int(value)
             except ValueError:
@@ -284,26 +290,35 @@ class ConfigCommands:
             else:
                 return CommandResult.fail("Value must be 'on' or 'off'")
 
-        elif setting == "admin-api":
-            # Deliberately opt-in, and deliberately reachable without a screen.
-            # The point of the default was that opening this port is a conscious
-            # act, not that the act happens in the GUI - and on a headless box
-            # the GUI is not somewhere the operator can go.
-            choice = value.lower().replace("_", "-")
-            if choice == "open":
-                settings.set_admin_api_mode(ADMIN_API_MODE_OPEN)
+        elif setting == "startup-wallet":
+            # A machine that reboots at 03:00 has nobody to type a wallet name,
+            # so it has to be written down. The password is not: it comes from
+            # PRIMER_VAULT_PASSWORD, because settings.json sits in the data
+            # directory beside the wallet file, and a password stored there
+            # defeats the encryption for anyone who copies the folder.
+            if value.lower() in ("none", "off", ""):
+                settings.set_startup_wallet(None)
                 return CommandResult.ok(
-                    "Admin API opened to local processes.\n\n"
-                    "Any program running as you can now create agents, read wallet\n"
-                    "addresses and approve requests through port "
-                    "4664. "
-                    "Only do this on a machine you trust.")
-            elif choice in ("gui-only", "guionly"):
-                settings.set_admin_api_mode(ADMIN_API_MODE_GUI_ONLY)
+                    "Vault will start with no wallet open.")
+            settings.set_startup_wallet(value)
+            return CommandResult.ok(
+                f"Vault will open '{value}' at startup.\n\n"
+                "Set PRIMER_VAULT_PASSWORD in the environment it starts in, or "
+                "it comes up locked and can sign nothing.")
+
+        elif setting == "start-agent-api":
+            if value.lower() in ("on", "true", "1", "yes"):
+                settings.set_start_agent_api(True)
                 return CommandResult.ok(
-                    "Admin API restricted to the Vault window (the default).")
+                    f"The agent API will start automatically on port "
+                    f"{settings.get_default_port()}.")
+            elif value.lower() in ("off", "false", "0", "no"):
+                settings.set_start_agent_api(False)
+                return CommandResult.ok(
+                    "The agent API will not start automatically. Turn it on for "
+                    "a session with `server start`.")
             else:
-                return CommandResult.fail("Value must be 'open' or 'gui-only'")
+                return CommandResult.fail("Value must be 'on' or 'off'")
 
         elif setting == "default-network":
             try:

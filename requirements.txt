@@ -22,8 +22,8 @@
 #
 # Change a version here, regenerate, and commit both files together.
 
-# UI
-PyQt6==6.10.2
+# Terminal interface
+prompt_toolkit==3.0.53
 
 # Cryptography
 cryptography==50.0.0
@@ -46,3 +46,7 @@ platformdirs==4.10.0
 
 # Hardware wallet (Ledger)
 ledgereth==0.10.0
+
+# Desktop edition only (the `desktop` extra). The Terminal edition installs
+# without it, and its CI job runs the suite on a machine where Qt is absent.
+PyQt6==6.10.2

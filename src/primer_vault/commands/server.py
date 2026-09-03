@@ -52,10 +52,6 @@ class ServerCommands:
                         "Usage: server start [port]\n"
                         "Example: server start 9410"
                     )
-            if port == 4664:
-                return CommandResult.fail(
-                    "Port 4664 is reserved for the admin API and cannot be used for the agent server."
-                )
             return self._start(port)
         elif subcmd == "stop":
             if "--help" in args or "-h" in args:

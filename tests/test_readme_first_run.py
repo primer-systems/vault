@@ -173,17 +173,22 @@ def test_the_readme_agent_setup_works_in_the_console(tmp_path):
     )
 
 
-def test_the_single_instance_section_states_the_admin_api_condition():
-    """Driving a running instance from the terminal requires opening the Admin
-    API; the "Single Instance" section must say so rather than promising it
-    unconditionally."""
-    start = README.index("### Single Instance")
+def test_the_single_instance_section_says_a_second_command_attaches():
+    """A second `primer-vault` against a running engine attaches to it.
+
+    This used to be the opposite: the second command was refused, and the only
+    way in was an unauthenticated HTTP port that shipped switched off, so the
+    section had to explain how to open it. Now the lock is the router, and the
+    section has to say so - a reader who believes the old behaviour will kill a
+    running server to run one command against it.
+    """
+    start = README.index("### One instance per data folder")
     section = README[start:README.index("---", start)]
-    assert "Admin API" in section and "--admin-open" in section, (
-        "the Single Instance section promises terminal control of a running "
-        "instance without naming how to open the Admin API (the window's "
-        "Security settings, or --admin-open for a headless server)"
-    )
+    assert "attaches" in section, (
+        "the section on one-instance-per-folder never says that a second "
+        "`primer-vault` attaches to the running one rather than failing")
+    assert "--admin-open" not in section and "Admin API" not in section, (
+        "the section still describes the Admin API, which no longer exists")
 
 
 # ============================================================

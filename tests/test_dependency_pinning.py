@@ -46,8 +46,17 @@ def normalise(name):
 
 
 def declared():
-    """{name: Requirement} from pyproject."""
-    deps = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
+    """{name: Requirement} from pyproject, extras included.
+
+    The desktop edition's Qt dependency lives in an optional group, but a
+    release build of that edition is exactly as reproducible-or-not as one of
+    the terminal edition. An extra that escaped these rules would be the one
+    unpinned thing in the binary people actually download.
+    """
+    project = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"]
+    deps = list(project["dependencies"])
+    for group in project.get("optional-dependencies", {}).values():
+        deps.extend(group)
     return {normalise(Requirement(d).name): Requirement(d) for d in deps}
 
 

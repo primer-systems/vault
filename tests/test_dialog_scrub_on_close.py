@@ -88,7 +88,7 @@ def test_create_wallet_wizard_does_not_outlive_its_close(qapp):
     Python attributes, so if the closed wizard survives, so do they.
     """
     from PyQt6.QtWidgets import QWidget
-    from primer_vault.wallet.dialogs import CreateWalletWizard
+    from primer_vault.ui.wallet_dialogs import CreateWalletWizard
 
     wallet_tab = QWidget()  # stands in for WalletTab, which lives for the session
     password = "correct-horse-battery"
@@ -117,13 +117,13 @@ def test_create_wallet_wizard_does_not_outlive_its_close(qapp):
 def test_unlock_dialog_does_not_keep_the_password_after_success(qapp, tmp_path):
     """A successful unlock leaves the typed password in the dialog.
 
-    wallet/dialogs.py clears the field only on a WRONG password; the
+    ui/wallet_dialogs.py clears the field only on a WRONG password; the
     success branch (1017-1018) calls accept() with the field untouched, and the
     dialog is a child of the wallet tab (ui/tabs.py), so it is never
     destroyed.
     """
     from PyQt6.QtWidgets import QWidget, QLineEdit
-    from primer_vault.wallet.dialogs import VaultWalletUnlockDialog
+    from primer_vault.ui.wallet_dialogs import VaultWalletUnlockDialog
 
     password = "unlock-me-please"
     wallet_path = tmp_path / "t.wallet"
@@ -150,7 +150,7 @@ def test_change_password_dialog_does_not_keep_the_passwords(qapp, tmp_path):
     wallet it was pointed at stays usable - it is the core's own wallet, not a
     private copy."""
     from PyQt6.QtWidgets import QWidget, QLineEdit
-    from primer_vault.wallet.dialogs import ChangePasswordDialog
+    from primer_vault.ui.wallet_dialogs import ChangePasswordDialog
 
     wallet = VaultWallet.create(TEST_PASSWORD)
     wallet_path = tmp_path / "t.wallet"

@@ -80,111 +80,108 @@ def test_the_clear_token_config_help_documents_actually_clears_the_endpoint(tmp_
 # 2. A windowed build asked for --cli says nothing at all
 # =========================================================================
 
-def test_a_windowed_build_asked_for_cli_tells_the_user_something(tmp_path, monkeypatch):
-    """`Vault.exe --cli` must not exit in silence.
+def test_a_windowed_build_that_cannot_open_a_window_tells_the_user_something(
+        tmp_path, monkeypatch):
+    """Vault.exe must not exit in silence when Qt will not start.
 
     Vault.spec builds with console=False, so the downloaded executable has no
-    stdin, stdout or stderr. cli.main() reaches `elif sys.stdin is None` and
-    calls sys.exit(1) - correct when run_gui() handed over after already
-    explaining itself, but this path is also reached when the user typed --cli,
-    and then nothing has been said. app.py already has
-    _report_without_a_console() for exactly this situation (a Windows message
-    box, plus a log line).
+    stdin, stdout or stderr. If Qt is missing or cannot open a display there is
+    nothing to print to and no window to put a dialog in, and the process would
+    otherwise close having said nothing at all - indistinguishable, to the
+    person who double-clicked it, from an antivirus block.
+
+    `_report_without_a_console` is the answer: a message box straight from
+    user32, plus a line in the log. This test exists because the desktop
+    edition no longer falls back to a terminal interface - it does not contain
+    one - so this really is the last channel left.
     """
-    from primer_vault import app, utils
+    from primer_vault import app_desktop
 
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
-    monkeypatch.setattr(utils, "get_app_dir", lambda: data_dir)
-    monkeypatch.setattr("primer_vault.cli.get_app_dir", lambda: data_dir)
-
-    # A frozen, windowed build: no standard streams at all.
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "stdin", None)
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
-    monkeypatch.setattr(sys, "argv", ["Vault.exe", "--cli"])
 
     told = []
-    monkeypatch.setattr(app, "_report_without_a_console", lambda msg: told.append(msg))
+    monkeypatch.setattr(app_desktop, "_report_without_a_console",
+                        lambda msg: told.append(msg))
 
-    with pytest.raises(SystemExit) as exit_info:
-        app.main()
+    app_desktop._gui_unavailable(ImportError("No module named 'PyQt6'"))
 
-    assert exit_info.value.code == 1
     assert told, (
-        "Vault.exe --cli exited 1 without a word: no console to print to, no "
-        "message box, no window. The user cannot tell whether it worked, "
-        "crashed, or was blocked by their antivirus.")
+        "Vault.exe closed without a word: no console to print to, no message "
+        "box, no window. The user cannot tell whether it worked, crashed, or "
+        "was blocked by their antivirus.")
+    assert "primer-vault" in told[0], (
+        "The message should point at the terminal edition, which is the thing "
+        "that does work on a machine with no graphics stack.")
 
 
 # =========================================================================
 # 3 & 4. README "Headless Mode" names both ports; neither clash is handled
 # =========================================================================
 
-def test_the_daemon_does_not_report_an_agent_api_it_failed_to_open(tmp_path):
-    """README.md sends the operator to
-    `primer-vault --headless --agent-port 4663 --admin-port 4664 --wallet main`.
+def test_an_agent_api_that_could_not_bind_is_not_reported_as_up(tmp_path):
+    """A machine set to serve agents from boot has nobody watching it.
 
-    If 4663 is already taken, Vault.start_server() returns False, Daemon.start()
-    ignores the return value, and run_daemon prints
-    "Agent API: http://localhost:4663". Nothing is listening there for Vault -
-    whatever took the port is. A headless operator has no window to check
-    against and is told the thing they cannot see is working.
+    `config set start-agent-api on` makes Vault open the agent API for itself at
+    launch. If the port is already taken, `start_server()` returns False - and
+    the one thing that must not happen is for Vault to carry on as though agents
+    can reach it. There is no window to check against and no operator to notice.
     """
-    from primer_vault.daemon.app import Daemon
+    from primer_vault.app_terminal import _apply_startup_settings
+    from primer_vault.core import Vault
 
     agent_port, blocker = _occupied_port()
     try:
-        daemon = Daemon(
-            data_dir=tmp_path / "data",
-            admin_port=_free_port(),
-            agent_port=agent_port,
-        )
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        core = Vault(data_dir=data_dir)
         try:
-            daemon.start()
-            agent_api_up = daemon._core.is_server_running()
-            reported_up = daemon.is_running()
-        finally:
-            daemon.stop()
-    finally:
-        blocker.close()
+            core.settings_manager.set_default_port(agent_port)
+            core.settings_manager.set_start_agent_api(True)
 
-    assert not agent_api_up, "the occupied port was not occupied"
-    assert not reported_up, (
-        f"the agent API could not bind port {agent_port}, but the daemon still "
-        "reports itself started, logs 'Daemon started - ... Agent API on "
-        f":{agent_port}', and run_daemon prints "
-        f"'Agent API: http://localhost:{agent_port}'. No warning is logged.")
+            _apply_startup_settings(core)
 
-
-def test_the_daemon_explains_an_occupied_admin_port_instead_of_crashing(tmp_path):
-    """Same command, admin port taken instead.
-
-    run_daemon catches InstanceAlreadyRunning and DataDirectoryError and prints
-    a sentence for each. A bind failure on the admin port is neither, so it
-    leaves as a bare OSError traceback - the one failure mode run_gui() takes
-    care to handle ("Run on without the admin API rather than dying for it",
-    app.py).
-    """
-    from primer_vault.daemon.app import run_daemon
-
-    admin_port, blocker = _occupied_port()
-    try:
-        with pytest.raises(BaseException) as raised:
-            run_daemon(
-                data_dir=tmp_path / "data",
-                admin_port=admin_port,
-                agent_port=_free_port(),
-                interactive=False,
+            assert not core.is_server_running(), (
+                f"the agent API reports itself running on port {agent_port}, "
+                "which was already taken by something else. Agents would be "
+                "talking to whatever holds that port."
             )
+        finally:
+            core.settings_manager.stop()
+            core.release_instance_lock()
     finally:
         blocker.close()
 
-    assert isinstance(raised.value, SystemExit), (
-        f"starting the headless daemon with port {admin_port} already in use "
-        f"raised {type(raised.value).__name__}: {raised.value!r}. The operator "
-        "gets a Python traceback rather than a sentence naming the port.")
+
+def test_a_startup_wallet_with_no_password_does_not_claim_to_be_open(tmp_path):
+    """The wallet name is a setting; its password is not, and comes from the
+    environment. If the environment is missing it, Vault has to come up locked
+    rather than pretending otherwise - a server that believes it is unlocked
+    and cannot sign is worse than one that says it is locked.
+    """
+    import os
+
+    from primer_vault.app_terminal import _apply_startup_settings
+    from primer_vault.core import Vault
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    core = Vault(data_dir=data_dir)
+    try:
+        core.settings_manager.set_startup_wallet("main")
+        previous = os.environ.pop("PRIMER_VAULT_PASSWORD", None)
+        try:
+            _apply_startup_settings(core)
+        finally:
+            if previous is not None:
+                os.environ["PRIMER_VAULT_PASSWORD"] = previous
+
+        assert not core.is_wallet_unlocked()
+    finally:
+        core.settings_manager.stop()
+        core.release_instance_lock()
 
 
 if __name__ == "__main__":

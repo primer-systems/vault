@@ -1,0 +1,269 @@
+---
+name: vault-morpho
+description: Lend USDG on Morpho through the Vault desktop app - supply to a curated vault or market, withdraw, and see what you hold. Vault holds the keys, enforces the user's limits, and executes, rejects, or asks the user to approve.
+license: MIT
+compatibility:
+  models: ["*"]
+  runtimes: ["*"]
+metadata:
+  author: Primer Systems
+  version: 0.1.0
+  homepage: https://primer.systems
+  repository: https://github.com/primer-systems/Vault
+---
+
+# Vault Morpho Lending Skill
+
+You can supply USDG to Morpho and withdraw it again through Vault. You decide
+what to do; Vault is a broker that holds the keys, checks each operation against
+the user's policy, and executes it or asks the user to approve.
+
+The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:4663`).
+
+## Authenticating
+
+You are authenticating to **Vault**, not to Morpho. Vault holds the private key
+and will not touch it for a caller it cannot identify. Morpho never sees you -
+it sees an ordinary signed transaction from the user's wallet.
+
+Same scheme as `/sign` and `/trade` (see the x402 skill for bearer vs HMAC). In
+HMAC mode you sign over the `position` object, under the key `position`:
+
+```python
+import hmac, hashlib, json, time, os
+agent_id = os.environ["PRIMER_VAULT_AGENT_ID"]
+token = os.environ["PRIMER_VAULT_AGENT_TOKEN"]
+timestamp = int(time.time())
+
+position = {
+    "action": "supply",
+    "venue": "0xBeEff033F34C046626B8D0A041844C5d1A5409dd",
+    "venue_kind": "vault",
+    "amount": "25.5",             # human units, not atomic
+}
+
+msg = json.dumps({"agent_id": agent_id, "timestamp": timestamp,
+                  "position": position},
+                 separators=(",", ":"), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
+
+body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}",
+        "position": position}
+# POST body to  ${PRIMER_VAULT_URL}/position
+```
+
+Sign the object exactly as you send it. Vault verifies against what arrived, so
+a field added, dropped or reordered after signing fails as `AUTH_FAILED`.
+
+### /venues signs an empty position
+
+`/venues` carries no position object, but it is signed under the same key with
+an empty one. This is not a typo - copy it exactly:
+
+```python
+msg = json.dumps({"agent_id": agent_id, "timestamp": timestamp, "position": {}},
+                 separators=(",", ":"), sort_keys=True).encode()
+sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
+
+body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}"}
+# POST body to  ${PRIMER_VAULT_URL}/venues
+```
+
+The timestamp is checked for freshness, so sign each request as you send it
+rather than reusing a signature.
+
+## Two things you can lend into
+
+**A vault** takes your USDG and a curator spreads it across several lending
+markets, rebalancing as they see fit. You get one number back: the position's
+value. Diversified, and you are trusting the curator's allocation.
+
+**A market** is a single loan book: your USDG is lent against one specific kind
+of collateral at one loan-to-value ratio. Concentrated, and the choice is yours.
+
+Both are `POST /position`. Which one you are using is `venue_kind`.
+
+## Always start with /venues
+
+`POST /venues`, authenticated like everything else, returns the venues the
+user's policy permits, what the wallet already holds in each, and the limits you
+are held to.
+
+**Do not guess a venue address.** There are 124 markets on this chain and most
+are empty, test, or built to take deposits. The user's policy names which are
+permitted, and anything else is refused.
+
+```json
+{
+  "status": "ok",
+  "restricted": true,
+  "venues": [
+    {"kind": "vault", "venue": "0xBeEff033...", "name": "Steakhouse USDG",
+     "asset": "0x5fc5360D...", "asset_decimals": 6,
+     "your_position_assets": 0},
+    {"kind": "market", "venue": "0xc845da65...", "name": "USDe / 91.5%",
+     "asset": "0x5fc5360D...", "asset_decimals": 6,
+     "your_position_assets": 0, "withdrawable_now": 29155129000000}
+  ],
+  "policy": {
+    "max_deposit_usd": 100.0,
+    "exposure_limit_usd": 500.0,
+    "deployed_usd": 0.0,
+    "remaining_deployable_usd": 500.0,
+    "max_ops_per_day": 20,
+    "ops_today": 0,
+    "auto_approve_below_usd": null
+  }
+}
+```
+
+What to do with each:
+
+- `remaining_deployable_usd` - what you can still put in, counting requests
+  already awaiting approval. **Pace against this, not `exposure_limit_usd`.**
+- `max_deposit_usd` - a single deposit above this is rejected. Split it.
+- `ops_today` against `max_ops_per_day` - deposits and withdrawals together.
+  This is a gas limit, not a money one, so it counts withdrawals too. Do not
+  loop.
+- `auto_approve_below_usd` - below this an operation runs without prompting.
+  Above it, expect `pending` and poll. `null` means every one needs approval.
+- `withdrawable_now` - what a **market** venue could return right now. It moves
+  with other people's borrowing and is typically a fraction of the total. A
+  **vault** venue does not carry this field here - computing it there is
+  expensive (a nested scan of every market behind the vault), so you get it
+  fresh at the point it actually matters: `venue_withdrawable` on a withdraw
+  request's quote, before you approve. Do not assume a position is instantly
+  liquid either way.
+
+`restricted: false` means the user has allowed any Morpho venue. The list then
+shows what this wallet has used before rather than what it may use.
+
+All amounts in these payloads are **atomic integers**. USDG has 6 decimals, so
+`44926051000000` is $44,926,051.
+
+## Supplying
+
+```json
+POST /position
+{
+  "agent_id": "A1B2C3",
+  "signature": "...",
+  "position": {
+    "action": "supply",
+    "venue": "0xBeEff033F34C046626B8D0A041844C5d1A5409dd",
+    "venue_kind": "vault",
+    "amount": "25.5"
+  }
+}
+```
+
+`amount` is a human-decimal **string**, not atomic. Vault resolves it once it
+knows the venue's decimals.
+
+Do not send `agent_id`, `wallet_address` or `receiver` inside `position` - Vault
+uses the credentials' own agent and address, and naming either is refused
+outright rather than ignored.
+
+## Withdrawing
+
+Same shape with `"action": "withdraw"`. Three ways to say how much:
+
+```json
+{"action": "withdraw", "venue": "0xBeEff033...", "venue_kind": "vault", "amount": "10"}
+{"action": "withdraw", "venue": "0xBeEff033...", "venue_kind": "vault", "amount": "4.5", "denomination": "shares"}
+{"action": "withdraw", "venue": "0xBeEff033...", "venue_kind": "vault", "withdraw_all": true}
+```
+
+**Assets** (the default) is "give me $10 back". Use it when you need a sum of
+money. What you actually receive can differ slightly, because the price moves
+between the quote and the settlement.
+
+**Shares** names the position itself. Use it when you want a *fraction* of what
+you hold rather than a sum - "half my position" is a share count and cannot be
+expressed accurately as a dollar figure. Read `your_position_assets` from
+`/venues` and the `shares` figure on any quote to see what you hold.
+
+**`withdraw_all` exits completely** and is the whole-position case of the same
+thing - it resolves to your full share balance, so nothing is stranded. Prefer
+it over calculating the shares yourself.
+
+Share scales differ by venue type, and getting this wrong is expensive:
+
+- **Vault shares are an ERC-20 with 18 decimals.** `"amount": "4.5"` means 4.5
+  shares. The quote's `share_decimals` confirms it.
+- **Market shares are a bare integer with no decimals** (`share_decimals: 0`).
+  `"amount": "1000000"` means one million shares. They are scaled against the
+  market's internal totals, roughly a million per unit of the asset, so the
+  numbers are large.
+
+Asking for more shares than you hold is refused before anything is signed,
+rather than reverting on-chain as an arithmetic error.
+
+A supply is always in assets - there are no shares to hand over before the
+deposit that mints them - so `denomination` is only valid on a withdrawal.
+
+Withdrawals are not subject to the deposit or exposure limits - taking a
+position back reduces risk. They do count against `max_ops_per_day`.
+
+## Responses
+
+| HTTP | Meaning |
+|---|---|
+| 200 | executed; `tx_hash` is in the body |
+| 202 | `pending` - a human is being asked. Poll `GET /position/status/{request_id}` |
+| 400 | refused. Read `reason` and change the request |
+| 500 | accepted, then something failed. The request was fine |
+| 503 | come back later. Check `Retry-After` |
+
+Two 503s matter and they are not the same:
+
+- `WALLET_LOCKED` - the user's wallet is locked. Retry after they unlock it.
+- `INSUFFICIENT_LIQUIDITY` - the venue cannot free that much **today**. A
+  smaller amount may work now, or the same amount later.
+
+A `failed` result carries `retryable`. When it is `false`, resending the same
+request will never work - fix it or give up. Do not loop on it.
+
+If a supply/withdraw needed a token approval first, the response also carries
+`approval_tx_hash` - the approval's own hash, set whenever that transaction
+settled, independently of whether the supply/withdraw itself then succeeded.
+A `failed` result can still show a populated `approval_tx_hash`: the
+allowance genuinely landed on-chain even though the deposit after it did not.
+Don't read a `null` `tx_hash` on a failed result as "nothing happened" -
+check `approval_tx_hash` too.
+
+Common refusals:
+
+- `VENUE_NOT_PERMITTED` - not on the permitted list. Call `/venues`.
+- `PER_DEPOSIT_EXCEEDED` - split the deposit.
+- `EXPOSURE_EXCEEDED` - withdraw something first, or stop.
+- `DAILY_OPS_EXCEEDED` - you have used the day's operations. Stop until tomorrow.
+- `EXPOSURE_UNREADABLE` - Vault could not read the position to check the limit.
+  Nothing was deposited. Retry shortly.
+
+## Polling a pending request
+
+```
+GET /position/status/{request_id}
+```
+
+202 while it waits, with `expires_in_seconds`. Requests expire after 15 minutes
+and are then rejected. Poll every few seconds; do not resubmit while one is
+pending - you have a per-agent ceiling on how many can be waiting.
+
+## Things worth knowing
+
+**A position is not a balance.** It sits there earning and its value changes.
+Read it back from `/venues` rather than remembering what you deposited.
+
+**Exit capacity is not guaranteed.** Exit capacity on a large vault is often
+under 10% of its size, whether or not `/venues` shows you a number for it. If
+the user needs the money out on a schedule, say so before depositing rather
+than after.
+
+**Interest accrues, so amounts drift.** Two reads minutes apart differ. Never
+assume a number you cached is still exact - especially when exiting.
+
+**One approval, then the operation.** A first supply to a venue needs a token
+approval transaction before the deposit. `approvals_needed` on the quote says
+whether that applies; both happen inside one `/position` call.

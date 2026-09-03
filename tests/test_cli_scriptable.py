@@ -1,5 +1,5 @@
 """
-Tests for CLI scriptable mode (non-interactive execution).
+Tests for scriptable mode (a single command, no prompts).
 
 Run with: pytest tests/test_cli_scriptable.py -v
 """
@@ -13,7 +13,8 @@ from unittest.mock import patch
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from primer_vault.cli import parse_global_flags, ScriptContext, handle_input_request
+from primer_vault.terminal.session import (
+    parse_global_flags, ScriptContext, collect_input)
 from primer_vault.commands.result import CommandResult
 
 
@@ -127,20 +128,20 @@ class TestScriptContext:
 
 
 class TestHandleInputRequestWithContext:
-    """Test handle_input_request with ScriptContext."""
+    """Test collect_input with ScriptContext."""
 
     def test_scripted_confirm(self):
         """Confirm is auto-supplied with script context."""
         result = CommandResult.need_input("confirm", "Type YES:")
         ctx = ScriptContext(auto_confirm=True)
-        inputs = handle_input_request(result, ctx)
+        inputs = collect_input(result, ctx)
         assert inputs == {"confirm": "YES"}
 
     def test_scripted_password(self):
         """Password is auto-supplied with script context."""
         result = CommandResult.need_input("password", "Enter password:")
         ctx = ScriptContext(password="testpass")
-        inputs = handle_input_request(result, ctx)
+        inputs = collect_input(result, ctx)
         assert inputs == {"password": "testpass", "value": "testpass"}
 
     def test_no_context_falls_back_to_interactive(self):

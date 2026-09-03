@@ -56,13 +56,16 @@ class ApprovalHandler(Protocol):
 
 class HeadlessApprovalHandler:
     """
-    Approval handler for headless mode.
+    Approval handler for an engine with no dialog to raise.
 
-    Implements the ApprovalHandler protocol.
+    Implements the ApprovalHandler protocol. "Headless" here names a
+    capability, not an edition or a mode: it is the handler used when nothing
+    has registered a way to put a question in front of a person. The desktop
+    registers its own; the terminal uses this one with `auto_reject=False` so
+    requests queue and surface in the live feed instead.
 
-    No user interface available, so:
-    - Requests that need approval are auto-rejected
-    - Or optionally queued with a timeout
+    - auto_reject=True:  requests that need approval are rejected at once
+    - auto_reject=False: they queue and expire on their own timeout
     """
 
     def __init__(self, core: "Vault", auto_reject: bool = True, timeout_seconds: int = 0):
@@ -75,10 +78,10 @@ class HeadlessApprovalHandler:
         if self._auto_reject:
             self._core.reject_request(
                 request.id,
-                "No operator available (headless mode)"
+                "No operator available"
             )
         # If not auto_reject, the request sits in pending until timeout or manual resolution
 
     def on_approval_resolved(self, request_id: str, approved: bool, reason: Optional[str] = None) -> None:
-        """Nothing to do in headless mode."""
+        """Nothing to do: there is no dialog to close."""
         pass

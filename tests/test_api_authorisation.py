@@ -1,12 +1,12 @@
 """Callers that present no credential.
 
-Two properties:
+POST /callback answers the same whether or not the wallet is unlocked, so it
+cannot be polled as a "the keys are in memory now" oracle. /sign and /mandate
+hold the same property.
 
-1. The Admin API is closed unless `admin_api_mode` holds a value it recognises;
-   an unreadable or unexpected value must not open it.
-2. POST /callback answers the same whether or not the wallet is unlocked, so it
-   cannot be polled as a "the keys are in memory now" oracle. /sign and
-   /mandate hold the same property.
+This file used to carry a second property about the Admin API refusing to open
+on an unrecognised `admin_api_mode`. The Admin API was removed in 0.3 and that
+setting no longer exists.
 """
 
 import json
@@ -35,84 +35,6 @@ def _bogus_sig() -> str:
     the signature rather than on the replay window."""
     return f"SIG:{int(time.time())}:{'00' * 32}"
 
-
-# ---------------------------------------------------------------------------
-# 1. An unrecognised admin_api_mode on disk
-# ---------------------------------------------------------------------------
-
-ADMIN_PROBE_PORT = 19414
-
-
-class TestUnknownAdminModeIsNotTreatedAsOpen:
-    """`_check_gui_only_access` asks `mode != "gui_only"` and opens the API on
-    anything that is not that exact string (daemon/admin_api.py). The value
-    is read straight out of settings.json with no validation on the way in
-    (core/settings.py), so a hand-edited file that says "GUI_ONLY" - the
-    locked-down mode, spelled differently - selects the wide-open one.
-    """
-
-    @pytest.fixture
-    def core_with_typo(self, temp_data_dir):
-        from primer_vault.core import Vault
-
-        # A user edits settings.json and writes the mode in the wrong case.
-        (temp_data_dir).mkdir(parents=True, exist_ok=True)
-        (temp_data_dir / "settings.json").write_text(json.dumps({
-            "version": 1,
-            "security": {"admin_api_mode": "GUI_ONLY"},
-        }), encoding="utf-8")
-
-        core = Vault(data_dir=temp_data_dir)
-        (temp_data_dir / "wallets").mkdir(exist_ok=True)
-        wallet_path = str(temp_data_dir / "wallets" / "test.wallet")
-        core.create_wallet(wallet_path, "testpass")
-        core.load_wallet(wallet_path, "testpass")
-        return core
-
-    @pytest.fixture
-    def admin_server(self, core_with_typo):
-        from primer_vault.daemon.admin_api import AdminAPIServer
-
-        srv = AdminAPIServer(core_with_typo, port=ADMIN_PROBE_PORT)
-        srv.start()
-        time.sleep(0.3)
-        yield core_with_typo
-        srv.stop()
-
-    def _post(self, path, body):
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{ADMIN_PROBE_PORT}{path}", method="POST",
-            data=json.dumps(body).encode())
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                return resp.status, json.loads(resp.read().decode() or "{}")
-        except urllib.error.HTTPError as e:
-            raw = e.read().decode()
-            try:
-                return e.code, json.loads(raw or "{}")
-            except json.JSONDecodeError:
-                return e.code, {}
-
-    def test_an_unrecognised_mode_does_not_open_the_admin_api(self, admin_server):
-        status, body = self._post("/agents", {"name": "smuggled"})
-        assert status == 403, (
-            "settings.json said the mode was GUI_ONLY, but the Admin API "
-            f"accepted an unauthenticated agent creation ({status} {body}). "
-            "Any value that is not exactly 'gui_only' opens the API to every "
-            "local process.")
-
-    def test_no_agent_is_created(self, admin_server):
-        self._post("/agents", {"name": "smuggled"})
-        names = [a.name for a in admin_server.get_all_agents()]
-        assert "smuggled" not in names, (
-            "an unauthenticated caller created an agent and was handed its "
-            f"credential; agents now: {names}")
-
-
-# ---------------------------------------------------------------------------
-# 2. POST /callback and the wallet-lock oracle
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def commissioned_agent(core):

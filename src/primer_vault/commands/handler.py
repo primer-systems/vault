@@ -40,6 +40,8 @@ class CommandHandler:
             "approve": self._cmd_approve,
             "reject": self._cmd_reject,
             "trade": self._cmd_trade,
+            "position": self._cmd_position,
+            "venues": self._cmd_venues,
             "server": self._cmd_server,
             "wallet": self._cmd_wallet,
             "seed": self._cmd_seed,
@@ -153,6 +155,17 @@ APPROVALS
   pending                                 - List pending requests
   approve <request>                       - Approve request
   reject <request> [reason]               - Reject request
+
+TRADING
+  trade pending                           - List trades awaiting approval
+  trade approve <id>                      - Approve and execute a trade
+  trade reject <id> [reason]              - Reject a trade
+
+MORPHO LENDING
+  venues                                  - Vaults and markets that are permitted
+  position pending                        - List lending requests awaiting approval
+  position approve <id>                   - Approve and execute a request
+  position reject <id> [reason]           - Reject a request
 
 SERVER
   server start [port]                     - Start agent server
@@ -290,6 +303,16 @@ Use <command> --help for detailed options.
         """Manage pending agent trades (pending / approve / reject)."""
         from .trade import TradeCommands
         return TradeCommands(self.core, self).execute(args)
+
+    def _cmd_position(self, args: list[str]) -> CommandResult:
+        """Manage pending agent lending (pending / approve / reject)."""
+        from .position import PositionCommands
+        return PositionCommands(self.core, self).execute(args)
+
+    def _cmd_venues(self, args: list[str]) -> CommandResult:
+        """List the Morpho venues this Vault permits."""
+        from .position import VenuesCommands
+        return VenuesCommands(self.core, self).execute(args)
 
     # =========================================================================
     # Server Commands

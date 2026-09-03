@@ -182,6 +182,14 @@ if present, because Vault takes both from the credentials you authenticated with
 Every response carries the `quote` Vault computed: `amount_out_expected`,
 `amount_out_min` (after slippage), `notional_usdg`, and the `pool`.
 
+If the trade needed a token approval first, the response also carries
+`approval_tx_hash` - the approval's own hash, set whenever that transaction
+settled, independently of whether the swap itself then succeeded. A trade can
+fail with `status: "failed"` and still show a populated `approval_tx_hash`:
+the allowance genuinely landed on-chain even though the swap after it did
+not. Don't read a `null` `tx_hash` on a failed trade as "nothing happened" -
+check `approval_tx_hash` too.
+
 Error responses carry a machine-readable `code`. The HTTP status tells you what
 to do: **400** fix the request, **403** refused by policy — retrying unchanged
 cannot succeed, **409** stale — re-quote and resubmit, **429** wait for a limit

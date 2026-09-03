@@ -153,11 +153,15 @@ class StuckApprovalAdapter:
 
 
 def _execution_service(monkeypatch, adapter):
-    agent = SimpleNamespace(id="A1", name="Bot", wallet_address=WALLET,
+    agent = SimpleNamespace(id="A1", name="Bot", code="A1-code", wallet_address=WALLET,
                             policy_id="P1", trading_volume_today_usd=0.0)
+    agent.add_trading_volume = lambda usd: setattr(
+        agent, "trading_volume_today_usd", agent.trading_volume_today_usd + usd)
     store = SimpleNamespace(
         get_agent_by_id=lambda aid: agent if aid == "A1" else None,
-        update_transaction=lambda tx: None)
+        add_transaction=lambda tx: None,
+        update_transaction=lambda tx: None,
+        update_agent=lambda a: None)
     entry = SimpleNamespace(id="k1", is_hardware=False, device_path=None,
                             device_label="", address=WALLET)
     wallet = SimpleNamespace(
@@ -196,3 +200,48 @@ def test_stuck_approval_is_not_reported_as_nothing_sent(monkeypatch):
     reason = result["reason"]
     assert "nor sent" not in reason, (
         f"an approval was broadcast but the user is told: {reason!r}")
+
+
+# ---------------------------------------------------------------------------
+# 3. A node's own rejection is not the same as "may still complete on-chain"
+# ---------------------------------------------------------------------------
+
+class RpcRejectsBeforeBroadcastAdapter:
+    """No approval needed; the node itself refuses the swap - insufficient
+    funds for gas, the real failure this class of exception represents."""
+
+    def approval_steps(self, token, owner, amount, token_label=""):
+        return []
+
+    def simulate_swap(self, *args, **kwargs):
+        return None
+
+    def build_swap_tx(self, *args, **kwargs):
+        return {"to": "0xRouter00000000000000000000000000000001"}
+
+    def sign_and_send(self, tx, private_key, before_send=None):
+        from web3.exceptions import Web3RPCError
+        if before_send:
+            before_send()
+        raise Web3RPCError(
+            "insufficient funds for gas * price + value",
+            rpc_response={"error": {"code": -32000,
+                                    "message": "insufficient funds for gas * "
+                                               "price + value"}})
+
+
+def test_a_node_rejection_is_reported_as_nothing_sent(monkeypatch):
+    """The opposite failure mode from the stuck-approval case above: this one
+    is NOT ambiguous. The node answered, and the answer was no."""
+    adapter = RpcRejectsBeforeBroadcastAdapter()
+    svc = _execution_service(monkeypatch, adapter)
+    request = TradeRequest.create("A1", USDG, WETH, "10", 500, 100,
+                                  wallet_address=WALLET)
+    request.agent_id = "A1"
+
+    result = svc.execute_trade(request, _swap_quote())
+
+    assert result["status"] == "failed"
+    assert result["code"] == "RPC_REJECTED"
+    assert "nothing was sent" in result["reason"].lower()
+    assert "may still complete on-chain" not in result["reason"]

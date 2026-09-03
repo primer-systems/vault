@@ -35,48 +35,56 @@ def _free_port() -> int:
 # 1. README.md, "Single Instance"
 # =========================================================================
 
-def test_status_is_refused_like_every_command_and_points_at_the_window(tmp_path):
-    """`status` is not a special case in the default (gui_only) mode: like every
-    other command against a running instance, it is refused, and the refusal
-    points at the Vault window (the CLI can still detect the instance is up).
+def test_a_second_primer_vault_attaches_instead_of_being_refused(tmp_path):
+    """README.md, "Single Instance".
 
-    The README must not claim otherwise - the old "answers the CLI with status
-    only" wording promised a command that does not exist.
+    One process per data directory, because two would each save whole files and
+    erase the other's spend records and seeds. What used to follow from that was
+    a refusal: a second `primer-vault` printed "Vault is already running" and
+    stopped, and the only way in was an unauthenticated HTTP port that shipped
+    switched off.
+
+    It now attaches. The lock is no longer an error path, it is the router - and
+    an engine started by the system at boot has to be reachable, or a queued
+    approval can never be answered.
     """
     from primer_vault.core import Vault
-    from primer_vault.core.settings import ADMIN_API_MODE_GUI_ONLY
-    from primer_vault.daemon.admin_api import AdminAPIServer
-    from primer_vault.client.core_client import CoreClient
     from primer_vault.commands import CommandHandler
-
-    assert "answers the CLI with status only" not in README, (
-        "README still makes the withdrawn status-only claim")
+    from primer_vault.instance_lock import InstanceAlreadyRunning
+    from primer_vault.terminal.control_client import ControlClient
+    from primer_vault.terminal.control_server import ControlServer
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     running = Vault(data_dir=data_dir)
-    port = _free_port()
-    server = AdminAPIServer(running, port=port)
-    server.start()
+    channel = ControlServer(running, data_dir)
+    channel.start()
     try:
-        assert (running.settings_manager.get_admin_api_mode()
-                == ADMIN_API_MODE_GUI_ONLY), "test assumes the shipped default"
+        # A second process on the same data directory is refused the lock...
+        with pytest.raises(InstanceAlreadyRunning):
+            Vault(data_dir=data_dir)
 
-        client = CoreClient.try_connect(port=port, data_dir=data_dir)
-        assert client is not None, (
-            "the CLI could not even detect the running instance on the admin port")
-
-        result = CommandHandler(client).execute("status")
+        # ...and reaches the first one over the control channel instead.
+        client = ControlClient(data_dir)
+        client.connect()
+        try:
+            result = client.execute("status")
+        finally:
+            client.close()
     finally:
-        server.stop()
+        channel.stop()
         running.settings_manager.stop()
         running.release_instance_lock()
 
-    assert not result.success, (
-        "`status` succeeded against a gui_only instance; it should be refused "
-        "like every other command")
-    assert "window" in (result.error or "").lower(), (
-        f"the refusal should point at the Vault window: {result.error!r}")
+    assert result.success, (
+        f"`status` was refused against a running engine: {result.error!r}. "
+        "An attached terminal runs every command, not a privileged subset.")
+    assert result.output
+
+    # The same command, run in-process, is the same command. There is one
+    # CommandHandler and one implementation behind it.
+    direct = CommandHandler(Vault(data_dir=tmp_path / "other")).execute("status")
+    assert direct.success
 
 
 # =========================================================================
@@ -85,11 +93,11 @@ def test_status_is_refused_like_every_command_and_points_at_the_window(tmp_path)
 
 def _usage_examples() -> list[str]:
     """The `primer-vault ...` command lines under Examples in print_usage()."""
-    from primer_vault import cli
+    from primer_vault import app_terminal
 
     buffer = io.StringIO()
     with redirect_stdout(buffer):
-        cli.print_usage()
+        app_terminal.print_usage()
     usage = buffer.getvalue()
 
     block = usage.split("Examples:", 1)[1].split("\n\n", 1)[0]
@@ -114,7 +122,7 @@ def test_every_example_in_the_usage_text_is_a_command_that_exists(tmp_path):
     """
     from primer_vault.core import Vault
     from primer_vault.commands import CommandHandler
-    from primer_vault.cli import parse_global_flags
+    from primer_vault.terminal.session import parse_global_flags
 
     examples = _usage_examples()
     assert examples, "could not read the Examples block - test needs updating"

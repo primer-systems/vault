@@ -6,6 +6,8 @@ GUI/Console connect to it via the admin API.
 """
 
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import Optional, Callable, TYPE_CHECKING
 
@@ -15,6 +17,7 @@ from .settings import SettingsManager, AppSettings
 
 if TYPE_CHECKING:
     from ..models import PolicyStore, Agent, SpendPolicy, Transaction, TradingRules
+    from ..models.policy import DefiRules
     from ..wallet import VaultWallet
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ class Vault:
             approval_handler: Handler for manual approvals. If None, uses HeadlessApprovalHandler.
         """
         from ..models import PolicyStore
+        from ..services.defi import DefiService
         from ..services.signing import SigningService
         from ..services.trading import TradingService
         from ..services.server import AgentServer
@@ -68,7 +72,7 @@ class Vault:
         # directory would silently erase this one's records - including spend
         # against daily limits, and the wallet itself. Acquired here, before
         # anything touches a file, so every entry point is covered; raises
-        # InstanceAlreadyRunning, which the GUI, CLI and daemon each surface
+        # InstanceAlreadyRunning, which each composition root surfaces
         # in their own way. The OS drops the lock on process death, so a
         # crashed instance never blocks the next start.
         self._instance_lock = InstanceLock(self._data_dir)
@@ -89,7 +93,7 @@ class Vault:
         # Initialize stores
         self._policy_store = PolicyStore(self._data_dir)
 
-        # Approval handler (GUI provides its own, headless uses default)
+        # Approval handler (the desktop registers its own dialog-backed one)
         self._approval_handler = approval_handler or HeadlessApprovalHandler(self)
 
         # Initialize signing service
@@ -120,10 +124,34 @@ class Vault:
             on_trade_executed=lambda address: self._event_bus.emit_trade_executed(address),
         )
 
+        # Initialize DeFi service — the third lane, wired from the same stores,
+        # wallet provider and agent auth as the other two.
+        self._defi_service = DefiService()
+        self._defi_service.set_stores(self._policy_store)
+        self._defi_service.set_wallet_provider(self.get_wallet_for_address)
+        self._defi_service.set_wallet_status_checker(self.is_wallet_unlocked)
+        self._defi_service.set_auth_verifier(self._signing_service.verify_agent_signature)
+        self._defi_service.set_rpc_resolver(self.get_rpc_url)
+        self._defi_service.set_callbacks(
+            on_approval_needed=self._on_position_approval_needed,
+            on_activity=lambda msg, is_error=False, detail=None: self._event_bus.emit_activity(msg, is_error, detail),
+            on_position_changed=lambda address: self._event_bus.emit_trade_executed(address),
+        )
+
+        self._signing_service.set_defi_summary_provider(
+            self._defi_service.mandate_summary)
+
+        # Only started once agents can actually reach /mandate - see
+        # start_server(). A Vault built but never serving (every test that
+        # exercises the core directly, without a running agent server) has no
+        # reason to run a background chain-scanning thread at all.
+        self._defi_venue_warmer_started = False
+
         # Initialize agent server
         self._agent_server = AgentServer()
         self._agent_server.set_signing_service(self._signing_service)
         self._agent_server.set_trading_service(self._trading_service)
+        self._agent_server.set_defi_service(self._defi_service)
 
         # Server state
         self._server_running = False
@@ -211,6 +239,80 @@ class Vault:
     def get_pending_trades(self) -> list:
         """Pending (request, quote) pairs awaiting approval."""
         return self._trading_service.get_pending_trades()
+
+    def _on_position_approval_needed(self, request, quote):
+        """A lending operation is awaiting user approval.
+
+        The request sits in the DeFi service's pending set until
+        approve_position/reject_position is called. The activity message is
+        already emitted by DefiService._activity(); this only raises the dialog.
+
+        Asked of the handler rather than assumed, the way trade approval is: an
+        interface that has not grown the dialog yet still runs, and the request
+        waits for the terminal or expires, rather than the callback raising.
+        """
+        if hasattr(self._approval_handler, 'request_position_approval'):
+            self._approval_handler.request_position_approval(request, quote)
+
+    def approve_position(self, request_id: str) -> dict:
+        """Approve and execute a pending lending operation (used by GUI/CLI)."""
+        return self._defi_service.approve_position(request_id)
+
+    def reject_position(self, request_id: str, reason: str = "Rejected by user") -> dict:
+        """Reject a pending lending operation (used by GUI/CLI)."""
+        return self._defi_service.reject_position(request_id, reason)
+
+    def get_pending_positions(self) -> list:
+        """Pending (request, quote) pairs awaiting approval."""
+        return self._defi_service.get_pending_positions()
+
+    def get_defi_venues(self, curators: list) -> list:
+        """Lending venues the given curators stand behind, read from chain.
+
+        Exposed on Vault rather than reached for through the service, so the
+        policy editor in either edition can show a user what their curator list
+        actually resolves to before they save it.
+        """
+        from ..networks import DEFAULT_NETWORK
+        return self._defi_service.venues(DEFAULT_NETWORK, curators, force=True)
+
+    def _start_defi_venue_warmer(self) -> None:
+        """Keep the DeFi venue cache populated in the background.
+
+        Without this, the venue cache is only ever filled by whichever
+        request happens to arrive first with a cold cache - and resolving it
+        is a real chain scan, not something a caller like /mandate should be
+        made to wait on (see services/defi.py's VENUE_CACHE_SECONDS). A daemon
+        thread that resolves once at startup and again on the same interval
+        the cache expires means no request ever pays that cost.
+
+        Best-effort only: an error here is logged and retried next cycle, and
+        must never be allowed to affect startup or any request in flight.
+        """
+        from ..networks import DEFAULT_NETWORK
+        from ..services.defi import VENUE_CACHE_SECONDS
+
+        def warm_once() -> None:
+            try:
+                curator_sets = set()
+                for policy in self._policy_store.get_all_policies():
+                    rules = getattr(policy, "defi_rules", None)
+                    if rules and rules.enabled and rules.morpho_curators:
+                        curator_sets.add(tuple(sorted(
+                            c.lower() for c in rules.morpho_curators)))
+                for curators in curator_sets:
+                    self._defi_service.venues(
+                        DEFAULT_NETWORK, list(curators), force=True)
+            except Exception:
+                logger.exception("DeFi venue warm-up failed; will retry")
+
+        def loop() -> None:
+            while True:
+                warm_once()
+                time.sleep(VENUE_CACHE_SECONDS)
+
+        threading.Thread(target=loop, daemon=True,
+                         name="defi-venue-warmer").start()
 
     def _apply_settings_to_signing_service(self) -> None:
         """Apply persisted settings to the signing service."""
@@ -782,7 +884,8 @@ class Vault:
         blocked_domains: Optional[list[str]] = None,
         networks: Optional[list[int]] = None,
         trading_rules: Optional["TradingRules"] = None,
-        x402_enabled: bool = True
+        x402_enabled: bool = True,
+        defi_rules: Optional["DefiRules"] = None
     ) -> "SpendPolicy":
         """Create a new spend policy.
 
@@ -811,7 +914,8 @@ class Vault:
             blocked_domains=blocked_domains,
             networks=networks,
             trading_rules=trading_rules,
-            x402_enabled=x402_enabled
+            x402_enabled=x402_enabled,
+            defi_rules=defi_rules
         )
         self._policy_store.add_policy(policy)
 
@@ -1607,6 +1711,8 @@ class Vault:
         """
         if self._trading_service:
             self._trading_service.set_hardware_tx_signer(handler)
+        if self._defi_service:
+            self._defi_service.set_hardware_tx_signer(handler)
 
     def approve_request(self, request_id: str) -> dict:
         """Approve a pending signing request."""
@@ -1728,6 +1834,9 @@ class Vault:
             self._server_running = True
             self._server_port = port
             self._allow_lan = allow_lan
+            if not self._defi_venue_warmer_started:
+                self._defi_venue_warmer_started = True
+                self._start_defi_venue_warmer()
             self._event_bus.emit(Event(
                 type=EventType.SERVER_STARTED,
                 data={"port": port, "allow_lan": allow_lan}

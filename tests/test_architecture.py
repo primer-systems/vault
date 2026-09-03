@@ -14,6 +14,8 @@ Run with: pytest tests/test_architecture.py -v
 import ast
 import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Set, List, Tuple
 
@@ -81,37 +83,160 @@ def get_attribute_access(filepath: Path) -> List[Tuple[str, int, str]]:
 
 
 class TestNoQtInCore:
-    """Rule 2: No Qt imports in core, services, models, daemon, or client."""
+    """Rule 2: No Qt imports anywhere in the shared tier.
 
-    FORBIDDEN_DIRS = ['core', 'services', 'models', 'daemon', 'client']
+    Every package and module listed below ships in both editions, and the
+    Terminal edition is installed with no PyQt6 present at all. A Qt import
+    here is not a layering opinion - it is an ImportError on every server.
+
+    `wallet` was missing from this list until the 0.3 split, which is how
+    `wallet/dialogs.py` came to hold 2,058 lines of PyQt6 inside a package
+    `core/vault.py` depends on. Those dialogs now live in `ui/wallet_dialogs.py`.
+    """
+
+    FORBIDDEN_DIRS = ['core', 'services', 'models', 'wallet', 'commands']
+    FORBIDDEN_MODULES = [
+        'utils.py', 'networks.py', 'instance_lock.py', 'version.py',
+        'design_tokens.py',
+    ]
     QT_MODULES = ['PyQt6', 'PyQt5', 'PySide6', 'PySide2']
 
-    def get_qt_violations(self) -> List[Tuple[Path, str, int, str]]:
-        """Find all Qt imports in forbidden directories."""
-        violations = []
-
+    def shared_tier_files(self) -> List[Path]:
+        """Every file that ships in both editions."""
+        files = []
         for dirname in self.FORBIDDEN_DIRS:
             dirpath = PRIMER_VAULT_DIR / dirname
-            if not dirpath.exists():
-                continue
+            if dirpath.exists():
+                files.extend(get_python_files(dirpath))
+        for name in self.FORBIDDEN_MODULES:
+            path = PRIMER_VAULT_DIR / name
+            if path.exists():
+                files.append(path)
+        return files
 
-            for filepath in get_python_files(dirpath):
-                imports = get_imports_from_file(filepath)
-                for module, lineno, line in imports:
-                    if any(qt in module for qt in self.QT_MODULES):
-                        violations.append((filepath.relative_to(PRIMER_VAULT_DIR), module, lineno, line))
+    def get_qt_violations(self) -> List[Tuple[Path, str, int, str]]:
+        """Find all Qt imports in the shared tier."""
+        violations = []
+
+        for filepath in self.shared_tier_files():
+            imports = get_imports_from_file(filepath)
+            for module, lineno, line in imports:
+                if any(qt in module for qt in self.QT_MODULES):
+                    violations.append((filepath.relative_to(PRIMER_VAULT_DIR), module, lineno, line))
 
         return violations
 
     def test_no_qt_in_core(self):
-        """Core layer must not import Qt."""
+        """The shared tier must not import Qt."""
         violations = self.get_qt_violations()
 
         if violations:
-            msg = "Qt imports found in core layer (violates Rule 2):\n"
+            msg = "Qt imports found in the shared tier (violates Rule 2):\n"
             for filepath, _module, lineno, line in violations:
                 msg += f"  {filepath}:{lineno}: {line}\n"
             pytest.fail(msg)
+
+    def test_shared_tier_imports_with_qt_uninstalled(self):
+        """Rule 8: the shared tier imports on a machine with no PyQt6 at all.
+
+        The rule above reads source; this one runs it. A Qt import inside a
+        function body - the shape that hid PyQt6 in utils.py for a year - is
+        invisible to a source scan and fatal to a Terminal install, because it
+        fails when the function is called rather than when the module loads.
+
+        Runs in a subprocess with the Qt packages poisoned in sys.modules, so
+        importing one raises exactly as it would on a bare server.
+        """
+        script = (
+            "import sys, importlib\n"
+            "class Blocked:\n"
+            "    def __getattr__(self, name):\n"
+            "        raise ImportError('No module named PyQt6')\n"
+            "for m in ('PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets'):\n"
+            "    sys.modules[m] = Blocked()\n"
+            "for m in ('primer_vault.core', 'primer_vault.models',\n"
+            "          'primer_vault.services', 'primer_vault.wallet',\n"
+            "          'primer_vault.commands', 'primer_vault.utils',\n"
+            "          'primer_vault.networks', 'primer_vault.instance_lock',\n"
+            "          'primer_vault.version', 'primer_vault.design_tokens'):\n"
+            "    importlib.import_module(m)\n"
+            "print('OK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True,
+            # src/, not the repo root: a stale copy of the package in
+            # site-packages would otherwise be what gets tested.
+            cwd=str(Path(__file__).parent.parent / "src"),
+        )
+        assert result.returncode == 0 and "OK" in result.stdout, (
+            "The shared tier does not import with PyQt6 uninstalled - which is "
+            "what a Terminal edition install looks like.\n\n"
+            + result.stdout + result.stderr
+        )
+
+
+class TestNoEditionConditionals:
+    """Rule 6: shared code asks what is registered, never which product it is.
+
+    Two editions means two chances for a rule to exist in one and be missing
+    from the other, and an `if edition ==` in shared code is how that starts:
+    the two branches drift, and the one nobody is running is the one that
+    breaks. The correct question is about a capability -
+
+        if not self._on_hardware_sign_needed:
+            return {"code": "LEDGER_SIGN_NOT_AVAILABLE", ...}
+
+    - which is answered the same way wherever it runs.
+
+    The composition roots are exempt. Naming the edition is their whole job.
+    """
+
+    SHARED_DIRS = ['core', 'services', 'models', 'wallet', 'commands']
+    SHARED_MODULES = ['utils.py', 'networks.py', 'instance_lock.py',
+                      'version.py', 'design_tokens.py']
+
+    #: Patterns that mean "which product am I", as opposed to "what can I do".
+    FORBIDDEN = [
+        r'\bedition\s*==',
+        r'==\s*["\'](?:desktop|terminal|gui|headless|cli)["\']',
+        r'\bis_gui\b',
+        r'\bis_headless\b',
+        r'\bif\s+headless\b',
+        r'\bIS_DESKTOP\b',
+        r'\bIS_TERMINAL\b',
+    ]
+
+    def test_no_edition_conditionals_in_shared_code(self):
+        pattern = re.compile('|'.join(self.FORBIDDEN))
+        violations = []
+
+        files = []
+        for dirname in self.SHARED_DIRS:
+            dirpath = PRIMER_VAULT_DIR / dirname
+            if dirpath.exists():
+                files.extend(get_python_files(dirpath))
+        for name in self.SHARED_MODULES:
+            path = PRIMER_VAULT_DIR / name
+            if path.exists():
+                files.append(path)
+
+        for filepath in files:
+            rel = str(filepath.relative_to(PRIMER_VAULT_DIR))
+            for lineno, line in enumerate(
+                    filepath.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                if pattern.search(line):
+                    violations.append(f"  {rel}:{lineno}: {stripped}")
+
+        assert not violations, (
+            "Shared code is branching on which edition it is running in "
+            "(violates Rule 6). Ask whether the capability is registered "
+            "instead - a handler, a callback - the way "
+            "LEDGER_SIGN_NOT_AVAILABLE does:\n" + "\n".join(violations))
+
 
 class TestUIUsesPublicAPI:
     """Rule 1 & 3: UI must use Core's public methods, not internal attributes."""
@@ -362,10 +487,10 @@ class TestEventBusUsage:
 class TestWalletDirectAccess:
     """UI should not create/restore wallets directly - must go through Core.
 
-    "UI" is every file that draws a window, not just the ui/ package. The wallet
-    dialogs live under wallet/ for import reasons - core code imports
-    wallet.crypto and must not pull Qt in with it - but they are UI and the same
-    rule applies to them.
+    Every file that draws a window now lives in ui/, including the wallet
+    dialogs. They used to sit under wallet/ so that core code could import
+    wallet.crypto without pulling Qt in; moving them to ui/wallet_dialogs.py
+    solved that properly, and this rule no longer needs a special case.
     """
 
     FORBIDDEN_PATTERNS = [
@@ -373,7 +498,7 @@ class TestWalletDirectAccess:
     ]
 
     #: Files that draw windows, wherever they sit in the tree.
-    UI_PATHS = ['ui', os.path.join('wallet', 'dialogs.py')]
+    UI_PATHS = ['ui']
 
     #: Lines exempt from the rule, each with the reason it is allowed.
     #:
@@ -382,8 +507,8 @@ class TestWalletDirectAccess:
     #: The rule exists to stop the UI writing a real wallet behind Core's back,
     #: which these do not do.
     ALLOWED = {
-        (os.path.join('wallet', 'dialogs.py'), '_show_derivation_dialog'),
-        (os.path.join('wallet', 'dialogs.py'), '_pick_ledger_addresses'),
+        (os.path.join('ui', 'wallet_dialogs.py'), '_show_derivation_dialog'),
+        (os.path.join('ui', 'wallet_dialogs.py'), '_pick_ledger_addresses'),
     }
 
     def get_direct_wallet_creation(self) -> List[Tuple[Path, str, int, str]]:
@@ -444,7 +569,7 @@ class TestStylingDiscipline:
 
     # The only two places allowed to set the application stylesheet.
     ALLOWED_SETSTYLESHEET = {
-        os.path.join("app.py"),
+        os.path.join("app_desktop.py"),
         os.path.join("ui", "main_window.py"),
     }
     # Color data lives only here.

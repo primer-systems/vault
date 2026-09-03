@@ -10,7 +10,7 @@ Contains:
 - LogTab: Real-time logs
 """
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QCheckBox, QSpinBox, QLineEdit, QTextEdit, QGroupBox, QFormLayout, QFileDialog, QDialog, QFrame, QSplitter
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QCheckBox, QSpinBox, QLineEdit, QTextEdit, QGroupBox, QFormLayout, QFileDialog, QDialog, QFrame
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QByteArray
 from PyQt6.QtGui import QFont, QColor, QPixmap, QIcon
 from typing import Optional
@@ -29,9 +29,9 @@ from .dialogs import (
     NewPolicyDialog
 )
 from ..models import SpendPolicy, Agent, Transaction
-from ..version import USER_AGENT
+from ..version import USER_AGENT, BLOCKSCOUT_USER_AGENT
 from ..wallet import VaultWallet, AddressEntry, WalletInfo, NO_PASSWORD_SENTINEL
-from ..wallet.dialogs import (
+from .wallet_dialogs import (
     AddAddressDialog, SeedSelectionDialog, DerivationBrowserDialog,
     NewSeedDialog, ImportSeedToWalletDialog, ImportPrivateKeyToWalletDialog,
     VaultWalletUnlockDialog, CreateWalletWizard,
@@ -87,9 +87,12 @@ class IconFetcherThread(QThread):
         import urllib.error
         logger = logging.getLogger(__name__)
         try:
+            # Blockscout-hosted icons need its browser-shaped UA (see
+            # BLOCKSCOUT_USER_AGENT); anywhere else keeps the honest one.
+            ua = BLOCKSCOUT_USER_AGENT if "blockscout.com" in self.url else USER_AGENT
             req = urllib.request.Request(
                 self.url,
-                headers={"User-Agent": USER_AGENT}
+                headers={"User-Agent": ua}
             )
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = response.read()
@@ -134,7 +137,7 @@ class PoliciesTab(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels([
-            "Name", "Trading", "x402", "Auto-Approve", "Linked to", "Actions"
+            "Name", "Trading", "Morpho", "x402", "Linked to", "Actions"
         ])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -142,9 +145,9 @@ class PoliciesTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(1, 70)
-        self.table.setColumnWidth(2, 60)
-        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(1, 90)
+        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(3, 90)
         self.table.setColumnWidth(4, 90)
         self.table.setColumnWidth(5, 70)
         self.table.setAlternatingRowColors(True)
@@ -156,8 +159,8 @@ class PoliciesTab(QWidget):
         layout.addWidget(self.table)
 
         help_text = QLabel(
-            "Spend policies control how much agents can spend. "
-            "Double-click to edit."
+            "Spend policies control how much agents can spend. Double-click to "
+            "edit. * marks a lane with auto-approve below a threshold."
         )
         help_text.setWordWrap(True)
         help_text.setProperty("role", "muted")
@@ -173,32 +176,24 @@ class PoliciesTab(QWidget):
             # Name
             self.table.setItem(row, 0, QTableWidgetItem(policy.name))
 
-            # Trading: tick or cross
-            trading_item = QTableWidgetItem("\u2713" if policy.is_trading_enabled() else "\u2717")
-            trading_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 1, trading_item)
+            # Trading / Morpho / x402: each cell is enabled-state and
+            # auto-approve-state together, rather than two columns saying
+            # related things about the same lane. Off is a cross; on is a
+            # check; on with an auto-approve threshold set adds an asterisk,
+            # explained once in the caption below the table.
+            trading_on = policy.is_trading_enabled()
+            trading_auto = (trading_on
+                            and policy.trading_rules.auto_approve_below_usd is not None)
+            self._set_lane_cell(row, 1, trading_on, trading_auto)
 
-            # x402: tick or cross
-            x402_item = QTableWidgetItem("\u2713" if policy.x402_enabled else "\u2717")
-            x402_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 2, x402_item)
+            defi_on = policy.is_defi_enabled()
+            defi_auto = (defi_on
+                        and policy.defi_rules.auto_approve_below_usd is not None)
+            self._set_lane_cell(row, 2, defi_on, defi_auto)
 
-            # Auto-Approve: trading / x402 / both / off
-            has_x402_auto = policy.x402_enabled and policy.auto_approve_below_micro is not None
-            has_trading_auto = (
-                policy.trading_rules is not None
-                and policy.trading_rules.enabled
-                and policy.trading_rules.auto_approve_below_usd is not None
-            )
-            if has_x402_auto and has_trading_auto:
-                auto_text = "both"
-            elif has_trading_auto:
-                auto_text = "trading"
-            elif has_x402_auto:
-                auto_text = "x402"
-            else:
-                auto_text = "off"
-            self.table.setItem(row, 3, QTableWidgetItem(auto_text))
+            x402_on = policy.x402_enabled
+            x402_auto = x402_on and policy.auto_approve_below_micro is not None
+            self._set_lane_cell(row, 3, x402_on, x402_auto)
 
             # Linked to: count of agents using this policy
             agent_count = sum(1 for a in agents if a.policy_id == policy.id)
@@ -220,10 +215,22 @@ class PoliciesTab(QWidget):
             delete_btn.setToolTip("Delete policy")
             delete_btn.setProperty("variant", "danger")
             delete_btn.clicked.connect(lambda checked, p=policy: self.delete_policy(p))
+            actions_layout.addStretch()
             actions_layout.addWidget(delete_btn)
             actions_layout.addStretch()
 
             self.table.setCellWidget(row, 5, actions_widget)
+
+    def _set_lane_cell(self, row: int, column: int, enabled: bool, auto: bool) -> None:
+        """✗ off, ✓ on, ✓* on with an auto-approve threshold set."""
+        text = "✗"
+        if enabled:
+            text = "✓ *" if auto else "✓"
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if auto:
+            item.setToolTip("Auto-approves below a threshold")
+        self.table.setItem(row, column, item)
 
     def add_policy(self):
         """Show dialog to create a new policy."""
@@ -250,6 +257,7 @@ class PoliciesTab(QWidget):
             policy.blocked_domains = policy_data.get("blocked_domains") or []
             policy.networks = policy_data.get("networks") or []
             policy.trading_rules = policy_data.get("trading_rules")
+            policy.defi_rules = policy_data.get("defi_rules")
             self.core.update_policy(policy)
             self.populate_table()
             self.policy_changed.emit()
@@ -607,7 +615,7 @@ class HistoryTab(QWidget):
         filters.addWidget(self.agent_filter)
 
         self.type_filter = QComboBox()
-        self.type_filter.addItems(["All Types", "x402", "Trade", "Send"])
+        self.type_filter.addItems(["All Types", "x402", "Trade", "Lend", "Approve", "Send"])
         self.type_filter.currentIndexChanged.connect(self.apply_filters)
         filters.addWidget(self.type_filter)
 
@@ -633,23 +641,24 @@ class HistoryTab(QWidget):
         layout.addLayout(filters)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        # Column order: Time, Type, Out, In, Status, Agent, Address
-        self.table.setHorizontalHeaderLabels(["Time", "Type", "Out", "In", "Status", "Agent", "Address"])
-        # Fixed widths for most columns, Address stretches to fill
+        self.table.setColumnCount(6)
+        # Column order: Time, Activity, Amount, Status, Agent, Address
+        self.table.setHorizontalHeaderLabels(["Time", "Activity", "Amount", "Status", "Agent", "Address"])
+        # Activity is a free-text sentence describing the row (it has to carry
+        # "Approve USDG for VaultV2" as well as "Swap 0.5 ETH for USDG", which
+        # a fixed Out/In pair can't - an approval moves no value at all), so
+        # it stretches; the rest stay fixed.
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # Time
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # Type
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Out
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # In
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # Status
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # Agent
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)  # Addr - flex
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Activity - flex
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Amount
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # Status
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # Agent
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # Address
         self.table.setColumnWidth(0, 100)   # Time
-        self.table.setColumnWidth(1, 60)    # Type
-        self.table.setColumnWidth(2, 120)   # Out
-        self.table.setColumnWidth(3, 120)   # In
-        self.table.setColumnWidth(4, 80)    # Status
-        self.table.setColumnWidth(5, 140)   # Agent
+        self.table.setColumnWidth(2, 140)   # Amount
+        self.table.setColumnWidth(3, 80)    # Status
+        self.table.setColumnWidth(4, 140)   # Agent
+        self.table.setColumnWidth(5, 140)   # Address
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -732,6 +741,10 @@ class HistoryTab(QWidget):
             filtered = [tx for tx in filtered if getattr(tx, 'type', 'x402') == 'x402']
         elif type_text == "trade":
             filtered = [tx for tx in filtered if getattr(tx, 'type', 'x402') == 'trade']
+        elif type_text == "lend":
+            filtered = [tx for tx in filtered if getattr(tx, 'type', 'x402') == 'lend']
+        elif type_text == "approve":
+            filtered = [tx for tx in filtered if getattr(tx, 'type', 'x402') == 'approve']
         elif type_text == "send":
             filtered = [tx for tx in filtered if getattr(tx, 'type', 'x402') == 'transfer']
         # "all types" shows everything
@@ -756,45 +769,21 @@ class HistoryTab(QWidget):
         self.table.setVisible(len(transactions) > 0)
 
         for row, tx in enumerate(transactions):
-            tx_type = getattr(tx, 'type', 'x402')
-
-            # Column order: Time(0), Type(1), Out(2), In(3), Status(4), Agent(5), Addr(6)
+            # Column order: Time(0), Activity(1), Amount(2), Status(3), Agent(4), Addr(5)
 
             # Store transaction ID in the first column for double-click lookup
             time_item = QTableWidgetItem(tx.format_time())
             time_item.setData(Qt.ItemDataRole.UserRole, tx.id)
             self.table.setItem(row, 0, time_item)
 
-            # Type label
-            type_labels = {'x402': 'x402', 'trade': 'Trade', 'transfer': 'Send'}
-            type_item = QTableWidgetItem(type_labels.get(tx_type, tx_type))
-            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 1, type_item)
+            # Activity - one sentence describing what this row did. Replaces
+            # the old fixed Type/Out/In columns, which had no way to show a
+            # no-value approval row without it looking broken.
+            self.table.setItem(row, 1, QTableWidgetItem(tx.display_activity()))
 
-            # "Out" column - what was spent
-            if tx_type == 'trade':
-                sym_in = getattr(tx, 'symbol_in', '?')
-                amt_in = getattr(tx, 'amount_in', '?')
-                out_text = f"{amt_in} {sym_in}"
-            elif tx_type == 'transfer':
-                sym = getattr(tx, 'transfer_symbol', 'ETH')
-                amt = getattr(tx, 'transfer_amount', '?')
-                out_text = f"{amt} {sym}"
-            else:
-                out_text = tx.format_amount()
-            self.table.setItem(row, 2, QTableWidgetItem(out_text))
-
-            # "In" column - buy token for settled trades, n/a for others
-            if tx_type == 'trade':
-                if tx.status == 'rejected':
-                    in_text = "n/a"
-                else:
-                    sym_out = getattr(tx, 'symbol_out', '?')
-                    amt_out = getattr(tx, 'amount_out', None)
-                    in_text = f"{amt_out} {sym_out}" if amt_out else sym_out
-            else:
-                in_text = "n/a"
-            self.table.setItem(row, 3, QTableWidgetItem(in_text))
+            # Amount - the single value this row moved, "—" for approvals.
+            amount_item = QTableWidgetItem(tx.display_amount())
+            self.table.setItem(row, 2, amount_item)
 
             # Status with color coding and verification indicator
             status_text = tx.status.upper()
@@ -819,11 +808,11 @@ class HistoryTab(QWidget):
 
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(QColor(color))
-            self.table.setItem(row, 4, status_item)
+            self.table.setItem(row, 3, status_item)
 
             # Agent name with ID
             agent_text = f"{tx.agent_name} ({tx.agent_id})"
-            self.table.setItem(row, 5, QTableWidgetItem(agent_text))
+            self.table.setItem(row, 4, QTableWidgetItem(agent_text))
 
             # Wallet name (looked up from address)
             wallet_text = ""
@@ -831,7 +820,7 @@ class HistoryTab(QWidget):
                 wallet_text = self._wallet_names.get(tx.wallet_address.lower(), tx.wallet_id or "")
             wallet_item = QTableWidgetItem(wallet_text)
             wallet_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 6, wallet_item)
+            self.table.setItem(row, 5, wallet_item)
 
     def on_row_double_clicked(self, index):
         """Handle double-click on a row to show transaction details."""
@@ -861,43 +850,31 @@ class HistoryTab(QWidget):
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                # "In" is the fill and "In (quoted)" the prediction. Both are
-                # exported so the difference is not lost on the way out.
+                # Activity is the same free-text sentence the table shows -
+                # "Approve USDG for VaultV2", "Swap 0.5 ETH for USDG" - so a
+                # no-value approval row has something honest to say instead of
+                # a blank "Out"/"In" pair. Quoted Amount stays a separate,
+                # machine-parseable column (trade fills only) rather than
+                # folded into the Activity sentence.
                 writer.writerow([
-                    "Timestamp", "Type", "Agent", "ID", "Out", "In",
-                    "In (quoted)", "Recipient", "Network", "Status", "Auto",
+                    "Timestamp", "Type", "Agent", "ID", "Activity", "Amount",
+                    "Quoted Amount", "Recipient", "Network", "Status", "Auto",
                     "Wallet ID", "TX Hash"
                 ])
                 for tx in self._transactions:
-                    tx_type = getattr(tx, 'type', 'x402')
-
-                    # Format "Out" based on type
-                    if tx_type == 'trade':
-                        out_val = f"{getattr(tx, 'amount_in', '')} {getattr(tx, 'symbol_in', '')}"
-                    elif tx_type == 'transfer':
-                        out_val = f"{getattr(tx, 'transfer_amount', '')} {getattr(tx, 'transfer_symbol', 'ETH')}"
-                    else:
-                        out_val = tx.format_amount()
-
-                    # Format "In" based on type
                     quoted_val = ""
-                    if tx_type == 'trade':
-                        sym_out = getattr(tx, 'symbol_out', '')
-                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {sym_out}"
+                    if tx.type == 'trade':
                         quoted = getattr(tx, 'amount_out_quoted', None)
+                        sym_out = getattr(tx, 'symbol_out', '') or ''
                         quoted_val = f"{quoted} {sym_out}" if quoted else ""
-                    elif tx_type == 'transfer':
-                        in_val = ""
-                    else:
-                        in_val = tx.resource or ""
 
                     writer.writerow([
                         tx.timestamp,
-                        tx_type,
+                        tx.type,
                         tx.agent_name,
                         tx.agent_id,
-                        out_val,
-                        in_val,
+                        tx.display_activity(),
+                        tx.display_amount(),
                         quoted_val,
                         tx.recipient or "",
                         tx.network,
@@ -1028,12 +1005,24 @@ class WalletTab(QWidget):
 
         toolbar = QHBoxLayout()
 
+        # The address selector leads the row: it is the thing every other
+        # control on this tab acts on, so it reads first.
+        from .address_selector import AddressSelector
+
+        self.address_selector = AddressSelector()
+        self.address_selector.address_selected.connect(self._on_address_chosen)
+        self.address_selector.copy_requested.connect(self._copy_address)
+        self.address_selector.details_requested.connect(self._open_address_details)
+        self.address_selector.send_requested.connect(
+            lambda addr: self._open_send_dialog(from_address=addr))
+        toolbar.addWidget(self.address_selector)
+
+        toolbar.addStretch()
+
         # Button changes based on whether wallet exists
         self.add_btn = QPushButton("+ Add Wallet")
         self.add_btn.clicked.connect(self.on_add_button)
         toolbar.addWidget(self.add_btn)
-
-        toolbar.addStretch()
 
         # Wallet name — underlined like a link; click opens wallet settings
         self.wallet_label = QLabel("")
@@ -1046,15 +1035,13 @@ class WalletTab(QWidget):
 
         content_layout.addLayout(toolbar)
 
-        # === ADDRESSES PANE (compact, ~30% height) ===
-        addresses_frame = QFrame()
-        addresses_frame.setFrameShape(QFrame.Shape.NoFrame)
-        addresses_layout = QVBoxLayout(addresses_frame)
-        addresses_layout.setContentsMargins(0, 0, 0, 0)
-        addresses_layout.setSpacing(0)
-
-        # Addresses table: Seed | Name | Address (double-click to edit)
+        # The address table this replaced took about a third of the tab for a
+        # list that is usually two rows long and gets read once - to pick one.
+        # It is kept, hidden: several paths still read rows out of it, and this
+        # is the one change where quietly dropping a code path would lose an
+        # address rather than a widget.
         self.address_table = QTableWidget()
+        self.address_table.setVisible(False)
         self.address_table.setColumnCount(3)
         self.address_table.setHorizontalHeaderLabels(["Seed", "Name", "Address"])
         self.address_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -1071,7 +1058,6 @@ class WalletTab(QWidget):
         self.address_table.doubleClicked.connect(self._on_address_double_clicked)
         self.address_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.address_table.customContextMenuRequested.connect(self._on_address_context_menu)
-        addresses_layout.addWidget(self.address_table)
 
         # === ASSETS PANE (larger, ~70% height) ===
         assets_frame = QFrame()
@@ -1089,6 +1075,21 @@ class WalletTab(QWidget):
         self.selected_address_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         assets_header.addWidget(self.selected_address_label)
 
+        # Beside the address rather than beside the chip: this is where the
+        # address is written out in full, and a copy button belongs next to the
+        # thing it copies.
+        from PyQt6.QtWidgets import QToolButton
+
+        self.copy_address_btn = QToolButton()
+        self.copy_address_btn.setProperty("role", "icon-button")
+        self.copy_address_btn.setText("⧉")
+        self.copy_address_btn.setToolTip("Copy address")
+        self.copy_address_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.copy_address_btn.setVisible(False)
+        self.copy_address_btn.clicked.connect(
+            lambda: self._selected_address and self._copy_address(self._selected_address))
+        assets_header.addWidget(self.copy_address_btn)
+
         assets_header.addStretch()
 
         # Refresh button
@@ -1096,14 +1097,6 @@ class WalletTab(QWidget):
         self.refresh_btn.clicked.connect(self._on_refresh_clicked)
         self.refresh_btn.setVisible(False)
         assets_header.addWidget(self.refresh_btn)
-
-        # Verify button (Ledger addresses only)
-        self.verify_device_btn = QPushButton("Verify on Ledger")
-        self.verify_device_btn.setToolTip(
-            "Check that the connected Ledger still derives this address")
-        self.verify_device_btn.clicked.connect(self._on_verify_device_clicked)
-        self.verify_device_btn.setVisible(False)
-        assets_header.addWidget(self.verify_device_btn)
 
         # Send button
         self.send_btn = QPushButton("Send")
@@ -1139,15 +1132,10 @@ class WalletTab(QWidget):
         self.no_address_label.setProperty("role", "muted")
         assets_layout.addWidget(self.no_address_label)
 
-        # Draggable divide between Addresses and Assets
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(addresses_frame)
-        splitter.addWidget(assets_frame)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([180, 420])
-        content_layout.addWidget(splitter, stretch=1)
+        # Assets take the whole height now. The splitter that used to divide
+        # them from the address table went with the table; a second pane below
+        # this one will want it back.
+        content_layout.addWidget(assets_frame, stretch=1)
 
         # Cache for balances by address
         self._address_balances: dict[str, list[Balance]] = {}
@@ -1418,9 +1406,10 @@ class WalletTab(QWidget):
         return None
 
     def populate_table(self):
-        """Refresh the address table with current addresses."""
+        """Refresh the address list and the chip with current addresses."""
         if not self._wallet:
             self.address_table.setRowCount(0)
+            self.address_selector.clear()
             self._clear_assets_pane()
             return
 
@@ -1469,6 +1458,65 @@ class WalletTab(QWidget):
         else:
             self._clear_assets_pane()
 
+        # The chip carries the selection now. Fed after the table so a restored
+        # selection is already settled, and given the per-address USD totals so
+        # the dropdown can show what each one is worth.
+        self.address_selector.set_addresses(
+            addresses, self._address_usd_totals())
+
+    def _address_usd_totals(self) -> dict:
+        """address -> USD across its balances, for the dropdown.
+
+        Best effort: an address whose balances have not been fetched, or whose
+        fetch failed, simply has no figure rather than a zero - and zero would
+        read as "empty", which is a different and wrong claim.
+        """
+        totals = {}
+        for address, balances in (self._address_balances or {}).items():
+            values = [b.usd_value for b in (balances or [])
+                      if getattr(b, "usd_value", None) is not None]
+            if values:
+                totals[address] = sum(values)
+        return totals
+
+    def _on_address_chosen(self, address: str) -> None:
+        """The chip changed. Point the table at the same row so every path that
+        still reads a selected row keeps agreeing with what is displayed."""
+        if not address:
+            self._clear_assets_pane()
+            return
+        for row in range(self.address_table.rowCount()):
+            item = self.address_table.item(row, 2)
+            if item and item.data(Qt.ItemDataRole.UserRole) == address:
+                self.address_table.selectRow(row)
+                return
+        # No matching row means the table has not caught up. Clearing is the
+        # honest answer: showing the previous address's assets under a chip
+        # naming a different one is worse than showing nothing.
+        self._clear_assets_pane()
+
+    def _copy_address(self, address: str) -> None:
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(address)
+        self.activity.emit(f"Copied address: {format_address(address)}", False)
+
+    def _open_address_details(self, address: str) -> None:
+        """The dialog that used to open on a double-click of the table row."""
+        from .dialogs import AddressDetailsDialog
+        if not self._wallet:
+            return
+        entry = self._wallet.get_address_by_address(address)
+        if not entry:
+            return
+        dialog = AddressDetailsDialog(
+            entry=entry,
+            wallet=self._wallet,
+            on_rename=lambda new_name: self._rename_address(entry.id, new_name),
+            on_delete=lambda: self.delete_address(entry.id),
+            parent=self,
+        )
+        dialog.exec()
+
     def _clear_assets_pane(self):
         """Clear the assets pane and show placeholder."""
         self._selected_address = None
@@ -1478,7 +1526,7 @@ class WalletTab(QWidget):
         self.no_address_label.setVisible(True)
         self.send_btn.setVisible(False)
         self.refresh_btn.setVisible(False)
-        self.verify_device_btn.setVisible(False)
+        self.copy_address_btn.setVisible(False)
 
     def _on_address_selected(self):
         """Handle address selection change."""
@@ -1504,15 +1552,7 @@ class WalletTab(QWidget):
         self.no_address_label.setVisible(False)
         self.send_btn.setVisible(True)
         self.refresh_btn.setVisible(True)
-
-        # Verifying only means something for hardware-backed addresses, and the
-        # button names whichever device this one came from.
-        entry = self._wallet.get_address_by_address(full_address) if self._wallet else None
-        if entry and entry.is_hardware:
-            self.verify_device_btn.setText(f"Verify on {entry.device_label}")
-            self.verify_device_btn.setVisible(True)
-        else:
-            self.verify_device_btn.setVisible(False)
+        self.copy_address_btn.setVisible(True)
 
         # Populate assets from cache
         self._populate_assets(full_address)
@@ -1734,64 +1774,6 @@ class WalletTab(QWidget):
         """Handle Send button click."""
         if self._selected_address:
             self._open_send_dialog(from_address=self._selected_address)
-
-    def _on_verify_device_clicked(self):
-        """Re-derive the selected address on its hardware wallet.
-
-        A quick pre-flight check: confirms the device is plugged in, unlocked,
-        in the right app, and holding the same seed this address came from -
-        without asking the user to approve anything.
-        """
-        from ..wallet.ledger import LedgerDevice, LedgerError
-
-        if not self._selected_address or not self._wallet:
-            return
-
-        entry = self._wallet.get_address_by_address(self._selected_address)
-        if not entry or not entry.is_hardware:
-            return
-
-        label = entry.device_label
-        self.verify_device_btn.setEnabled(False)
-        self.verify_device_btn.setText("Checking...")
-        try:
-            # Only Ledger is supported so far; a second brand dispatches here
-            # on entry.wallet_type.
-            device = LedgerDevice.discover()
-            if device is None:
-                FramelessMessageBox.warning(
-                    self, f"{label} Not Found",
-                    f"No {label} device found.\n\n"
-                    f"Connect and unlock your {label}, then open the Ethereum app."
-                )
-                return
-
-            derived = device.derive_address(entry.device_path)
-            if derived.lower() == entry.address.lower():
-                self.activity.emit(f"{label} verified for {entry.name}", False)
-                FramelessMessageBox.information(
-                    self, f"{label} Verified",
-                    f"The connected {label} derives this address at "
-                    f"{entry.device_path}.\n\nSigning will work."
-                )
-            else:
-                FramelessMessageBox.warning(
-                    self, f"Wrong {label}",
-                    f"This device derives a different address at {entry.device_path}:\n\n"
-                    f"Expected: {entry.address}\n"
-                    f"Device:   {derived}\n\n"
-                    f"This is a different {label}, or it was restored from another seed."
-                )
-        except LedgerError as e:
-            FramelessMessageBox.warning(self, f"{label} Error", str(e))
-        except BaseException as e:
-            # Belt and braces: this is a UI slot, so anything escaping here
-            # would surface as an app-level crash dialog.
-            logger.exception("Hardware wallet verification failed")
-            FramelessMessageBox.warning(self, f"{label} Error", f"Verification failed: {e}")
-        finally:
-            self.verify_device_btn.setEnabled(True)
-            self.verify_device_btn.setText(f"Verify on {label}")
 
     def _on_refresh_clicked(self):
         """Handle Refresh button click."""
@@ -2784,40 +2766,14 @@ class SettingsTab(QWidget):
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version_label)
 
-    def set_settings(self, settings: dict):
-        """Update all settings from dict (used on load)."""
-        self._settings = settings
-
-        # Block signals while updating to avoid triggering saves
-        self.sound_checkbox.blockSignals(True)
-        self.toast_checkbox.blockSignals(True)
-        self.flash_checkbox.blockSignals(True)
-        self.minimize_to_tray_checkbox.blockSignals(True)
-        self.close_to_tray_checkbox.blockSignals(True)
-        self.start_minimized_checkbox.blockSignals(True)
-        self.auto_start_server_checkbox.blockSignals(True)
-        self.auto_lock_input.blockSignals(True)
-        self.replay_window_input.blockSignals(True)
-
-        self.sound_checkbox.setChecked(settings.get("sound_enabled", True))
-        self.toast_checkbox.setChecked(settings.get("toast_enabled", True))
-        self.flash_checkbox.setChecked(settings.get("flash_taskbar", True))
-        self.minimize_to_tray_checkbox.setChecked(settings.get("minimize_to_tray", False))
-        self.close_to_tray_checkbox.setChecked(settings.get("close_to_tray", False))
-        self.start_minimized_checkbox.setChecked(settings.get("start_minimized", False))
-        self.auto_start_server_checkbox.setChecked(settings.get("auto_start_server", False))
-        self.auto_lock_input.setValue(settings.get("auto_lock_minutes", 0))
-        self.replay_window_input.setValue(settings.get("replay_window_seconds", 300))
-
-        self.sound_checkbox.blockSignals(False)
-        self.toast_checkbox.blockSignals(False)
-        self.flash_checkbox.blockSignals(False)
-        self.minimize_to_tray_checkbox.blockSignals(False)
-        self.close_to_tray_checkbox.blockSignals(False)
-        self.start_minimized_checkbox.blockSignals(False)
-        self.auto_start_server_checkbox.blockSignals(False)
-        self.auto_lock_input.blockSignals(False)
-        self.replay_window_input.blockSignals(False)
+    # There was a `set_settings()` here that repopulated every control from a
+    # dict. Nothing called it - the controls are populated once, at
+    # construction, from the same `self._settings` - and it had drifted: it read
+    # `auto_start_server` with a default of False while every live read of that
+    # key defaults to True. Wiring it up would have silently turned the agent
+    # server's auto-start off for every user whose settings file predates the
+    # key. Deleted rather than corrected, because a second population path that
+    # nothing exercises is how the defaults drift apart in the first place.
 
     def get_settings(self) -> dict:
         """Get current settings as dict."""

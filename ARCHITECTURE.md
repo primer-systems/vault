@@ -1,8 +1,8 @@
 # Architecture
 
-Vault runs as a desktop app, a terminal, and a headless daemon, and all three do
-the same things. That only stays true if there is one implementation underneath
-and the interfaces are thin. These are the rules that keep it that way.
+Vault ships as two editions - a desktop window and a terminal - and they do the
+same things. That only stays true if there is one implementation underneath and
+the interfaces are thin. These are the rules that keep it that way.
 
 Every rule here is enforced by `tests/test_architecture.py`. If you change a
 rule, change the test — a rule that lives only in prose stops being true within a
@@ -14,36 +14,66 @@ release.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ CORE — knows nothing about how it is being driven       │
+│ SHARED — knows nothing about how it is being driven     │
 │   Vault          the single entry point for operations  │
 │   services/      signing, trading, the HTTP agent API   │
 │   models/        agents, policies, transactions, store  │
 │   wallet/        keys, encryption, hardware devices     │
+│   commands/      every command, for both editions       │
 └─────────────────────────────────────────────────────────┘
                           ▲
-                          │  method calls, or HTTP to the admin API
-          ┌───────────────┼───────────────┐
-    ┌─────┴─────┐   ┌─────┴─────┐   ┌─────┴──────┐
-    │ GUI       │   │ CLI       │   │ Headless   │
-    │ (PyQt6)   │   │ terminal  │   │ daemon     │
-    └───────────┘   └───────────┘   └────────────┘
+                          │  method calls, in process
+              ┌───────────┴───────────┐
+        ┌─────┴──────┐         ┌──────┴─────┐
+        │ ui/        │         │ terminal/  │
+        │ (PyQt6)    │         │ prompt     │
+        └─────┬──────┘         └──────┬─────┘
+              │                       │
+      app_desktop.py           app_terminal.py
 ```
 
-The core owns all state and every decision. An interface collects input, calls
-`Vault`, and renders what comes back. When an interface starts deciding
-something, that decision exists in one place and is missing from the other two —
-which is exactly how a wallet ends up enforcing a limit in the GUI and not in the
-daemon.
+The shared tier owns all state and every decision. An interface collects input,
+calls `Vault`, and renders what comes back. When an interface starts deciding
+something, that decision exists in one place and is missing from the other — which
+is exactly how a wallet ends up enforcing a limit in the window and not on the
+server.
+
+**`commands/` is shared.** It reads as terminal code and it is not: the desktop's
+console panel (`ui/console.py`) imports the same `CommandHandler`. Forking it
+would give the two editions two command languages and two sets of validation.
+This is the single most likely thing in the tree for someone to get wrong.
+
+**The two composition roots are the only places an edition is named.**
+`app_desktop.py` and `app_terminal.py` build a `Vault` and register the handlers
+that make it a product. Below them, code asks whether a capability is present -
+"is a hardware-signing handler registered?" - never which product it is running
+in.
 
 ---
 
-## Rule 1 — No Qt in the core
+## Rule 1 — No Qt in the shared tier
 
-*Enforced by `test_no_qt_in_core`.*
+*Enforced by `test_no_qt_in_core` and
+`test_shared_tier_imports_with_qt_uninstalled`.*
 
-Nothing under `core/`, `services/`, `models/` or `wallet/` may import PyQt. The
-daemon runs on machines with no display and no Qt installed; an import that
-reaches into Qt turns a headless deployment into an import error.
+Nothing under `core/`, `services/`, `models/`, `wallet/` or `commands/`, and none
+of `utils.py`, `networks.py`, `instance_lock.py`, `version.py` or
+`design_tokens.py`, may import PyQt. Everything in that list ships in both
+editions, and the Terminal edition is installed with no Qt present at all — so an
+import that reaches into Qt is not a layering opinion, it is an ImportError on
+every server.
+
+The two tests do different jobs. The first reads the source, which is fast and
+catches the common case. The second runs a subprocess with the Qt packages
+poisoned in `sys.modules` and imports the whole shared tier, which is the only
+thing that catches a Qt import buried inside a function body — the shape that hid
+PyQt6 in `utils.py`, where a source scan sees nothing and the failure only
+appears when the function is called.
+
+`wallet` was missing from the first list until the 0.3 split, which is how
+`wallet/dialogs.py` came to hold 2,058 lines of PyQt6 inside a package
+`core/vault.py` depends on. Those dialogs now live in `ui/wallet_dialogs.py`, and
+every file that draws a window is under `ui/`.
 
 Core code reports events through the `EventBus` and through callbacks. The GUI
 subscribes and bridges those to Qt signals at the boundary.
@@ -59,7 +89,7 @@ first half invites: an interface calling a method that was renamed or never
 existed, which no test would otherwise notice until a user clicked the button.
 
 If the UI needs something the core does not expose, add it to `Vault`. That way
-the CLI and the daemon get it too.
+the terminal edition gets it too.
 
 ## Rule 3 — Operations go through the core, not around it
 
@@ -75,8 +105,9 @@ not construct wallets itself. Wallet creation in particular carries precondition
 *Enforced by `test_core_emits_expected_events`.*
 
 When the core changes something a user can see, it emits an event. Interfaces
-render from those rather than polling or guessing. This is what lets a CLI
-command update a running GUI: both are watching the same core.
+render from those rather than polling or guessing. It is what puts an approval
+request in front of a terminal operator the moment it arrives, instead of
+leaving them to keep typing `pending` and hoping.
 
 ## Rule 5 — Styling is semantic, never inline
 
@@ -95,14 +126,33 @@ that hardcodes a colour is correct in one of them and wrong in the other.
 Set a semantic property on the widget and write a QSS rule for it. The colour
 then comes from whichever palette is active.
 
+## Rule 6 — Shared code never asks which edition it is in
+
+*Enforced by `test_no_edition_conditionals_in_shared_code`.*
+
+No `if edition ==`, no `is_gui`, no `if headless`. Shared code asks whether a
+capability is registered, and behaves accordingly:
+
+```python
+if not self._on_hardware_sign_needed:
+    return {"status": "error", "code": "LEDGER_SIGN_NOT_AVAILABLE", ...}
+```
+
+That is a question about this deployment, and it is answered the same way in
+both editions. `if edition == "desktop"` is a fork with extra steps: the two
+branches drift, and the one nobody is running is the one that breaks.
+
+When the desktop got hardware signing and the terminal did not, this rule is
+what made adding it a matter of registering a handler rather than editing the
+signing service.
+
 ---
 
 ## Common mistakes
 
-**Adding a decision to the interface.** A check in the GUI is a check the CLI and
-the daemon do not have. A rule implemented in two of three interfaces is a rule
-the third does not enforce. Put it in the core and let the interface show a
-nicer message on top.
+**Adding a decision to the interface.** A check in the window is a check the
+terminal does not have, and the terminal is the edition running unattended on a
+server. Put it in the core and let the interface show a nicer message on top.
 
 **Trusting a field the caller supplied.** If the core already knows something
 from authenticating the caller, it must not read that same thing out of the
@@ -138,9 +188,10 @@ escapes the handler becomes a dropped connection rather than a refusal.
 | `models/` | Agent, policy, transaction, and their JSON store |
 | `wallet/crypto.py` | Master key, encryption, seeds, addresses |
 | `wallet/ledger.py` | Hardware wallet support |
-| `daemon/` | Headless mode and the admin API |
-| `ui/`, `wallet/dialogs.py` | PyQt6 interface |
-| `commands/` | CLI command handlers |
+| `commands/` | Every command. **Shared** — the desktop console uses these too |
+| `ui/` | PyQt6 interface — every file that draws a window, including the wallet dialogs |
+| `terminal/` | The prompt, the local control channel, boot registration |
+| `app_desktop.py`, `app_terminal.py` | The two composition roots |
 
 ## Running the rules
 

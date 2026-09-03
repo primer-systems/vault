@@ -106,23 +106,10 @@ Subcommands:
             tx_type = getattr(tx, 'type', 'x402')
             agent = tx.agent_name or 'unknown'
             status = tx.status
-
-            if tx_type == 'trade':
-                # Trade: show swap details
-                sym_in = getattr(tx, 'symbol_in', '?')
-                sym_out = getattr(tx, 'symbol_out', '?')
-                amt_in = getattr(tx, 'amount_in', '?')
-                lines.append(f"  {tx.id[:8]}  {agent}  {amt_in} {sym_in} → {sym_out}  [trade/{status}]")
-            elif tx_type == 'transfer':
-                # Transfer: show amount and recipient
-                sym = getattr(tx, 'transfer_symbol', 'ETH')
-                amt = getattr(tx, 'transfer_amount', '?')
-                recip = tx.recipient[:10] + '…' if tx.recipient and len(tx.recipient) > 12 else (tx.recipient or '?')
-                lines.append(f"  {tx.id[:8]}  {agent}  {amt} {sym} → {recip}  [transfer/{status}]")
-            else:
-                # x402: show USDG amount
-                amount = tx.amount_micro / 1_000_000
-                lines.append(f"  {tx.id[:8]}  {agent}  ${amount:.6f}  [x402/{status}]")
+            # One line per row, built from the same activity sentence the
+            # desktop UI and CSV export use - one place formatting lives,
+            # rather than a third re-implementation per type here.
+            lines.append(f"  {tx.id[:8]}  {agent}  {tx.display_activity()}  [{tx_type}/{status}]")
 
         return CommandResult.ok("\n".join(lines), data={"transactions": [
             {
@@ -172,6 +159,25 @@ Subcommands:
                 f"  Token:      {getattr(match, 'transfer_symbol', 'ETH')}",
                 f"  Amount:     {getattr(match, 'transfer_amount', '?')}",
                 f"  Recipient:  {match.recipient or 'unknown'}",
+            ])
+        elif tx_type == 'lend':
+            # create_lend stores no explicit direction - infer supply vs
+            # withdraw the same way the model's own display helpers do.
+            supplying = match.lend_is_supply()
+            asset = getattr(match, 'symbol_in', None) if supplying else getattr(match, 'symbol_out', None)
+            venue = getattr(match, 'symbol_out', None) if supplying else getattr(match, 'symbol_in', None)
+            lines.extend([
+                f"  Action:     {'Supply' if supplying else 'Withdraw'}",
+                f"  Venue:      {venue or '?'}",
+                f"  Asset:      {asset or '?'}",
+                f"  Amount:     {getattr(match, 'amount_in', '?')}",
+                f"  Venue Addr: {getattr(match, 'pool', '?') or 'unknown'}",
+            ])
+        elif tx_type == 'approve':
+            lines.extend([
+                f"  Asset:      {getattr(match, 'approve_symbol', None) or '?'}",
+                f"  Amount:     {getattr(match, 'amount_in', '?')}",
+                f"  Spender:    {getattr(match, 'approve_spender', None) or 'unknown'}",
             ])
         else:  # x402
             amount = match.amount_micro / 1_000_000
@@ -243,45 +249,32 @@ Example:
         try:
             with open(filepath, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                # Header
-                # 'In' is what the trade actually delivered; 'In (quoted)' is
-                # what it was predicted to. Both, so the difference survives the
-                # export - a spreadsheet showing only the quote would report an
-                # estimate as a settled fact.
+                # Activity is the same free-text sentence `history list`/the
+                # desktop UI show ("Approve USDG for VaultV2", "Swap 0.5 ETH
+                # for USDG") - a no-value approval row has something honest to
+                # say instead of a blank Out/In pair. Quoted Amount stays a
+                # separate, machine-parseable column (trade fills only)
+                # rather than folded into the Activity sentence.
                 writer.writerow([
-                    'ID', 'Type', 'Agent', 'Out', 'In', 'In (quoted)', 'Status',
-                    'Recipient', 'Network', 'Timestamp', 'Tx Hash'
+                    'ID', 'Type', 'Agent', 'Activity', 'Amount', 'Quoted Amount',
+                    'Status', 'Recipient', 'Network', 'Timestamp', 'Tx Hash'
                 ])
                 # Data
                 for tx in txs:
                     tx_type = getattr(tx, 'type', 'x402')
 
-                    # Format "Out" column based on type
-                    if tx_type == 'trade':
-                        out_val = f"{getattr(tx, 'amount_in', '')} {getattr(tx, 'symbol_in', '')}"
-                    elif tx_type == 'transfer':
-                        out_val = f"{getattr(tx, 'transfer_amount', '')} {getattr(tx, 'transfer_symbol', 'ETH')}"
-                    else:
-                        out_val = f"{tx.amount_micro / 1_000_000:.6f} USDG"
-
-                    # Format "In" column based on type
                     quoted_val = ''
                     if tx_type == 'trade':
-                        sym_out = getattr(tx, 'symbol_out', '')
-                        in_val = f"{getattr(tx, 'amount_out', '') or '?'} {sym_out}"
+                        sym_out = getattr(tx, 'symbol_out', '') or ''
                         quoted = getattr(tx, 'amount_out_quoted', None)
                         quoted_val = f"{quoted} {sym_out}" if quoted else ''
-                    elif tx_type == 'transfer':
-                        in_val = ""  # Transfers out don't receive anything
-                    else:
-                        in_val = getattr(tx, 'request_url', None) or getattr(tx, 'resource', '') or ''
 
                     writer.writerow([
                         tx.id,
                         tx_type,
                         getattr(tx, 'agent_name', '') or '',
-                        out_val,
-                        in_val,
+                        tx.display_activity(),
+                        tx.display_amount(),
                         quoted_val,
                         tx.status,
                         getattr(tx, 'recipient', '') or '',

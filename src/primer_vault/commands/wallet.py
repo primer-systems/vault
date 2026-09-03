@@ -23,6 +23,70 @@ def _extract_flag(args: list[str], flag: str) -> tuple[Optional[str], list[str]]
     return value, remaining
 
 
+# --------------------------------------------------------------------- ledger
+
+#: Path types `address ledger` accepts, in the order the desktop's connect
+#: dialog lists them, with the same default. A device enrolled from either
+#: edition therefore lands on the same addresses - which matters, because the
+#: path is what the wallet stores and what every later signature is checked
+#: against.
+LEDGER_PATH_TYPES = ("ledger_live", "bip44", "legacy_mew", "custom")
+DEFAULT_LEDGER_PATH_TYPE = "ledger_live"
+
+#: Ceiling on how many addresses one `list` may sweep. Each index is a separate
+#: USB round trip - the desktop hides that behind a worker thread and a Load
+#: More button, and a terminal has neither, so an unbounded --count would look
+#: like a hang for as long as it took.
+LEDGER_MAX_PAGE = 50
+
+#: What to check when the device will not answer. The last item only bites the
+#: terminal edition: an engine started by systemd runs as its own user, and USB
+#: access to the device is a permission that user may not have been granted.
+_LEDGER_CHECKLIST = (
+    "  - Plug the Ledger into this machine and unlock it with your PIN\n"
+    "  - Open the Ethereum app on the device\n"
+    "  - Close Ledger Live, or anything else holding the device\n"
+    "  - If Vault runs as a system service, that service's user needs USB\n"
+    "    access to the device (on Linux, a udev rule)"
+)
+
+
+def _parse_ledger_path_type(name: Optional[str], custom_path: Optional[str]):
+    """Resolve --path-type/--path into a LedgerPathType. Returns (type, error)."""
+    from ..wallet.ledger import LedgerPathType
+
+    chosen = (name or DEFAULT_LEDGER_PATH_TYPE).strip().lower().replace("-", "_")
+    if chosen not in LEDGER_PATH_TYPES:
+        return None, (
+            f"Unknown path type: {name}\n"
+            f"Choose one of: {', '.join(LEDGER_PATH_TYPES)}"
+        )
+
+    path_type = LedgerPathType(chosen)
+    if path_type == LedgerPathType.CUSTOM and not custom_path:
+        return None, (
+            "--path-type custom also needs the template to use:\n"
+            "  address ledger list --path-type custom --path \"m/44'/60'/0'/0/{index}\""
+        )
+    return path_type, None
+
+
+def _parse_count(value: Optional[str], flag: str, default: int,
+                 minimum: int = 0, maximum: Optional[int] = None):
+    """Parse a numeric flag. Returns (number, error)."""
+    if value is None:
+        return default, None
+    try:
+        number = int(value)
+    except ValueError:
+        return None, f"Invalid {flag} '{value}': expected a number"
+    if number < minimum:
+        return None, f"Invalid {flag} {number}: must be {minimum} or more"
+    if maximum is not None and number > maximum:
+        return None, f"Invalid {flag} {number}: {maximum} is the most one call may read"
+    return number, None
+
+
 class WalletCommands:
     """Wallet-related commands."""
 
@@ -96,17 +160,9 @@ Subcommands:
                 data={"unlocked": True, "address_count": len(addresses)}
             )
         else:
-            try:
-                # Use the tracked wallet path — set on load, cleared on detach, kept on lock.
-                # Correctly distinguishes "locked" from "no wallet loaded".
-                has_wallets = self.core.get_wallet_path() is not None
-            except Exception:
-                # CoreClient blocks get_wallet_path; fall back to directory scan.
-                try:
-                    wallet_dir = self.core.get_wallet_dir()
-                    has_wallets = any(wallet_dir.glob("*.wallet"))
-                except Exception:
-                    has_wallets = True
+            # The tracked wallet path - set on load, cleared on detach, kept on
+            # lock - is what distinguishes "locked" from "no wallet loaded".
+            has_wallets = self.core.get_wallet_path() is not None
             msg = "Wallet locked." if has_wallets else "No wallet loaded."
             return CommandResult.ok(msg, data={"unlocked": False, "has_wallet": has_wallets})
 
@@ -595,6 +651,8 @@ class AddressCommands:
             private_key = args[1]
             name = " ".join(args[2:]) if len(args) > 2 else None
             return self._import(private_key, name)
+        elif subcmd == "ledger":
+            return self._ledger(args[1:])
         elif subcmd == "delete":
             if "--help" in args or "-h" in args:
                 return self._delete_help()
@@ -640,6 +698,7 @@ Subcommands:
   list                              - List all addresses
   create [seed] [index] [name]      - Derive new address
   import <key> [name]               - Import private key
+  ledger <list|add|verify>          - Addresses held on a Ledger device
   delete <address>                  - Delete address
   rename <address> <name>           - Rename address
   export <address>                  - Export private key
@@ -799,6 +858,327 @@ Example:
         else:
             return CommandResult.fail(result.get("error", "Unknown error"))
 
+    # -------------------------------------------------------------- ledger
+    #
+    # The desktop enrols a Ledger through two dialogs: connect and choose a path
+    # type, then the same paged, tick-box browser the software seeds use. None of
+    # that shape survives a terminal - a picker is inherently several round trips
+    # and a CommandResult is one - so the terminal splits it the way it already
+    # splits seed derivation: `list` to look, `add` to commit an index.
+    # Scriptable, and it works unchanged over the control channel.
+    #
+    # Nothing below talks to the device itself. Discovery, path templates,
+    # derivation and error mapping all live in `wallet/ledger.py`, are Qt-free,
+    # and are the same code the desktop calls.
+
+    def _ledger(self, args: list[str]) -> CommandResult:
+        """Route `address ledger` subcommands."""
+        if not args or args[0] in ("--help", "-h"):
+            return self._ledger_help()
+
+        subcmd = args[0].lower()
+        rest = args[1:]
+
+        if "--help" in rest or "-h" in rest:
+            return self._ledger_help()
+
+        if subcmd == "list":
+            return self._ledger_list(rest)
+        elif subcmd == "add":
+            return self._ledger_add(rest)
+        elif subcmd == "verify":
+            if not rest:
+                return CommandResult.fail("Usage: address ledger verify <address>")
+            return self._ledger_verify(rest[0])
+        else:
+            return CommandResult.fail(
+                f"Unknown subcommand: {subcmd}\n"
+                "Usage: address ledger <list|add|verify>"
+            )
+
+    def _ledger_help(self) -> CommandResult:
+        """Help for address ledger."""
+        from ..wallet.ledger import LedgerPathType, get_path_type_description
+
+        rows = []
+        for name in LEDGER_PATH_TYPES:
+            marker = "  (default)" if name == DEFAULT_LEDGER_PATH_TYPE else ""
+            rows.append(f"  {name:<12} "
+                        f"{get_path_type_description(LedgerPathType(name))}{marker}")
+        path_types = "\n".join(rows)
+
+        return CommandResult.ok(f"""address ledger - Addresses held on a Ledger device
+
+The private keys never leave the device. Vault stores the address and its
+derivation path, and every signature is produced on the Ledger itself.
+
+Usage:
+  address ledger list [--path-type <type>] [--start <n>] [--count <n>]
+  address ledger add <index[,index...]> [name] [--path-type <type>]
+  address ledger verify <address>
+
+Path types:
+{path_types}
+
+  For --path-type custom, supply the template with --path, writing {{index}}
+  where the number goes.
+
+Flags:
+  --path-type <type>   Derivation convention (default: {DEFAULT_LEDGER_PATH_TYPE})
+  --path <template>    Template, required when --path-type is custom
+  --start <n>          First index to read (list only, default 0)
+  --count <n>          How many to read (list only, default 5, max {LEDGER_MAX_PAGE})
+
+Examples:
+  address ledger list
+  address ledger list --path-type bip44 --start 0 --count 10
+  address ledger add 0 "Trading desk"
+  address ledger add 0,1,2
+  address ledger verify L001
+
+The device must be plugged into the machine running Vault, unlocked, with the
+Ethereum app open. Enrolment needs somebody physically present to press the
+device's buttons, so a machine meant to run unattended wants software-held keys.""")
+
+    def _ledger_connect(self):
+        """Open the connected Ledger. Returns (device, failure_result)."""
+        from ..wallet.ledger import FATAL_EXCEPTIONS, LedgerDevice, LedgerError
+
+        try:
+            device = LedgerDevice.discover()
+        except FATAL_EXCEPTIONS:
+            raise
+        except LedgerError as e:
+            return None, CommandResult.fail(f"{e}\n{_LEDGER_CHECKLIST}")
+        except BaseException as e:
+            # ledgerblue raises bare BaseException for low-level USB failures,
+            # which `except Exception` would walk straight past.
+            return None, CommandResult.fail(
+                f"Could not talk to the Ledger: {e}\n{_LEDGER_CHECKLIST}")
+
+        if device is None:
+            return None, CommandResult.fail(f"No Ledger found.\n{_LEDGER_CHECKLIST}")
+        return device, None
+
+    def _ledger_existing(self) -> dict:
+        """Addresses already in the wallet, keyed by lowercased 0x address.
+
+        Matched by address rather than by index, for the reason the desktop's
+        picker matches the same way: the same key can be reached under more than
+        one path convention, and it is still the same key.
+        """
+        return {a["address"].lower(): a for a in self.core.get_wallet_addresses()}
+
+    def _ledger_list(self, args: list[str]) -> CommandResult:
+        """Read a page of addresses off the device without enrolling any."""
+        if not self.core.is_wallet_unlocked():
+            return CommandResult.fail("Wallet must be unlocked.")
+
+        path_type_name, args = _extract_flag(args, "--path-type")
+        custom_path, args = _extract_flag(args, "--path")
+        start_value, args = _extract_flag(args, "--start")
+        count_value, args = _extract_flag(args, "--count")
+
+        path_type, error = _parse_ledger_path_type(path_type_name, custom_path)
+        if error:
+            return CommandResult.fail(error)
+
+        start, error = _parse_count(start_value, "--start", default=0)
+        if error:
+            return CommandResult.fail(error)
+        count, error = _parse_count(count_value, "--count", default=5,
+                                    minimum=1, maximum=LEDGER_MAX_PAGE)
+        if error:
+            return CommandResult.fail(error)
+
+        device, failure = self._ledger_connect()
+        if failure:
+            return failure
+
+        from ..wallet.ledger import (FATAL_EXCEPTIONS, LedgerError,
+                                     get_path_type_display_name)
+        try:
+            found = device.get_addresses(path_type, start_index=start, count=count,
+                                         custom_path=custom_path)
+        except FATAL_EXCEPTIONS:
+            raise
+        except LedgerError as e:
+            return CommandResult.fail(f"{e}\n{_LEDGER_CHECKLIST}")
+        except BaseException as e:
+            return CommandResult.fail(f"Could not read addresses: {e}")
+
+        if not found:
+            return CommandResult.fail("The device returned no addresses.")
+
+        existing = self._ledger_existing()
+        label = get_path_type_display_name(path_type.value)
+        lines = [f"Ledger addresses ({label}):", ""]
+        rows = []
+        for entry in found:
+            already = existing.get(entry.address.lower())
+            note = f"  in wallet as {already['id']}" if already else ""
+            lines.append(f"  #{entry.index:<4} {entry.address}  {entry.path}{note}")
+            rows.append({
+                "index": entry.index,
+                "address": entry.address,
+                "path": entry.path,
+                "path_type": entry.path_type,
+                "address_id": already["id"] if already else None,
+            })
+
+        # A sweep stops short of `count` when the link drops part-way through.
+        # Say so, rather than letting a short page read as "that is all there is".
+        if len(found) < count:
+            lines.append("")
+            lines.append(f"  Stopped after {len(found)} of {count} - the device "
+                         f"stopped answering.")
+
+        hint = "Add one with:  address ledger add <index>"
+        if path_type.value != DEFAULT_LEDGER_PATH_TYPE:
+            hint += f" --path-type {path_type.value}"
+        lines.extend(["", hint])
+
+        return CommandResult.ok("\n".join(lines), data={"addresses": rows})
+
+    def _ledger_add(self, args: list[str]) -> CommandResult:
+        """Enrol one or more device addresses into the wallet."""
+        if not self.core.is_wallet_unlocked():
+            return CommandResult.fail("Wallet must be unlocked.")
+
+        path_type_name, args = _extract_flag(args, "--path-type")
+        custom_path, args = _extract_flag(args, "--path")
+
+        if not args:
+            return CommandResult.fail(
+                "Usage: address ledger add <index[,index...]> [name]\n"
+                "Run `address ledger list` first to see what is on the device.")
+
+        indices = []
+        for piece in args[0].split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                value = int(piece)
+            except ValueError:
+                return CommandResult.fail(
+                    f"Invalid index '{piece}': expected a number\n"
+                    "Usage: address ledger add <index[,index...]> [name]")
+            if value < 0:
+                return CommandResult.fail(f"Invalid index {value}: must be 0 or more")
+            indices.append(value)
+
+        if not indices:
+            return CommandResult.fail("No index given. Usage: address ledger add <index>")
+        if len(indices) > LEDGER_MAX_PAGE:
+            return CommandResult.fail(
+                f"Too many indices at once: {LEDGER_MAX_PAGE} is the maximum")
+
+        name = " ".join(args[1:]) if len(args) > 1 else None
+        if name and len(indices) > 1:
+            # One name cannot describe several addresses, and quietly applying it
+            # to the first would be a surprise. The wallet's own default naming
+            # ("Ledger #1", "Ledger #2") covers the batch case.
+            return CommandResult.fail(
+                "A name can only be given when adding a single address.\n"
+                "Add them one at a time to name each, or omit the name.")
+
+        path_type, error = _parse_ledger_path_type(path_type_name, custom_path)
+        if error:
+            return CommandResult.fail(error)
+
+        device, failure = self._ledger_connect()
+        if failure:
+            return failure
+
+        from ..wallet.ledger import FATAL_EXCEPTIONS
+
+        existing = self._ledger_existing()
+        lines = []
+        added = []
+        for index in indices:
+            try:
+                entry = device.get_address(path_type, index, custom_path=custom_path)
+            except FATAL_EXCEPTIONS:
+                raise
+            except BaseException as e:
+                lines.append(f"  #{index}  could not be read: {e}")
+                continue
+
+            already = existing.get(entry.address.lower())
+            if already:
+                lines.append(f"  #{index}  {entry.address}  already in wallet "
+                             f"as {already['id']}")
+                continue
+
+            result = self.core.add_hardware_address(
+                entry.address, entry.path, entry.path_type, name)
+            if result.get("success"):
+                address_id = result.get("address_id") or ""
+                suffix = f" as {address_id}" if address_id else ""
+                lines.append(f"  #{index}  {entry.address}  added{suffix}")
+                added.append({
+                    "index": index,
+                    "address": entry.address,
+                    "path": entry.path,
+                    "path_type": entry.path_type,
+                    "id": address_id or None,
+                })
+                existing[entry.address.lower()] = {"id": address_id}
+            else:
+                lines.append(f"  #{index}  {entry.address}  not added: "
+                             f"{result.get('error', 'unknown error')}")
+
+        if not added:
+            return CommandResult.fail("No addresses were added.\n" + "\n".join(lines))
+
+        heading = f"Added {len(added)} Ledger address{'es' if len(added) != 1 else ''}:"
+        return CommandResult.ok("\n".join([heading] + lines), data={"added": added})
+
+    def _ledger_verify(self, identifier: str) -> CommandResult:
+        """Confirm the connected device still derives a stored address."""
+        if not self.core.is_wallet_unlocked():
+            return CommandResult.fail("Wallet must be unlocked.")
+
+        addr = self._find_address(identifier)
+        if not addr:
+            return CommandResult.fail(f"Address not found: {identifier}")
+        if not addr.get("is_hardware"):
+            return CommandResult.fail(
+                f"{addr['id']} is not a hardware address - there is no device to "
+                f"check it against.")
+
+        path = addr.get("device_path")
+        if not path:
+            return CommandResult.fail(
+                f"{addr['id']} has no derivation path recorded, so it cannot be "
+                f"checked against a device.")
+
+        device, failure = self._ledger_connect()
+        if failure:
+            return failure
+
+        from ..wallet.ledger import FATAL_EXCEPTIONS
+        try:
+            matches = device.verify_address(path, addr["address"])
+        except FATAL_EXCEPTIONS:
+            raise
+        except BaseException as e:
+            return CommandResult.fail(f"Could not check the address: {e}")
+
+        if matches:
+            return CommandResult.ok(
+                f"Verified: the connected Ledger derives {addr['address']}\n"
+                f"  at {path}",
+                data={"verified": True, "address": addr["address"], "path": path})
+
+        # The check ran and came back no, which is worth failing on: it means a
+        # different device, or the same one restored from a different phrase.
+        return CommandResult.fail(
+            f"Mismatch: the connected Ledger does not derive {addr['address']} at "
+            f"{path}.\nThis is a different device, or one restored from a "
+            f"different recovery phrase.")
+
     def _delete_help(self) -> CommandResult:
         """Help for address delete."""
         return CommandResult.ok("""address delete - Remove an address from the wallet
@@ -874,15 +1254,15 @@ Arguments:
   <address>   Address ID (e.g., A001) or full 0x address
 
 Options:
-  --wallet <name>     Wallet name to open (required in standalone mode)
-  --password <pw>     Wallet password (or use PRIMER_VAULT_PASSWORD env var)
+  --wallet <name>     Wallet to export from (defaults to the open one)
+  --password <pw>     Wallet password - required (or PRIMER_VAULT_PASSWORD)
   --yes               Skip confirmation prompt
 
 Examples:
   address export A001 --wallet mywallet --password "secret" --yes
   PRIMER_VAULT_PASSWORD="secret" address export A001 --wallet mywallet --yes
 
-Note: Private key export only works in standalone mode (no GUI/daemon running).
+Note: the password is required every time, even if the wallet is already open.
 
 WARNING: This will display your private key on screen.
 Never share your private key with anyone!""")
@@ -892,28 +1272,39 @@ Never share your private key with anyone!""")
         """Export private key for an address with confirmation."""
         import os
 
-        # If wallet not unlocked, try to open it with provided credentials
-        if not self.core.is_wallet_unlocked():
-            # Check for password from env var if not provided via flag
-            if password is None:
-                password = os.environ.get("PRIMER_VAULT_PASSWORD")
+        # Exporting a key needs the password every time, even when the wallet is
+        # already open. This is the one command that hands out a key in the
+        # clear, and "the wallet happens to be unlocked" is not proof that the
+        # person asking is the owner - an engine left running unattended is
+        # unlocked for weeks. Re-deriving the master key with Argon2id is what
+        # proves it, and it is the same check that protects the wallet file.
+        if password is None:
+            password = os.environ.get("PRIMER_VAULT_PASSWORD")
+        if password is None:
+            return CommandResult.fail(
+                "Exporting a private key needs the wallet password, even when "
+                "the wallet is already open.\n\n"
+                "  address export <addr> --wallet <name> --password <pw> --yes\n\n"
+                "Or set PRIMER_VAULT_PASSWORD."
+            )
 
-            if wallet_name and password is not None:
-                # Try to open the wallet
-                wallet_dir = self.core.get_wallet_dir()
-                wallet_path = wallet_dir / f"{wallet_name}.wallet"
-                if not wallet_path.exists():
-                    return CommandResult.fail(f"Wallet not found: {wallet_name}")
-                result = self.core.load_wallet(str(wallet_path), password)
-                if not result.get("success"):
-                    return CommandResult.fail(f"Failed to unlock wallet: {result.get('error', 'Unknown error')}")
-            else:
+        wallet_path = None
+        if wallet_name:
+            wallet_path = self.core.get_wallet_dir() / f"{wallet_name}.wallet"
+            if not wallet_path.exists():
+                return CommandResult.fail(f"Wallet not found: {wallet_name}")
+        else:
+            current = self.core.get_wallet_path()
+            if current is None:
                 return CommandResult.fail(
-                    "Wallet must be unlocked.\n\n"
-                    "In standalone mode, use:\n"
-                    "  address export <addr> --wallet <name> --password <pw> --yes\n\n"
-                    "Or set PRIMER_VAULT_PASSWORD environment variable."
-                )
+                    "No wallet is open, so there is nothing to export from. "
+                    "Name one with --wallet <name>.")
+            wallet_path = current
+
+        result = self.core.load_wallet(str(wallet_path), password)
+        if not result.get("success"):
+            return CommandResult.fail(
+                f"Failed to unlock wallet: {result.get('error', 'Unknown error')}")
 
         addr = self._find_address(identifier)
         if not addr:
@@ -926,17 +1317,6 @@ Never share your private key with anyone!""")
                 f"Cannot export private key for {label} address.\n"
                 "Hardware wallet keys never leave the device."
             )
-
-        # Fail before asking for confirmation if key export isn't supported in this mode
-        try:
-            from primer_vault.client.core_client import CoreClient
-            if isinstance(self.core, CoreClient):
-                return CommandResult.fail(
-                    "Private key export requires running without a GUI or daemon.\n"
-                    "Stop the running instance first, then run the command standalone."
-                )
-        except ImportError:
-            pass
 
         # Check if we have confirmation
         if force or (inputs and inputs.get("confirm") == "YES"):
@@ -957,10 +1337,18 @@ Never share your private key with anyone!""")
                 "private_key": private_key
             })
 
-        # Need confirmation
+        # Need confirmation. The credentials ride along in the pending context:
+        # this command runs twice - once to ask, once with the answer - and the
+        # second call has to arrive with the same password the first proved,
+        # or it refuses itself.
         self.handler._set_pending(
-            lambda inp, **ctx: self._export(ctx["identifier"], inp),
-            identifier=identifier
+            lambda inp, **ctx: self._export(
+                ctx["identifier"], inp,
+                wallet_name=ctx.get("wallet_name"),
+                password=ctx.get("password")),
+            identifier=identifier,
+            wallet_name=wallet_name,
+            password=password,
         )
         return CommandResult.need_input(
             "confirm",

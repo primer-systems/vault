@@ -248,6 +248,7 @@ class SigningService:
         # Returns USD an agent has promised to trades not yet recorded. Injected
         # by the core, because the trading service is what holds them.
         self._reserved_volume_provider: Optional[Callable] = None
+        self._defi_summary_provider: Optional[Callable] = None
         self._pending_requests: dict[str, SigningRequest] = {}
         # request_id -> monotonic deadline, kept beside _pending_requests so an
         # abandoned request cannot sit in memory until the process ends.
@@ -652,6 +653,16 @@ class SigningService:
         the endpoint turns that into a graceful "balances unavailable"."""
         self._balance_provider = provider
 
+    def set_defi_summary_provider(self, provider):
+        """Inject DefiService.mandate_summary so /mandate reports the Morpho
+        limits beside the other two lanes.
+
+        Injected rather than imported: signing.py must not depend on the DeFi
+        service, and an instance without one still answers /mandate for the
+        lanes it does have.
+        """
+        self._defi_summary_provider = provider
+
     def set_reserved_volume_provider(self, provider):
         """Set the callable that reports an agent's in-flight trading volume."""
         self._reserved_volume_provider = provider
@@ -822,7 +833,7 @@ class SigningService:
 
         return None
 
-    def _verify_mandate_auth(
+    def _verify_agent_read_auth(
         self,
         agent: Agent,
         agent_id: str,
@@ -830,9 +841,14 @@ class SigningService:
         data_key: Optional[bytes]
     ) -> Optional[str]:
         """
-        Verify agent authentication for /mandate endpoint.
+        Verify agent authentication for the read-only agent endpoints
+        (/mandate, /balances - see _authenticate_agent_read).
 
         Simpler than _verify_agent_auth - just signs over agent_id + timestamp.
+        One shared check for every such endpoint, so the signed message uses
+        a single generic action tag ("agent_read") rather than one named
+        after whichever endpoint happens to call it - a second read-only
+        endpoint reuses this unchanged, no branching on which one asked.
 
         Returns None on success, error message on failure.
         """
@@ -877,9 +893,11 @@ class SigningService:
                 return "Request timestamp is in the future"
             return "Request expired (timestamp too old)"
 
-        # For /mandate, sign over just agent_id + timestamp + action
+        # Shared by every read-only agent endpoint: sign over just
+        # agent_id + timestamp + a generic action tag, not one named after
+        # whichever endpoint is calling.
         message_data = {
-            "action": "get_mandate",
+            "action": "agent_read",
             "agent_id": agent_id,
             "timestamp": timestamp,
         }
@@ -982,7 +1000,7 @@ class SigningService:
         # locked wallet must not be revealed to a caller that hasn't authenticated
         # (the same lock-oracle /sign guards against). See handle_sign_request.
         if agent.auth_mode == "bearer":
-            auth_result = self._verify_mandate_auth(agent, agent_id, signature, None)
+            auth_result = self._verify_agent_read_auth(agent, agent_id, signature, None)
             if auth_result:
                 return None, None, {"status": "error", "error": auth_result, "code": "AUTH_FAILED"}
 
@@ -1006,7 +1024,7 @@ class SigningService:
         # For HMAC auth: verify signature (needs the wallet key to decrypt the
         # agent's shared secret). Bearer was already verified above.
         if agent.auth_mode != "bearer":
-            auth_result = self._verify_mandate_auth(agent, agent_id, signature, wallet.data_key)
+            auth_result = self._verify_agent_read_auth(agent, agent_id, signature, wallet.data_key)
             if auth_result:
                 return None, None, {"status": "error", "error": auth_result, "code": "AUTH_FAILED"}
 
@@ -1047,6 +1065,7 @@ class SigningService:
                 "allowed_domains": policy.allowed_domains if policy.allowed_domains else None,
                 "blocked_domains": policy.blocked_domains if policy.blocked_domains else None,
                 "trading": self._trading_summary(agent, policy),
+                "morpho": self._defi_summary(agent, policy),
             }
 
         # Calculate remaining budget. Reported whenever there is a policy at all:
@@ -1137,6 +1156,26 @@ class SigningService:
             if not getattr(b, "fetch_failed", False)
         ]
         return result
+
+    def _defi_summary(self, agent: "Agent", policy: "SpendPolicy") -> Optional[dict]:
+        """The Morpho limits an agent is held to, or None if the lane is off.
+
+        Delegated to the DeFi service because the interesting numbers - what is
+        deployed, what room is left - are chain reads, and this module has no
+        business making them.
+        """
+        rules = getattr(policy, "defi_rules", None)
+        if rules is None or not rules.enabled:
+            return None
+        if not self._defi_summary_provider:
+            return {"enabled": True,
+                    "note": "Morpho lending is not available on this instance"}
+        try:
+            return self._defi_summary_provider(agent)
+        except Exception:
+            logger.exception("defi summary provider failed")
+            return {"enabled": True,
+                    "note": "Morpho limits could not be read just now"}
 
     def _trading_summary(self, agent: "Agent", policy: "SpendPolicy") -> dict:
         """The trading limits an agent is held to, so it can stay inside them.
@@ -2066,7 +2105,9 @@ class SigningService:
                 if not self._on_hardware_sign_needed:
                     return {
                         "status": "error",
-                        "error": "Ledger signing not available (GUI required)",
+                        "error": ("Ledger signing is unavailable here. Nothing "
+                                  "is registered to prompt for a confirmation "
+                                  "on the device."),
                         "code": "LEDGER_SIGN_NOT_AVAILABLE"
                     }
 

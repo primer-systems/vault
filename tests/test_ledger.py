@@ -1090,7 +1090,7 @@ def _ledger_trading_service(monkeypatch, adapter):
 
     # execute_trade re-checks that the address belongs to the agent, so the
     # service needs a store to resolve it - the same check a real trade gets.
-    agent = SimpleNamespace(id="A1", wallet_address=LEDGER_ADDR)
+    agent = SimpleNamespace(id="A1", name="Bot", code="A1-code", wallet_address=LEDGER_ADDR)
     store = SimpleNamespace(
         get_agent_by_id=lambda aid: agent if aid == "A1" else None,
         add_transaction=lambda tx: None,

@@ -3,24 +3,26 @@ Trading service — orchestrates an agent trade request end to end.
 
 Mirrors SigningService (the x402 payment path): it resolves the agent, re-quotes
 the trade independently, values it in USDG notional, and then either auto-executes
-under the policy threshold or escalates to human approval. Qt-free, so GUI, CLI,
-and headless all share it.
+under the policy threshold or escalates to human approval. Qt-free, so both
+editions share it.
 """
 
 import logging
 import math
-import threading
 import time
 from dataclasses import dataclass, replace as dc_replace
 from typing import Callable, Optional, TYPE_CHECKING
 
+from web3.exceptions import Web3RPCError
+
 from ..models.agent import daily_allowance_is_due
 from ..models.trade import TradeRequest, TradeQuote, TradeResult
 from ..wallet.ledger import LedgerError
-from ..models.transaction import Transaction, STATUS_SETTLED, STATUS_FAILED, STATUS_REJECTED
+from ..models.transaction import Transaction, STATUS_REJECTED
 from ..networks import (NETWORKS, DEFAULT_NETWORK, get_dex, get_dex_v4, TOKENS,
                         is_native_eth, is_wrap_trade, is_unwrap_trade)
 from .dex import DexAdapter, DexAdapterV3, DexError, to_atomic, from_atomic
+from .pending import PendingQueue, Reservations
 from .server import server_stats
 from .dex_v4 import DexAdapterV4
 from . import pricing
@@ -39,7 +41,7 @@ PENDING_TRADE_TTL_SECONDS = 900  # 15 minutes
 #
 # A result is held so the caller that submitted a trade can come back and read
 # the outcome; once it has, the entry is dead weight. Each carries a full quote,
-# and a headless daemon runs for weeks, so the set needs a ceiling.
+# and an unattended engine runs for weeks, so the set needs a ceiling.
 #
 # Generous against real use - an agent polls within seconds of submitting - and
 # small enough that the set cannot grow into a problem. Past the cap the oldest
@@ -55,14 +57,13 @@ MAX_PENDING_TRADES_PER_AGENT = 20
 
 @dataclass
 class PendingTrade:
-    """A trade waiting for a human, with the deadline it waits until."""
+    """The trade a pending entry is holding.
+
+    The deadline it waits until lives on the `PendingEntry` that wraps this, so
+    that the waiting is the queue's business and the trade is this module's.
+    """
     request: "TradeRequest"
     quote: "TradeQuote"
-    deadline: float  # time.monotonic() value
-
-    @property
-    def expired(self) -> bool:
-        return time.monotonic() >= self.deadline
 
 
 class TradingService:
@@ -78,16 +79,40 @@ class TradingService:
         self._on_activity: Optional[Callable] = None
         self._on_trade_executed: Optional[Callable] = None
         self._on_hardware_sign_tx: Optional[Callable] = None  # Hardware wallet tx signing
-        self._pending: dict[str, PendingTrade] = {}
-        self._resolved: dict[str, dict] = {}
+        # Trades awaiting a human, and the outcomes of those already settled.
+        self._queue = PendingQueue(
+            ttl_seconds=PENDING_TRADE_TTL_SECONDS,
+            max_resolved=MAX_RESOLVED_TRADES,
+            max_per_owner=MAX_PENDING_TRADES_PER_AGENT,
+            on_expire=self._on_trade_expired)
         # Volume committed to trades that are in flight or awaiting approval but
-        # not yet recorded against the agent. Held under _volume_lock.
-        # request_id -> (agent_id, usd)
-        self._reservations: dict[str, tuple[str, float]] = {}
-        self._volume_lock = threading.Lock()
+        # not yet recorded against the agent.
+        self._volume = Reservations()
         # chain_id -> (rpc_url the adapter was built for, adapter)
         self._adapters_v3: dict[int, tuple[str, DexAdapterV3]] = {}
         self._adapters_v4: dict[int, tuple[str, DexAdapterV4]] = {}
+
+    # ---- the collaborators, under the names they had when they were fields
+    #
+    # The queue and the ledger moved to services/pending.py so the DeFi lane can
+    # use the same ones rather than a second copy. These read through to their
+    # live storage, so anything watching a trade's deadline or checking that a
+    # reservation was released still sees the real thing rather than a snapshot.
+
+    @property
+    def _pending(self) -> dict:
+        """request_id -> PendingEntry, whose `.payload` is the PendingTrade."""
+        return self._queue._pending
+
+    @property
+    def _resolved(self) -> dict:
+        """request_id -> the finished result dict."""
+        return self._queue._resolved
+
+    @property
+    def _reservations(self) -> dict:
+        """request_id -> (agent_id, usd) still promised but not yet recorded."""
+        return self._volume._entries
 
     # ---- wiring (mirrors SigningService) --------------------------------
 
@@ -227,8 +252,8 @@ class TradingService:
     # already promised.
 
     def _reset_volume_if_due(self, agent) -> None:
-        """Renew the agent's daily trading volume, under `_volume_lock` and only
-        after re-confirming the renewal is still due.
+        """Renew the agent's daily trading volume, under the ledger's lock and
+        only after re-confirming the renewal is still due.
 
         The check that decided to call this ran outside the lock and can be
         stale: two trades arriving as the day rolls over can both decide a reset
@@ -239,12 +264,11 @@ class TradingService:
         other reader and writer of the counter takes closes that window. The
         disk write is done after the lock is released.
         """
-        with self._volume_lock:
-            if not daily_allowance_is_due(
-                    agent.last_trading_reset_date, agent.last_trading_reset_at):
-                return
-            agent.reset_daily_trading_volume()
-        if self._policy_store:
+        renewed = self._volume.revalidate(
+            still_due=lambda: daily_allowance_is_due(
+                agent.last_trading_reset_date, agent.last_trading_reset_at),
+            renew=agent.reset_daily_trading_volume)
+        if renewed and self._policy_store:
             self._policy_store.update_agent(agent)
 
     def _check_and_reserve_volume(self, agent, request_id: str, usd: float,
@@ -271,16 +295,14 @@ class TradingService:
 
         Returns None if the volume was reserved, or a refusal reason if not.
         """
-        with self._volume_lock:
-            reserved = sum(u for rid, (aid, u) in self._reservations.items()
-                           if aid == agent.id and rid != exclude_request_id)
-            committed = agent.trading_volume_today_usd + reserved
-            if committed + usd > limit_usd:
-                remaining = max(0.0, limit_usd - committed)
-                return (f"Trade ${usd:.2f} exceeds daily limit "
-                        f"(${remaining:.2f} remaining of ${limit_usd:.2f})")
-            self._reservations[request_id] = (agent.id, usd)
+        shortfall = self._volume.check_and_reserve(
+            key=request_id, owner_id=agent.id, amount=usd, limit=limit_usd,
+            committed=agent.trading_volume_today_usd,
+            exclude_key=exclude_request_id)
+        if shortfall is None:
             return None
+        return (f"Trade ${shortfall.amount:.2f} exceeds daily limit "
+                f"(${shortfall.remaining:.2f} remaining of ${shortfall.limit:.2f})")
 
     def reserved_volume_for(self, agent_id: str) -> float:
         """USD this agent has promised to trades in flight or awaiting approval.
@@ -289,19 +311,15 @@ class TradingService:
         spend. Without it the figure counts only settled volume, so an agent with
         trades queued is told it has room the next request will refuse.
         """
-        with self._volume_lock:
-            return sum(u for aid, u in self._reservations.values() if aid == agent_id)
+        return self._volume.reserved_for(agent_id)
 
     def _release_volume(self, request_id: str) -> None:
         """Give back a reservation for a trade that did not happen."""
-        with self._volume_lock:
-            self._reservations.pop(request_id, None)
+        self._volume.release(request_id)
 
     def _commit_volume(self, request_id: str, agent, usd: float) -> None:
         """Turn a reservation into recorded volume, atomically."""
-        with self._volume_lock:
-            self._reservations.pop(request_id, None)
-            agent.add_trading_volume(usd)
+        self._volume.commit(request_id, lambda: agent.add_trading_volume(usd))
         if self._policy_store:
             self._policy_store.update_agent(agent)
 
@@ -334,12 +352,30 @@ class TradingService:
         ones - no timestamp needed to know what to evict.
         """
         self._count_outcome(result)
-        self._resolved[request_id] = result
-        while len(self._resolved) > MAX_RESOLVED_TRADES:
-            self._resolved.pop(next(iter(self._resolved)))
-        return result
+        return self._queue.remember(request_id, result)
 
     # ---- pending expiry --------------------------------------------------
+
+    def _on_trade_expired(self, entry) -> None:
+        """Auto-reject one trade that waited too long. Called by the queue.
+
+        The queue has already taken it out of the pending set by the time this
+        runs, so everything here is about settling what the trade left behind:
+        the allowance it was holding, the record of it, and telling somebody.
+        """
+        request_id = entry.key
+        trade = entry.payload
+        self._release_volume(request_id)
+        reason = (f"Expired: not approved within "
+                  f"{PENDING_TRADE_TTL_SECONDS // 60} minutes")
+        tx = self._create_trade_transaction(trade.request, trade.quote)
+        if tx and self._policy_store:
+            tx.status = STATUS_REJECTED
+            tx.reject_reason = reason
+            self._policy_store.update_transaction(tx)
+        self._remember_result(request_id, TradeResult.rejected(
+            request_id, reason, trade.quote).to_dict())
+        self._activity(f"Trade {request_id} expired without approval", is_error=True)
 
     def _expire_pending(self) -> None:
         """Auto-reject anything that has waited past its deadline.
@@ -347,21 +383,7 @@ class TradingService:
         Called before every read or decision on the pending set, so an expired
         trade cannot be approved by a caller that happened to arrive first.
         """
-        for request_id, entry in list(self._pending.items()):
-            if not entry.expired:
-                continue
-            self._pending.pop(request_id, None)
-            self._release_volume(request_id)
-            reason = (f"Expired: not approved within "
-                      f"{PENDING_TRADE_TTL_SECONDS // 60} minutes")
-            tx = self._create_trade_transaction(entry.request, entry.quote)
-            if tx and self._policy_store:
-                tx.status = STATUS_REJECTED
-                tx.reject_reason = reason
-                self._policy_store.update_transaction(tx)
-            self._remember_result(request_id, TradeResult.rejected(
-                request_id, reason, entry.quote).to_dict())
-            self._activity(f"Trade {request_id} expired without approval", is_error=True)
+        self._queue.sweep()
 
     # ---- price impact ----------------------------------------------------
 
@@ -667,7 +689,7 @@ class TradingService:
             # Record transaction before execution (auto_approved=True)
             tx = self._create_trade_transaction(request, quote, auto_approved=True)
 
-            result = self.execute_trade(request, quote)
+            result = self.execute_trade(request, quote, auto_approved=True)
 
             try:
                 self._record_outcome(request, quote, tx, result)
@@ -678,9 +700,7 @@ class TradingService:
             return result
 
         # Default: escalate to human approval.
-        waiting = sum(1 for e in self._pending.values()
-                      if e.request.agent_id == agent.id)
-        if waiting >= MAX_PENDING_TRADES_PER_AGENT:
+        if self._queue.is_full_for(agent.id):
             self._release_volume(request.id)
             reason = (f"{MAX_PENDING_TRADES_PER_AGENT} trades from this agent are "
                       f"already waiting for approval")
@@ -689,9 +709,7 @@ class TradingService:
             # later and _remember_result never sees it.
             return self._count_refusal(TradeResult.rejected(request.id, reason, quote).to_dict())
 
-        self._pending[request.id] = PendingTrade(
-            request=request, quote=quote,
-            deadline=time.monotonic() + PENDING_TRADE_TTL_SECONDS)
+        self._queue.add(request.id, agent.id, PendingTrade(request=request, quote=quote))
 
         # Build activity messages: brief (symbols) for header, detailed (addresses) for logs
         sym_in = quote.symbol_in or quote.token_in[:10]
@@ -713,20 +731,27 @@ class TradingService:
     def _signer_unavailable(self, request: TradeRequest) -> Optional[dict]:
         """Refuse now if nothing could sign this trade, whatever the policy says.
 
-        A hardware address needs the desktop app to drive the device. Without it
-        the trade would quote, pass policy, take a request id, and only fail once
-        a human had approved it - asking someone to authorise something that was
-        never going to work.
+        A locked wallet and a hardware address with no driving app are the
+        same shape of problem: without this check the trade would quote, pass
+        policy, take a request id, and only fail once a human had approved it
+        - asking someone to authorise something that was never going to work,
+        and leaving the caller to discover why only after that pointless
+        round trip. Caught here instead, the caller finds out immediately and
+        can retry once the wallet is unlocked.
 
-        This does not reach for the device itself. Whether it is plugged in and
-        unlocked is a question for the moment of signing, and one that cannot be
-        settled in advance.
+        The hardware branch below still does not reach for the device itself.
+        Whether it is plugged in and unlocked is a question for the moment of
+        signing, and one that cannot be settled in advance - only the wallet
+        (software or hardware) being loaded at all can be.
         """
         if not self._wallet_provider or not request.wallet_address:
             return None
         wallet = self._wallet_provider(request.wallet_address)
         if not wallet:
-            return None  # locked or unknown; the usual paths report that
+            return {
+                "status": "error", "code": "WALLET_LOCKED",
+                "error": "Wallet is locked. Unlock it to execute trades.",
+            }
         entry = wallet.get_address_by_address(request.wallet_address)
         if entry is None or not entry.is_hardware:
             return None
@@ -734,9 +759,9 @@ class TradingService:
             return None
         return {
             "status": "error", "code": "LEDGER_SIGN_NOT_AVAILABLE",
-            "error": (f"This agent signs from a {entry.device_label} address, which "
-                      "needs the Vault window open to confirm on the device. "
-                      "Headless and CLI modes cannot prompt for one."),
+            "error": (f"This agent signs from a {entry.device_label} address, so "
+                      "somebody has to confirm on the device before it can sign. "
+                      "Nothing here is able to ask for that confirmation."),
         }
 
     def _authenticate(self, agent, agent_id: str, signature: Optional[str],
@@ -777,20 +802,20 @@ class TradingService:
     def get_trade_status(self, request_id: str) -> dict:
         """Status of a trade awaiting approval (polled by the agent)."""
         self._expire_pending()
-        if request_id in self._pending:
-            entry = self._pending[request_id]
+        entry = self._queue.get(request_id)
+        if entry is not None:
             return {"status": "pending", "request_id": request_id,
-                    "quote": entry.quote.to_dict(),
-                    "expires_in_seconds": max(0, int(entry.deadline - time.monotonic()))}
-        if request_id in self._resolved:
-            return self._resolved[request_id]
+                    "quote": entry.payload.quote.to_dict(),
+                    "expires_in_seconds": self._queue.seconds_remaining(request_id)}
+        if self._queue.has_resolved(request_id):
+            return self._queue.resolved(request_id)
         return {"status": "error", "code": "REQUEST_NOT_FOUND",
                 "error": f"No trade request {request_id}"}
 
     def get_pending_trades(self) -> list:
         """Pending (request, quote) pairs, for the approval UI."""
         self._expire_pending()
-        return [(e.request, e.quote) for e in self._pending.values()]
+        return [(e.payload.request, e.payload.quote) for e in self._queue.entries()]
 
     def approve_trade(self, request_id: str) -> dict:
         """Approve a pending trade, re-check it, and execute it.
@@ -811,13 +836,23 @@ class TradingService:
         """
         self._expire_pending()
 
-        entry = self._pending.pop(request_id, None)
+        entry = self._queue.pop(request_id)
         if entry is None:
-            if request_id in self._resolved:
-                return self._resolved[request_id]
+            if self._queue.has_resolved(request_id):
+                return self._queue.resolved(request_id)
             return {"status": "error", "code": "REQUEST_NOT_FOUND",
                     "error": f"No pending trade {request_id}"}
-        request, original = entry.request, entry.quote
+        request, original = entry.payload.request, entry.payload.quote
+
+        # Popped from pending, but nothing final exists yet: re-quoting and
+        # execution below can take real time. Without this, a status poll
+        # landing in that window gets REQUEST_NOT_FOUND - indistinguishable
+        # from an id that never existed - even though a human just approved
+        # it. Every exit below overwrites this the same way it always
+        # overwrote a resolved entry.
+        self._queue.remember(request_id, {
+            "status": "executing", "request_id": request_id,
+            "quote": original.to_dict()})
 
         def refuse(reason, code="TRADE_NO_LONGER_VALID"):
             self._release_volume(request_id)
@@ -893,13 +928,13 @@ class TradingService:
         """Reject a pending trade (called by the app/user)."""
         self._expire_pending()
 
-        entry = self._pending.pop(request_id, None)
+        entry = self._queue.pop(request_id)
         if entry is None:
-            if request_id in self._resolved:
-                return self._resolved[request_id]
+            if self._queue.has_resolved(request_id):
+                return self._queue.resolved(request_id)
             return {"status": "error", "code": "REQUEST_NOT_FOUND",
                     "error": f"No pending trade {request_id}"}
-        request, quote = entry.request, entry.quote
+        request, quote = entry.payload.request, entry.payload.quote
 
         self._release_volume(request_id)
 
@@ -927,8 +962,7 @@ class TradingService:
 
         if tx is not None and self._policy_store:
             if executed:
-                tx.status = STATUS_SETTLED
-                tx.tx_hash = result.get("tx_hash")
+                tx.mark_settled(result.get("tx_hash"))
                 # Both sides, and neither standing in for the other: the fill
                 # stays None if the receipt could not be read.
                 decimals = quote.token_out_decimals
@@ -939,12 +973,16 @@ class TradingService:
                 if quoted is not None:
                     tx.amount_out_quoted = str(from_atomic(quoted, decimals))
             else:
-                tx.status = STATUS_FAILED
-                tx.reject_reason = result.get("reason", "Trade failed")
+                # A guard clause caught before execution (e.g. WALLET_LOCKED)
+                # uses "error", not "reason" - both are read so that shape of
+                # failure is not silently recorded as the generic fallback text.
+                tx.mark_failed(result.get("reason") or result.get("error", "Trade failed"))
                 # The hash belongs to the broadcast, not the outcome: a swap
                 # that reverted or timed out still has one, and it is the only
                 # thing that lets the user check the chain rather than retry
-                # blind. None when nothing reached the network.
+                # blind. None when nothing reached the network. This row is
+                # the swap's alone now - an approval's hash can no longer land
+                # here, it settles its own row the moment it confirms.
                 tx.tx_hash = result.get("tx_hash")
             self._policy_store.update_transaction(tx)
 
@@ -1000,6 +1038,41 @@ class TradingService:
             auto_approved=auto_approved,
         )
 
+        self._policy_store.add_transaction(tx)
+        return tx
+
+    def _create_approve_transaction(self, request: TradeRequest, asset: str,
+                                     symbol: str, spender: str, amount_atomic: int,
+                                     auto_approved: bool = False) -> Optional[Transaction]:
+        """Create and persist a Transaction record for one approval leg,
+        before it is attempted - same discipline as _create_trade_transaction,
+        so a crash mid-flight still leaves a trace of what was sent.
+
+        Its own row, not folded into the trade: an approval is a real
+        transaction with its own hash, and can settle even when the swap it
+        was for then fails.
+        """
+        if not self._policy_store:
+            return None
+
+        agent = self._policy_store.get_agent_by_id(request.agent_id)
+        if not agent:
+            logger.warning(f"Agent not found for trade {request.id}: {request.agent_id}")
+            return None
+
+        wallet_address = request.wallet_address
+        wallet_id = None
+        if wallet_address and self._wallet_provider:
+            wallet = self._wallet_provider(wallet_address)
+            entry = wallet.get_address_by_address(wallet_address) if wallet else None
+            wallet_id = entry.id if entry else None
+
+        tx = Transaction.create_approve(
+            agent_id=agent.id, agent_name=agent.name, agent_code=agent.code,
+            network=f"eip155:{request.chain_id}", asset=asset, symbol=symbol,
+            spender=spender, amount=str(amount_atomic),
+            wallet_address=wallet_address, wallet_id=wallet_id,
+            auto_approved=auto_approved)
         self._policy_store.add_transaction(tx)
         return tx
 
@@ -1193,7 +1266,8 @@ class TradingService:
 
     # ---- execution (needs a funded, unlocked wallet) --------------------
 
-    def execute_trade(self, request: TradeRequest, quote: TradeQuote) -> dict:
+    def execute_trade(self, request: TradeRequest, quote: TradeQuote,
+                       auto_approved: bool = False) -> dict:
         """Approve (if needed), simulate, then sign and submit the swap. Requires
         the wallet unlocked. Returns an executed/failed TradeResult dict.
 
@@ -1244,8 +1318,9 @@ class TradingService:
         if addr_entry.is_hardware:
             if not self._on_hardware_sign_tx:
                 return {"status": "error", "code": "LEDGER_SIGN_NOT_AVAILABLE",
-                        "error": "Ledger signing is unavailable. The Vault window must be "
-                                 "open to confirm transactions on the device."}
+                        "error": "Ledger signing is unavailable here. Nothing is "
+                                 "registered to prompt for a confirmation on the "
+                                 "device."}
 
             def submit(tx: dict, description: str, before_send=None) -> str:
                 raw = self._on_hardware_sign_tx(
@@ -1296,8 +1371,15 @@ class TradingService:
         # Hash of the last transaction handed to the node - approval or swap -
         # so a failure can report it and say the trade may be live. Distinct
         # from `broadcast` below, which gates the volume commit and is set only
-        # for value-bearing transactions.
+        # for value-bearing transactions. This is exception-messaging only now
+        # - it no longer doubles as what gets persisted to history, since each
+        # leg writes its own Transaction row the moment its own outcome is
+        # known (see the approval loop below).
         sent_hash = None
+        # The settled approval's hash, if this attempt sent one - reported on
+        # the TradeResult independently of whether the swap then succeeded, so
+        # an agent polling /trade/status can see it even on a failure.
+        approve_hash = None
 
         def on_broadcast() -> None:
             """A value-bearing transaction for this trade is about to be sent."""
@@ -1371,15 +1453,27 @@ class TradingService:
                 token_label=f"{request.amount_in} {quote.symbol_in}")
             total_steps = len(steps) + 1  # the approvals, then the swap
             for step_num, (approve_tx, what) in enumerate(steps, start=1):
+                approve_row = self._create_approve_transaction(
+                    request, asset=request.token_in, symbol=quote.symbol_in or "",
+                    spender=approve_tx["to"], amount_atomic=quote.amount_in_atomic,
+                    auto_approved=auto_approved)
                 ah = submit(approve_tx, f"Step {step_num} of {total_steps}: {what}")
                 sent_hash = ah
                 self._activity(f"Trade {request.id}: approval submitted ({ah})")
                 arc = adapter.wait_for_receipt(ah)
                 if arc.status != 1:
+                    if approve_row and self._policy_store:
+                        approve_row.mark_failed(f"reverted: {what} (tx {ah})")
+                        approve_row.tx_hash = ah
+                        self._policy_store.update_transaction(approve_row)
                     return TradeResult(
                         request_id=request.id, status="failed",
                         reason=f"approval reverted: {what} (tx {ah})",
                         tx_hash=ah, quote=quote).to_dict()
+                if approve_row and self._policy_store:
+                    approve_row.mark_settled(ah)
+                    self._policy_store.update_transaction(approve_row)
+                approve_hash = ah
 
             # 2. Simulate now that allowance exists — rejects a bad fill before we
             #    spend gas on the swap (min-out enforces slippage on-chain too).
@@ -1411,7 +1505,8 @@ class TradingService:
             src = adapter.wait_for_receipt(sh)
             if src.status != 1:
                 return TradeResult(request_id=request.id, status="failed",
-                                   reason=f"swap reverted (tx {sh})", tx_hash=sh, quote=quote).to_dict()
+                                   reason=f"swap reverted (tx {sh})", tx_hash=sh,
+                                   quote=quote, approval_tx_hash=approve_hash).to_dict()
 
             self._activity(f"Trade {request.id} executed: {sh}")
             # The fill, not the quote. None if the receipt could not be read,
@@ -1425,13 +1520,14 @@ class TradingService:
             return TradeResult(request_id=request.id, status="executed",
                                tx_hash=sh, amount_out=filled,
                                amount_out_quoted=quote.amount_out_expected,
-                               quote=quote).to_dict()
+                               quote=quote, approval_tx_hash=approve_hash).to_dict()
         except LedgerError as e:
             # Device rejection/disconnect/locked. These messages are already
             # written for the user, so pass them through unchanged.
             self._activity(f"Trade {request.id} failed: {e}", True)
             return TradeResult(request_id=request.id, status="failed",
-                               reason=str(e), quote=quote).to_dict()
+                               reason=str(e), quote=quote,
+                               approval_tx_hash=approve_hash).to_dict()
         except DexError as e:
             # Whether anything is live on-chain decides what the reader should do
             # next, and this handler catches both sides of that line - a quote
@@ -1451,7 +1547,22 @@ class TradingService:
                           "again.")
             return TradeResult(request_id=request.id, status="failed",
                                reason=reason, tx_hash=sent_hash,
-                               quote=quote).to_dict()
+                               quote=quote, approval_tx_hash=approve_hash).to_dict()
+        except Web3RPCError as e:
+            # The node evaluated this attempt and rejected it outright - not a
+            # timeout or a dropped connection, where whether anything reached
+            # the network is genuinely unknown. An RPC error response means it
+            # did reach the network, and the network said no before ever
+            # broadcasting it (insufficient funds for gas, a stale nonce,
+            # underpriced gas). Unlike DexError above, this one can say for
+            # certain that this attempt sent nothing.
+            self._activity(f"Trade {request.id} failed: {e}", True)
+            return TradeResult(
+                request_id=request.id, status="failed",
+                reason=f"Rejected before broadcast: {e}. Nothing was sent by "
+                       "this attempt - fix the cause and try again.",
+                code="RPC_REJECTED", quote=quote,
+                approval_tx_hash=approve_hash).to_dict()
         except Exception:
             # An unexpected fault on this side. The detail goes to the log: a
             # library's exception text is not something a caller can act on, and
@@ -1468,4 +1579,5 @@ class TradingService:
                           "the Vault log for the cause.")
             return TradeResult(
                 request_id=request.id, status="failed", code="EXECUTION_ERROR",
-                reason=reason, tx_hash=sent_hash, quote=quote).to_dict()
+                reason=reason, tx_hash=sent_hash, quote=quote,
+                approval_tx_hash=approve_hash).to_dict()

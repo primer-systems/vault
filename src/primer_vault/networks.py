@@ -15,7 +15,7 @@ import urllib.error
 
 from web3 import Web3
 
-from .version import USER_AGENT
+from .version import BLOCKSCOUT_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,69 @@ def get_dex_v4(chain_id: int) -> Optional[DexConfigV4]:
     return DEX_V4.get(chain_id)
 
 
+# ============================================================
+# DeFi (Morpho) Configuration
+# ============================================================
+
+
+@dataclass
+class MorphoConfig:
+    """Morpho deployment for a chain (Qt-free; shared by services + UI).
+
+    Morpho is one singleton for every lending market on the chain, which is the
+    opposite shape to Uniswap: there is no factory to ask and no per-venue
+    address to configure. A market is identified by the hash of its parameters,
+    and anyone may create one - 124 exist on RHC, of which four have depth and a
+    curator behind them.
+
+    So the address list here is deliberately short, and the interesting question
+    - *which* venues may be used - is not answered by configuration at all. It is
+    read from the chain against `default_curators`; see `services/morpho.py`.
+
+    Addresses from https://docs.morpho.org/getting-started/resources/addresses/
+    and verified on-chain: the singleton reports this IRM as enabled, and the
+    vaults below report `curator()` matching.
+    """
+    morpho: str                     # the Blue singleton — every market lives here
+    adaptive_curve_irm: str         # the IRM 121 of 124 RHC markets use
+    vault_factory: str = ""         # every Vault V2 on the chain came from here
+    default_curators: tuple[str, ...] = ()   # who Vault trusts, out of the box
+    #: A warm start, not an allowlist. Discovery enumerates the factory to find
+    #: every vault a trusted curator runs, which takes a minute against a public
+    #: node - too long to sit in front of the first request. These are the ones
+    #: that were true when the release was cut, used immediately while discovery
+    #: runs behind. Being stale is harmless: every entry is re-checked against
+    #: `curator()` before it is offered, so a vault that changed hands drops out
+    #: and one that is missing gets added.
+    seed_vaults: tuple[str, ...] = ()
+
+
+MORPHO = {
+    4663: MorphoConfig(
+        morpho="0x9D53d5E3bd5E8d4Cbfa6DB1ca238AEA02E651010",
+        adaptive_curve_irm="0x2BD3d5965B26B51814AC95127B2b80dD6CcC0fa1",
+        vault_factory="0x0FBad98595b0186dA120E41f77C102beb49f803c",
+        # Steakhouse. Curator of seven vaults on this chain as of 2026-08-28,
+        # and of every market those vaults lend into.
+        default_curators=("0x9023fbd6a08c666491a2d1648737e400cf42d2fb",),
+        seed_vaults=(
+            "0xBeEff033F34C046626B8D0A041844C5d1A5409dd",  # Steakhouse USDG
+            "0xbEeFF0fb1Dc19344A87b8479dAb60A2e16160737",  # Ethena x Steakhouse USDG
+            "0xbeEfFF136E3684273e6aA75A1669B784B373A4FD",  # Steakhouse Turbo USDG
+            "0xBEEff039907422219Fb367e525954DDC092854d9",  # Grove x Steakhouse USDG
+            "0x2007B597b730546eb885aD7b589bEE2f5dc07052",  # Ethena USDG Turbo
+            "0xB97a135C344862bbacbB585A3B0Db051698CF905",  # Ethena USDG Turbo
+            "0xE9c34c8Fe2d8452807eA13148b3F52b91354eA04",
+        ),
+    ),
+}
+
+
+def get_morpho(chain_id: int) -> Optional[MorphoConfig]:
+    """Return the Morpho deployment for a chain, or None if unsupported."""
+    return MORPHO.get(chain_id)
+
+
 # ============================================
 # Balance Data
 # ============================================
@@ -265,17 +328,24 @@ class Balance:
 class BlockscoutClient:
     """Client for Blockscout V2 API - auto-discovers all tokens held by an address."""
 
-    def __init__(self, network: NetworkConfig, timeout: int = 10):
+    def __init__(self, network: NetworkConfig, timeout: int = 10,
+                 w3: Optional[Web3] = None):
         self.network = network
         self.api_base = network.blockscout_api
         self.timeout = timeout
+        #: Native-balance fallback for when Blockscout itself is unreachable -
+        #: an outage, or its User-Agent rule rejecting this request outright
+        #: (see BLOCKSCOUT_USER_AGENT). Every node answers eth_getBalance
+        #: directly, so this is not an extra external dependency - unlike
+        #: token discovery below, which has no RPC equivalent.
+        self.w3 = w3
 
     def _request(self, endpoint: str) -> dict:
         """Make an API request to Blockscout."""
         url = f"{self.api_base}{endpoint}"
         req = urllib.request.Request(
             url,
-            headers={"User-Agent": USER_AGENT, "Accept": "application/json"}
+            headers={"User-Agent": BLOCKSCOUT_USER_AGENT, "Accept": "application/json"}
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
@@ -342,6 +412,9 @@ class BlockscoutClient:
                     is_native=True,
                 )
             logger.warning(f"Failed to fetch native balance: HTTP {e.code}")
+            fallback = self._native_balance_via_rpc(address)
+            if fallback is not None:
+                return fallback
             return Balance(
                 symbol=self.network.native_symbol,
                 name=self.network.native_symbol,
@@ -355,6 +428,9 @@ class BlockscoutClient:
             )
         except Exception as e:
             logger.warning(f"Failed to fetch native balance: {e}")
+            fallback = self._native_balance_via_rpc(address)
+            if fallback is not None:
+                return fallback
             return Balance(
                 symbol=self.network.native_symbol,
                 name=self.network.native_symbol,
@@ -366,6 +442,33 @@ class BlockscoutClient:
                 fetch_failed=True,
                 is_native=True,
             )
+
+    def _native_balance_via_rpc(self, address: str) -> Optional["Balance"]:
+        """Read native balance straight from the chain when Blockscout can't
+        answer at all - a WAF challenge or an outage in front of its API,
+        not an "address not indexed" 404/500. No USD value: the price lookup
+        is unrelated to why Blockscout failed and stays best-effort only in
+        the primary path, not duplicated here.
+        """
+        if self.w3 is None:
+            return None
+        try:
+            raw = self.w3.eth.get_balance(Web3.to_checksum_address(address))
+        except Exception as e:
+            logger.debug(f"RPC balance fallback also failed: {e}")
+            return None
+        formatted = raw / (10 ** self.network.native_decimals)
+        return Balance(
+            symbol=self.network.native_symbol,
+            name=self.network.native_symbol,
+            raw=raw,
+            decimals=self.network.native_decimals,
+            formatted=formatted,
+            token_address=None,
+            icon_url=None,
+            fetch_failed=False,
+            is_native=True,
+        )
 
     def get_token_balances(self, address: str) -> list[Balance]:
         """
@@ -466,10 +569,11 @@ class BalanceFetcher:
             rpc_url: Optional custom RPC URL (overrides network.rpc_url if provided)
         """
         self.network = network
-        self.client = BlockscoutClient(network)
-        # Keep Web3 for potential direct RPC fallback
         effective_rpc = rpc_url if rpc_url else network.rpc_url
         self.w3 = Web3(Web3.HTTPProvider(effective_rpc))
+        # Native balance falls back to this Web3 instance when Blockscout's
+        # API itself is unreachable; see BlockscoutClient._native_balance_via_rpc.
+        self.client = BlockscoutClient(network, w3=self.w3)
 
     @property
     def is_connected(self) -> bool:

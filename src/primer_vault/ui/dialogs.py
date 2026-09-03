@@ -130,6 +130,7 @@ def copy_sensitive_to_clipboard(text: str, parent: QWidget = None, timeout_sec: 
     if parent:
         FramelessMessageBox.information(parent, "Copied", "Copied to clipboard.")
 from ..models import SpendPolicy, Agent, TradingRules
+from ..models.policy import DefiRules
 from ..models.transaction import STATUS_SETTLED
 from ..version import USER_AGENT
 from ..wallet import WalletInfo, AddressEntry
@@ -1292,6 +1293,13 @@ class ViewInstructionsDialog(FramelessDialog):
 # New Policy Dialog
 # ============================================
 
+#: Where a user goes to see what Steakhouse currently runs. The slug is part
+#: of the route - the address alone lands on a generic page - so it is written
+#: out rather than built from the address.
+STEAKHOUSE_URL = ("https://app.morpho.org/robinhood-chain/vault/"
+                  "0xBeEff033F34C046626B8D0A041844C5d1A5409dd/steakhouse-usdg")
+
+
 class NewPolicyDialog(FramelessDialog):
     """Dialog for creating or editing a spend policy with Trading and x402 tabs."""
 
@@ -1329,6 +1337,9 @@ class NewPolicyDialog(FramelessDialog):
         # Trading tab (LEFT)
         self._create_trading_tab(policy)
 
+        # DeFi tab (MIDDLE)
+        self._create_defi_tab(policy)
+
         # x402 tab (RIGHT)
         self._create_x402_tab(policy)
 
@@ -1358,15 +1369,12 @@ class NewPolicyDialog(FramelessDialog):
         form.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._trading_form_container)
 
-        def add_limit(label_text, widget, tooltip):
-            """Add a labelled row, with the explanation on both halves.
-
-            The label is what a user's cursor lands on, so it carries the tooltip
-            too - hovering the words is the natural way to ask what they mean.
-            """
+        def add_limit(label_text, widget, tooltip=None):
+            """Add a labelled row. The tooltip, if any, goes on both halves."""
             label = QLabel(label_text)
-            label.setToolTip(tooltip)
-            widget.setToolTip(tooltip)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
             form.addRow(label, widget)
 
         # The limits come first and auto-approve last. Auto-approve is a
@@ -1380,9 +1388,7 @@ class NewPolicyDialog(FramelessDialog):
         self.trade_max_input.setDecimals(2)
         self.trade_max_input.setSuffix(" USD")
         self.trade_max_input.setValue(100.0)
-        add_limit("Per Trade Max:", self.trade_max_input,
-                  "The largest single swap, valued in USD.\n"
-                  "A trade worth more than this is refused outright.")
+        add_limit("Per Trade Max:", self.trade_max_input)
 
         # Daily Volume Limit
         self.trade_daily_input = QDoubleSpinBox()
@@ -1391,9 +1397,7 @@ class NewPolicyDialog(FramelessDialog):
         self.trade_daily_input.setSuffix(" USD")
         self.trade_daily_input.setValue(500.0)
         add_limit("Daily Volume Limit:", self.trade_daily_input,
-                  "Total value this agent may trade in a day. Resets at midnight.\n"
-                  "Trades still waiting for your approval count against it, so a\n"
-                  "queue of them cannot clear the cap together.")
+                  "Resets at midnight.")
 
         # Min ETH Balance floor
         self.min_eth_input = QDoubleSpinBox()
@@ -1401,11 +1405,7 @@ class NewPolicyDialog(FramelessDialog):
         self.min_eth_input.setDecimals(6)
         self.min_eth_input.setSuffix(" ETH")
         self.min_eth_input.setValue(0.0001)
-        add_limit("Min ETH Balance:", self.min_eth_input,
-                  "A trade is blocked if it would take the wallet's ETH below\n"
-                  "this - so an ETH-spending trade cannot empty the balance you\n"
-                  "keep for gas. Gas itself is not reserved on top.\n"
-                  "Set to 0 to turn the check off.")
+        add_limit("Min ETH Balance:", self.min_eth_input)
 
         # Max Slippage %
         self.max_slip_input = QDoubleSpinBox()
@@ -1414,10 +1414,7 @@ class NewPolicyDialog(FramelessDialog):
         self.max_slip_input.setSuffix(" %")
         self.max_slip_input.setValue(3.0)
         add_limit("Max Slippage:", self.max_slip_input,
-                  "How far the final fill may drift from the price Vault quoted,\n"
-                  "while the transaction waits to be mined. The chain enforces it:\n"
-                  "the swap reverts rather than filling worse.\n\n"
-                  "This is about the price moving, not whether it was good.")
+                  "Difference between quote and fill.")
 
         # Max Price Impact %
         # Set here and nowhere else: the agent picks the pool, so this is the
@@ -1428,19 +1425,10 @@ class NewPolicyDialog(FramelessDialog):
         self.max_impact_input.setSuffix(" %")
         self.max_impact_input.setValue(5.0)
         add_limit("Max Price Impact:", self.max_impact_input,
-                  "How much worse than the pool's own rate a fill may be, with the\n"
-                  "pool's fee included. Catches a pool too thin for the trade,\n"
-                  "which would otherwise fill at a fraction of what it is worth.\n\n"
-                  "Above this, Vault asks you rather than trading.\n"
-                  "The agent picks the pool, so only you can set this.")
+                  "Difference between the pool's spot price and the fill.")
 
         # Auto-approve checkbox, last: everything above applies either way.
         self.trade_auto_enabled = QCheckBox("Auto-approve trades below:")
-        self.trade_auto_enabled.setToolTip(
-            "Trades under this value go through without asking you.\n"
-            "Everything else waits for your approval - as does any trade that\n"
-            "trips one of the limits above.\n\n"
-            "Leave unticked to be asked about every trade.")
         form.addRow(self.trade_auto_enabled)
 
         # Auto-approve threshold
@@ -1450,7 +1438,6 @@ class NewPolicyDialog(FramelessDialog):
         self.trade_auto_input.setSuffix(" USD")
         self.trade_auto_input.setValue(10.0)
         self.trade_auto_input.setEnabled(False)
-        self.trade_auto_input.setToolTip(self.trade_auto_enabled.toolTip())
         form.addRow("", self.trade_auto_input)
 
         # Help text
@@ -1486,6 +1473,157 @@ class NewPolicyDialog(FramelessDialog):
         self._on_trading_toggled(self.trading_enabled.isChecked())
 
         self.tabs.addTab(tab, "Trading")
+
+    def _create_defi_tab(self, policy: SpendPolicy = None):
+        """Create the DeFi tab with enable toggle and fields."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+
+        self.defi_enabled = QCheckBox("Enable Morpho Lending")
+        self.defi_enabled.setProperty("role", "section-toggle")
+        layout.addWidget(self.defi_enabled)
+
+        self._defi_form_container = QWidget()
+        form = QFormLayout(self._defi_form_container)
+        form.setSpacing(8)
+        layout.addWidget(self._defi_form_container)
+
+        def add_limit(label_text, widget, tooltip=None):
+            label = QLabel(label_text)
+            if tooltip:
+                label.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            form.addRow(label, widget)
+
+        # The restriction comes first: it decides *where* money may go, and
+        # every limit below it is about how much.
+        self.defi_restrict = QCheckBox("Restrict to Steakhouse")
+        self.defi_restrict.setChecked(True)
+        form.addRow(self.defi_restrict)
+
+        restrict_hint = QLabel(
+            f'<a href="{STEAKHOUSE_URL}">Steakhouse\'s vaults and the markets '
+            f'they lend into</a>')
+        restrict_hint.setOpenExternalLinks(True)
+        restrict_hint.setProperty("role", "hint")
+        form.addRow("", restrict_hint)
+
+        self.defi_max_deposit_input = QDoubleSpinBox()
+        self.defi_max_deposit_input.setRange(0.01, 1000000)
+        self.defi_max_deposit_input.setDecimals(2)
+        self.defi_max_deposit_input.setSuffix(" USD")
+        self.defi_max_deposit_input.setValue(100.0)
+        add_limit("Max Per Deposit:", self.defi_max_deposit_input)
+
+        # The limit a daily cap cannot express.
+        self.defi_max_total_input = QDoubleSpinBox()
+        self.defi_max_total_input.setRange(0.01, 10000000)
+        self.defi_max_total_input.setDecimals(2)
+        self.defi_max_total_input.setSuffix(" USD")
+        self.defi_max_total_input.setValue(500.0)
+        add_limit("Max Total Deployed:", self.defi_max_total_input)
+
+        self.defi_percent_enabled = QCheckBox("Also cap at a share of USDG:")
+        self.defi_percent_enabled.setToolTip(
+            "Share of USDG held plus deployed. The lower limit applies.")
+        form.addRow(self.defi_percent_enabled)
+
+        self.defi_percent_input = QDoubleSpinBox()
+        self.defi_percent_input.setRange(1, 100)
+        self.defi_percent_input.setDecimals(0)
+        self.defi_percent_input.setSuffix(" % of USDG")
+        self.defi_percent_input.setValue(50)
+        self.defi_percent_input.setEnabled(False)
+        self.defi_percent_input.setToolTip(self.defi_percent_enabled.toolTip())
+        form.addRow("", self.defi_percent_input)
+
+        # Not a money limit: this one bounds gas.
+        self.defi_ops_input = QSpinBox()
+        self.defi_ops_input.setRange(1, 1000)
+        self.defi_ops_input.setValue(20)
+        self.defi_ops_input.setSuffix(" per day")
+        add_limit("Max Operations:", self.defi_ops_input,
+                  "Deposits and withdrawals combined. Resets at midnight.")
+
+        self.defi_auto_enabled = QCheckBox("Auto-approve operations below:")
+        form.addRow(self.defi_auto_enabled)
+
+        self.defi_auto_input = QDoubleSpinBox()
+        self.defi_auto_input.setRange(0.01, 10000)
+        self.defi_auto_input.setDecimals(2)
+        self.defi_auto_input.setSuffix(" USD")
+        self.defi_auto_input.setValue(10.0)
+        self.defi_auto_input.setEnabled(False)
+        form.addRow("", self.defi_auto_input)
+
+        layout.addStretch()
+        self._defi_unrestricted_warning = QLabel(
+            "Any Morpho venue is permitted. Uncurated markets can be built so a "
+            "borrower posts worthless collateral and takes the deposits."
+        )
+        self._defi_unrestricted_warning.setWordWrap(True)
+        self._defi_unrestricted_warning.setProperty("role", "hint")
+        self._defi_unrestricted_warning.setVisible(False)
+        layout.addWidget(self._defi_unrestricted_warning)
+
+        if policy and getattr(policy, "defi_rules", None):
+            dr = policy.defi_rules
+            self.defi_enabled.setChecked(dr.enabled)
+            self.defi_restrict.setChecked(dr.restrict_to_steakhouse)
+            self.defi_max_deposit_input.setValue(dr.max_deposit_usd)
+            if dr.max_total_deployed_usd is not None:
+                self.defi_max_total_input.setValue(dr.max_total_deployed_usd)
+            if dr.max_deployed_percent is not None:
+                self.defi_percent_enabled.setChecked(True)
+                self.defi_percent_input.setValue(dr.max_deployed_percent)
+            self.defi_ops_input.setValue(dr.max_ops_per_day)
+            if dr.auto_approve_below_usd is not None:
+                self.defi_auto_enabled.setChecked(True)
+                self.defi_auto_input.setValue(dr.auto_approve_below_usd)
+
+        self.defi_enabled.toggled.connect(self._on_defi_toggled)
+        self.defi_restrict.toggled.connect(self._on_defi_restrict_toggled)
+        self.defi_percent_enabled.toggled.connect(
+            lambda checked: self.defi_percent_input.setEnabled(
+                checked and self.defi_enabled.isChecked())
+        )
+        self.defi_auto_enabled.toggled.connect(
+            lambda checked: self.defi_auto_input.setEnabled(
+                checked and self.defi_enabled.isChecked())
+        )
+        self._on_defi_toggled(self.defi_enabled.isChecked())
+        self._on_defi_restrict_toggled(self.defi_restrict.isChecked())
+
+        self.tabs.addTab(tab, "Morpho")
+
+    def _build_defi_rules(self):
+        """The Morpho ruleset from the dialog, or None when the lane is off.
+
+        The curator list is not edited here. It is the mechanism behind the
+        checkbox rather than a choice - "which curator" is not a question a user
+        can be asked, since nobody curates the curators and the answer would be
+        an address with no name on it. Vault ships the list; the checkbox says
+        whether to hold the agent to it.
+        """
+        if not self.defi_enabled.isChecked():
+            return None
+        from ..networks import DEFAULT_NETWORK, get_morpho
+        config = get_morpho(DEFAULT_NETWORK)
+        return DefiRules(
+            enabled=True,
+            restrict_to_steakhouse=self.defi_restrict.isChecked(),
+            morpho_curators=list(config.default_curators) if config else [],
+            max_deposit_usd=self.defi_max_deposit_input.value(),
+            max_total_deployed_usd=self.defi_max_total_input.value(),
+            max_deployed_percent=(self.defi_percent_input.value()
+                                  if self.defi_percent_enabled.isChecked()
+                                  else None),
+            max_ops_per_day=self.defi_ops_input.value(),
+            auto_approve_below_usd=(self.defi_auto_input.value()
+                                    if self.defi_auto_enabled.isChecked()
+                                    else None),
+        )
 
     def _create_x402_tab(self, policy: SpendPolicy = None):
         """Create the x402 tab with enable toggle and fields."""
@@ -1615,6 +1753,27 @@ class NewPolicyDialog(FramelessDialog):
         if enabled:
             self.trade_auto_input.setEnabled(self.trade_auto_enabled.isChecked())
 
+    def _on_defi_restrict_toggled(self, restricted: bool):
+        """Show the warning only when the venue gate is actually open."""
+        self._defi_unrestricted_warning.setVisible(
+            not restricted and self.defi_enabled.isChecked())
+
+    def _on_defi_toggled(self, enabled: bool):
+        """Enable/disable DeFi fields based on toggle."""
+        self._defi_form_container.setEnabled(enabled)
+        if enabled:
+            self._defi_form_container.setGraphicsEffect(None)
+        else:
+            effect = QGraphicsOpacityEffect()
+            effect.setOpacity(0.4)
+            self._defi_form_container.setGraphicsEffect(effect)
+        # These two have a further dependency on their own checkbox.
+        if enabled:
+            self.defi_percent_input.setEnabled(
+                self.defi_percent_enabled.isChecked())
+            self.defi_auto_input.setEnabled(self.defi_auto_enabled.isChecked())
+        self._on_defi_restrict_toggled(self.defi_restrict.isChecked())
+
     def _on_x402_toggled(self, enabled: bool):
         """Enable/disable x402 fields based on toggle."""
         self._x402_form_container.setEnabled(enabled)
@@ -1644,12 +1803,25 @@ class NewPolicyDialog(FramelessDialog):
                     return
 
         # At least one lane must be enabled
-        if not self.trading_enabled.isChecked() and not self.x402_enabled.isChecked():
+        if (not self.trading_enabled.isChecked()
+                and not self.x402_enabled.isChecked()
+                and not self.defi_enabled.isChecked()):
             FramelessMessageBox.warning(
                 self, "Validation Error",
-                "At least one lane must be enabled (Trading or x402)."
+                "At least one lane must be enabled (Trading, Morpho or x402)."
             )
             return
+
+        # A DeFi lane with no curator refuses everything, so a policy saved that
+        # way looks enabled and does nothing. The model already knows; asking it
+        # here means the user finds out at the dialog rather than at the first
+        # refused deposit.
+        defi_rules = self._build_defi_rules()
+        if defi_rules is not None:
+            ok, reason = defi_rules.validate()
+            if not ok:
+                FramelessMessageBox.warning(self, "Validation Error", reason)
+                return
 
         self.accept()
 
@@ -1708,6 +1880,7 @@ class NewPolicyDialog(FramelessDialog):
             blocked_domains=blocked_domains,
             trading_rules=trading_rules,
             x402_enabled=self.x402_enabled.isChecked(),
+            defi_rules=self._build_defi_rules(),
         )
 
     def get_policy_data(self) -> dict:
@@ -1759,6 +1932,7 @@ class NewPolicyDialog(FramelessDialog):
             "blocked_domains": blocked_domains if blocked_domains else None,
             "trading_rules": trading_rules,
             "x402_enabled": self.x402_enabled.isChecked(),
+            "defi_rules": self._build_defi_rules(),
         }
 
 
@@ -1916,37 +2090,6 @@ class SettingsDialog(FramelessDialog):
         security_layout.addRow("Replay window:", self.replay_window_input)
 
         # Admin API access mode
-        admin_api_desc = QLabel(
-            "Lets a separate CLI process drive this running instance. Most people "
-            "never need to change this - CLI commands already work on the default "
-            "whenever Vault is not already open."
-        )
-        admin_api_desc.setWordWrap(True)
-        admin_api_desc.setProperty("role", "muted")
-        security_layout.addRow(admin_api_desc)
-
-        from ..core.settings import ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY
-        self.admin_api_mode_combo = QComboBox()
-        # Default first: the safe setting should read as the ordinary choice, not
-        # as the one that blocks things. currentData() is used to read the value
-        # back, so this order is presentation only.
-        self.admin_api_mode_combo.addItem("Vault window only (default)", ADMIN_API_MODE_GUI_ONLY)
-        self.admin_api_mode_combo.addItem("Open to local processes", ADMIN_API_MODE_OPEN)
-        self.admin_api_mode_combo.setToolTip(
-            "Vault window only - admin commands come from this window alone.\n\n"
-            "Open to local processes - any program running under your user account "
-            "can also use port 4664 to create agents and read their tokens, set "
-            "policies, and approve requests. While the wallet is unlocked those go "
-            "through without a prompt. For power users driving Vault from scripts "
-            "on a machine they control."
-        )
-        # Set current value from settings if core is available
-        if self.core:
-            current_mode = self.core.settings_manager.get_admin_api_mode()
-            index = 1 if current_mode == ADMIN_API_MODE_OPEN else 0
-            self.admin_api_mode_combo.setCurrentIndex(index)
-        self.admin_api_mode_combo.currentIndexChanged.connect(self._on_setting_changed)
-        security_layout.addRow("Admin API:", self.admin_api_mode_combo)
 
         layout.addWidget(security_group)
 
@@ -1979,7 +2122,6 @@ class SettingsDialog(FramelessDialog):
             "log_retention_days": self.log_retention_input.value(),
             "auto_lock_minutes": self.auto_lock_input.value(),
             "replay_window_seconds": self.replay_window_input.value(),
-            "admin_api_mode": self.admin_api_mode_combo.currentData(),
         }
 
     def has_changes(self) -> bool:
@@ -2442,7 +2584,8 @@ class TransactionDetailDialog(FramelessDialog):
         info_layout.setSpacing(8)
 
         tx_type = getattr(tx, 'type', 'x402')
-        type_labels = {'x402': 'x402 Payment', 'trade': 'Trade', 'transfer': 'Transfer'}
+        type_labels = {'x402': 'x402 Payment', 'trade': 'Trade', 'transfer': 'Transfer',
+                       'lend': 'Lend', 'approve': 'Approve'}
         info_layout.addRow("Type:", QLabel(type_labels.get(tx_type, tx_type)))
         info_layout.addRow("Agent:", QLabel(f"{tx.agent_name} ({tx.agent_id})"))
         info_layout.addRow("Network:", QLabel(tx.network))
@@ -2478,6 +2621,31 @@ class TransactionDetailDialog(FramelessDialog):
             recipient_label.setWordWrap(True)
             recipient_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             info_layout.addRow("Recipient:", recipient_label)
+        elif tx_type == 'lend':
+            # Lend-specific fields. create_lend stores no explicit direction -
+            # the model infers supply vs withdraw from which side of
+            # token_in/token_out is the venue (`pool`).
+            supplying = tx.lend_is_supply()
+            action_label = "Supply" if supplying else "Withdraw"
+            asset = getattr(tx, 'symbol_in', None) if supplying else getattr(tx, 'symbol_out', None)
+            venue = getattr(tx, 'symbol_out', None) if supplying else getattr(tx, 'symbol_in', None)
+            info_layout.addRow("Action:", QLabel(action_label))
+            info_layout.addRow("Venue:", QLabel(venue or "?"))
+            info_layout.addRow("Asset:", QLabel(asset or "?"))
+            info_layout.addRow("Amount:", QLabel(f"{getattr(tx, 'amount_in', '?')}"))
+            pool = getattr(tx, 'pool', None)
+            if pool:
+                pool_label = QLabel(pool)
+                pool_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                info_layout.addRow("Venue Address:", pool_label)
+        elif tx_type == 'approve':
+            # Approve-specific fields: the allowance this row grants.
+            info_layout.addRow("Asset:", QLabel(getattr(tx, 'approve_symbol', None) or "?"))
+            info_layout.addRow("Amount:", QLabel(f"{getattr(tx, 'amount_in', '?')}"))
+            spender = getattr(tx, 'approve_spender', None)
+            spender_label = QLabel(spender or "?")
+            spender_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            info_layout.addRow("Spender:", spender_label)
         else:
             # x402-specific fields
             info_layout.addRow("Amount:", QLabel(tx.format_amount()))
@@ -3209,8 +3377,8 @@ class ExportKeysDialog(FramelessDialog):
         copy_sensitive_to_clipboard(text, self)
 
     def scrub(self):
-        """Blank the revealed key/seed; see utils.scrub_dialog for why."""
-        from ..utils import scrub_dialog
+        """Blank the revealed key/seed; see ui/scrub.py for why."""
+        from .scrub import scrub_dialog
         scrub_dialog(self)
 
     def close(self):

@@ -22,14 +22,10 @@ DEFAULT_PORT = 4663
 #: Requests per minute one caller may make to the agent API. 0 means no ceiling.
 #:
 #: Lives here rather than in the GUI's own settings file because the ceiling
-#: protects the agent server, which the daemon and the CLI also run - a limit
-#: only the GUI could set would not exist in headless mode, which is the mode
+#: protects the agent server, which both editions run - a limit only the
+#: desktop could set would not exist on a server, which is the deployment
 #: most exposed to a LAN.
 DEFAULT_RATE_LIMIT_PER_MINUTE = 300
-
-# Admin API access modes
-ADMIN_API_MODE_OPEN = "open"          # Any local process can access (current behavior)
-ADMIN_API_MODE_GUI_ONLY = "gui_only"  # Reject all external HTTP requests
 
 # Default settings values
 DEFAULT_SETTINGS = {
@@ -46,8 +42,9 @@ DEFAULT_SETTINGS = {
         "allow_lan": False,
         "rate_limit_per_minute": DEFAULT_RATE_LIMIT_PER_MINUTE,
     },
-    "security": {
-        "admin_api_mode": ADMIN_API_MODE_GUI_ONLY,
+    "startup": {
+        "open_wallet": None,
+        "start_agent_api": False,
     },
     "display": {
         "default_network": 4663
@@ -75,9 +72,27 @@ class ServerSettings:
 
 
 @dataclass
-class SecuritySettings:
-    """Security-related settings."""
-    admin_api_mode: str = ADMIN_API_MODE_GUI_ONLY  # "open" or "gui_only"
+class StartupSettings:
+    """What Vault does for itself when it starts, with nobody typing.
+
+    A machine that reboots at 03:00 comes back with a locked wallet and no
+    agent API, and no operator is going to be there to type either one. These
+    two settings are how it comes back serving. They are settings rather than
+    launch flags precisely because a service manager cannot type a flag - and
+    because anything that must survive a reboot has to be written down
+    somewhere the reboot cannot lose.
+
+    The password is deliberately not here. `settings.json` sits in the data
+    directory alongside the wallet file, so a password stored here would be
+    readable by anyone who copies that folder - which is the one attack the
+    wallet's encryption still defends against once the machine runs unattended.
+    It comes from PRIMER_VAULT_PASSWORD, which lives outside the data
+    directory, in the service configuration.
+    """
+    #: Wallet name to unlock at launch, or None to start locked.
+    open_wallet: Optional[str] = None
+    #: Switch the agent API on at launch, on `server.default_port`.
+    start_agent_api: bool = False
 
 
 @dataclass
@@ -98,7 +113,7 @@ class AppSettings:
     version: int = 1
     signing: SigningSettings = field(default_factory=SigningSettings)
     server: ServerSettings = field(default_factory=ServerSettings)
-    security: SecuritySettings = field(default_factory=SecuritySettings)
+    startup: StartupSettings = field(default_factory=StartupSettings)
     display: DisplaySettings = field(default_factory=DisplaySettings)
     rpc: RpcSettings = field(default_factory=RpcSettings)
 
@@ -116,8 +131,9 @@ class AppSettings:
                 "allow_lan": self.server.allow_lan,
                 "rate_limit_per_minute": self.server.rate_limit_per_minute,
             },
-            "security": {
-                "admin_api_mode": self.security.admin_api_mode,
+            "startup": {
+                "open_wallet": self.startup.open_wallet,
+                "start_agent_api": self.startup.start_agent_api,
             },
             "display": {
                 "default_network": self.display.default_network,
@@ -144,24 +160,11 @@ class AppSettings:
             settings.server.rate_limit_per_minute = s.get(
                 "rate_limit_per_minute", DEFAULT_RATE_LIMIT_PER_MINUTE)
 
-        if "security" in data:
-            s = data["security"]
-            raw_mode = s.get("admin_api_mode", ADMIN_API_MODE_GUI_ONLY)
-            # Validate on the way in. The admin-API gate is the only thing
-            # standing between a local process and the wallet, and it treats any
-            # value other than "open" as locked-down - but a hand-edited
-            # settings.json can carry a near-miss of the *safe* value ("GUI_ONLY",
-            # "gui-only") that is neither, and an unvalidated one would sail
-            # through. Anything not exactly one of the two known modes falls back
-            # to the safe one, the same way an unreadable file does.
-            if raw_mode not in (ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY):
-                logger.warning(
-                    "Unrecognised admin_api_mode %r in settings.json; using the "
-                    "safe default %r. Valid values are %r and %r.",
-                    raw_mode, ADMIN_API_MODE_GUI_ONLY,
-                    ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY)
-                raw_mode = ADMIN_API_MODE_GUI_ONLY
-            settings.security.admin_api_mode = raw_mode
+        if "startup" in data:
+            s = data["startup"]
+            name = s.get("open_wallet")
+            settings.startup.open_wallet = str(name) if name else None
+            settings.startup.start_agent_api = bool(s.get("start_agent_api", False))
 
         if "display" in data:
             s = data["display"]
@@ -529,16 +532,29 @@ class SettingsManager:
             if self._on_change:
                 self._on_change(self._settings)
 
-    def get_admin_api_mode(self) -> str:
-        """Get admin API access mode."""
-        return self._settings.security.admin_api_mode
+    def get_startup_wallet(self) -> Optional[str]:
+        """Name of the wallet to unlock at launch, or None."""
+        return self._settings.startup.open_wallet
 
-    def set_admin_api_mode(self, mode: str) -> None:
-        """Set admin API access mode. Only 'open' or 'gui_only' are valid."""
-        if mode not in (ADMIN_API_MODE_OPEN, ADMIN_API_MODE_GUI_ONLY):
-            raise ValueError(f"Invalid admin API mode: {mode}")
-        if self._settings.security.admin_api_mode != mode:
-            self._settings.security.admin_api_mode = mode
+    def set_startup_wallet(self, name: Optional[str]) -> None:
+        """Set (or clear, with None) the wallet opened at launch."""
+        name = name or None
+        if self._settings.startup.open_wallet != name:
+            self._settings.startup.open_wallet = name
             self._save()
             if self._on_change:
                 self._on_change(self._settings)
+
+    def get_start_agent_api(self) -> bool:
+        """Whether the agent API comes up automatically at launch."""
+        return self._settings.startup.start_agent_api
+
+    def set_start_agent_api(self, enabled: bool) -> None:
+        """Set whether the agent API comes up automatically at launch."""
+        enabled = bool(enabled)
+        if self._settings.startup.start_agent_api != enabled:
+            self._settings.startup.start_agent_api = enabled
+            self._save()
+            if self._on_change:
+                self._on_change(self._settings)
+
