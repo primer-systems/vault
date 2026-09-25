@@ -134,7 +134,7 @@ from ..models.policy import DefiRules
 from ..models.transaction import STATUS_SETTLED, format_stamp
 from ..version import USER_AGENT
 from ..wallet import WalletInfo, AddressEntry
-from ..networks import (NETWORKS, DEFAULT_NETWORK, format_address,
+from ..networks import (NETWORKS, format_address,
                         resolve_network, get_dex, get_network)
 from .network_icons import network_icon
 from ..utils import agent_config_snippet

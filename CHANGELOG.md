@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+Lint-only fix; no functional or behavioral changes from 0.4.0.
+
+### Fixed
+- Two unused imports (`DEFAULT_NETWORK` in `ui/dialogs.py`,
+  `timedelta` in `tests/test_history_time_column.py`) that failed CI's
+  `ruff check`.
+
 ## 0.4.0
 
 Base is now a second supported network alongside Robinhood Chain, and Vault

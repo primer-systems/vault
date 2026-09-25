@@ -1,4 +1,4 @@
-# Vault v0.4.0
+# Vault v0.4.1
 
 ![Tests](https://github.com/primer-systems/Vault/actions/workflows/test.yml/badge.svg)
 
