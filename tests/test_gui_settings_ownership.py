@@ -1,15 +1,13 @@
 """One home per setting.
 
 gui_settings.json is for how the window looks and behaves. Everything the
-daemon or the CLI also has to know lives in the core's settings.json. The two
-files had drifted into holding copies of the same facts, and each copy went
-wrong in its own way: a server port the window used but a headless run did not,
-a rate limit that reached nothing, a replay window shown as one number while
-another was enforced, three Uniswap addresses that could be edited and were
-then ignored.
+daemon or the CLI also has to know lives in the core's settings.json. A key
+owned by the core must never come back into the GUI's file as a second,
+independently-editable copy - two copies of the same fact are free to disagree,
+and only one of them is what actually gets enforced.
 
-These tests hold the line: no core-owned key can come back into the GUI's file,
-and each formerly-dead control now reaches the thing it claims to control.
+These tests hold the line: no core-owned key can appear in the GUI's file, and
+every control in the settings UI reaches the thing it claims to control.
 """
 
 import os
@@ -30,7 +28,8 @@ CORE_OWNED = {
     "rate_limit",                           # settings.json: server.rate_limit_per_minute
     "replay_window_seconds",                # settings.json: signing.max_request_age_seconds
     "allow_lan", "verify_settlements",      # settings.json: server / signing
-    "rhc_rpc",                              # settings.json: rpc.<chain>
+    "rpc_endpoints",                        # settings.json: rpc.<chain>, per chain
+    "enabled_networks",                     # settings.json: signing.enabled_networks
     "wallet_path",                          # the core's wallet_path.txt
     "uniswap_factory", "uniswap_quoter", "uniswap_router",  # networks.py, not a setting
 }
@@ -49,8 +48,10 @@ def offline(monkeypatch):
     public endpoint and then emit into a dialog the test has already closed."""
     from primer_vault.ui.dialogs import NetworkSettingsDialog
 
-    monkeypatch.setattr(NetworkSettingsDialog, "_check_rhc_connection", lambda self: None)
-    monkeypatch.setattr(NetworkSettingsDialog, "_check_dex_connection", lambda self: None)
+    monkeypatch.setattr(NetworkSettingsDialog, "_check_rpc_connection",
+                        lambda self, chain_id: None)
+    monkeypatch.setattr(NetworkSettingsDialog, "_check_dex_connection",
+                        lambda self, chain_id: None)
 
 
 @pytest.fixture
@@ -92,7 +93,8 @@ def test_a_dialog_answer_is_filtered_before_it_is_stored(tmp_path, monkeypatch):
         "server_port": 5000,
         "rate_limit": 60,
         "replay_window_seconds": 120,
-        "rhc_rpc": "https://example.invalid",
+        "rpc_endpoints": {4663: "https://example.invalid"},
+        "enabled_networks": {4663: True},
         "verify_settlements": False,
     })
 
@@ -152,18 +154,90 @@ def test_the_gui_starts_the_server_on_the_port_the_core_records(core, qt_app,
 
 def test_the_uniswap_addresses_are_not_settings(qt_app, core, offline):
     """They come from the network registry and are shown, not edited - so the
-    dialog must not offer them back as something to save."""
+    dialog must not offer them back as something to save.
+
+    Checked on every network's tab, not just one: the router is the contract a
+    swap approves to move tokens, and a chain whose fields were editable would
+    be a way to lose funds on that chain specifically.
+    """
+    from PyQt6.QtWidgets import QLineEdit, QAbstractSpinBox
     from primer_vault.ui.dialogs import NetworkSettingsDialog
+    from primer_vault.networks import NETWORKS, get_dex
 
     dialog = NetworkSettingsDialog(core=core, settings={})
     try:
-        assert dialog.uniswap_factory_input.isReadOnly()
-        assert dialog.uniswap_quoter_input.isReadOnly()
-        assert dialog.uniswap_router_input.isReadOnly()
+        # Spin boxes own an internal QLineEdit; this test is about the address
+        # and endpoint fields, not the port/rate-limit numbers.
+        standalone = [
+            w for w in dialog.findChildren(QLineEdit)
+            if not isinstance(w.parent(), QAbstractSpinBox)
+        ]
+
+        editable = {w for w in standalone if not w.isReadOnly()}
+        assert editable == set(dialog._rpc_inputs.values()), \
+            "the RPC boxes must be the only editable fields in the dialog"
+
+        # Every registered chain's contract addresses are shown, uneditable.
+        readonly = {w.text() for w in standalone if w.isReadOnly()}
+        for chain_id in NETWORKS:
+            dex = get_dex(chain_id)
+            if dex:
+                assert dex.factory in readonly, chain_id
+                assert dex.swap_router in readonly, chain_id
+
         assert not set(dialog.get_settings()) & {
             "uniswap_factory", "uniswap_quoter", "uniswap_router"}
     finally:
         dialog.close()
+
+
+def test_every_registered_network_gets_a_tab(qt_app, core, offline):
+    """The dialog is generated from the registry, not written per chain.
+
+    This is the property that was actually missing: Base shipped supported but
+    with no UI at all, so its RPC and its kill switch were unreachable.
+    """
+    from primer_vault.ui.dialogs import NetworkSettingsDialog
+    from primer_vault.networks import NETWORKS
+
+    dialog = NetworkSettingsDialog(core=core, settings={})
+    try:
+        titles = {dialog.tabs.tabText(i) for i in range(dialog.tabs.count())}
+        assert "General" in titles
+        for cfg in NETWORKS.values():
+            assert cfg.display_name in titles
+        # A control per chain, both ways round.
+        assert set(dialog._rpc_inputs) == set(NETWORKS)
+        assert set(dialog._enabled_checks) == set(NETWORKS)
+    finally:
+        dialog.close()
+
+
+def test_every_network_is_enabled_by_default(core):
+    """A kill switch whose resting state is "everything killed" is a setup step.
+
+    Authorization is the policies' job - they name their chains explicitly
+    since 0.4. This switch exists to stop a chain, so it starts un-stopped.
+    """
+    from primer_vault.networks import NETWORKS
+
+    for chain_id in NETWORKS:
+        assert core.settings_manager.is_network_enabled(chain_id), chain_id
+    # A chain the registry does not know stays off: absence is only permission
+    # when there is something real to enable.
+    assert not core.settings_manager.is_network_enabled(999999)
+
+
+def test_the_kill_switch_reaches_the_signing_path(core, qt_app, offline):
+    """Unticking a network must reject on that chain, whatever policies allow."""
+    from primer_vault.networks import DEFAULT_NETWORK
+
+    core.set_network_enabled(DEFAULT_NETWORK, False)
+    assert not core.is_network_enabled(DEFAULT_NETWORK)
+    assert not core._signing_service.is_network_enabled(DEFAULT_NETWORK)
+
+    core.set_network_enabled(DEFAULT_NETWORK, True)
+    assert core._signing_service.is_network_enabled(DEFAULT_NETWORK)
 
 
 def test_the_dialog_shows_the_replay_window_actually_in_force(qt_app, core):
@@ -189,13 +263,11 @@ def test_the_dialog_shows_the_replay_window_actually_in_force(qt_app, core):
 #: depending on which code path ran, which is not a thing anyone can debug from
 #: the outside: the file on disk looks the same either way.
 #:
-#: `auto_start_server` is here because it drifted. A dead `set_settings()` in
-#: SettingsTab read it with a default of False while the window, the settings
-#: tab and the network dialog all read it with True. Nothing called the dead
-#: method, so nothing broke - but the next person to wire it up would have
-#: turned the agent server's auto-start off for every user whose settings file
-#: predates the key, and the symptom would have been "it used to start on its
-#: own" with nothing in the file to explain it.
+#: `auto_start_server` is here because a mismatched default is easy to
+#: introduce silently: any code path that reads it with a different fallback
+#: than the rest would turn the agent server's auto-start off for every user
+#: whose settings file predates the key, with nothing in the file to explain
+#: the symptom.
 SHARED_DEFAULTS = {
     "auto_start_server": "True",
     "sound_enabled": "True",

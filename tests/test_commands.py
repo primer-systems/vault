@@ -263,26 +263,26 @@ class TestPolicyCommands:
 
     def test_policy_create(self, handler):
         """policy create creates a policy."""
-        result = handler.execute("policy create standard")
+        result = handler.execute("policy create standard --networks 4663")
         assert result.success
         assert "created" in result.output.lower()
 
     def test_policy_create_with_limits(self, handler):
         """policy create with custom limits."""
-        result = handler.execute("policy create premium --day 500 --txn 50 --auto 5")
+        result = handler.execute("policy create premium --networks 4663 --day 500 --txn 50 --auto 5")
         assert result.success
         assert "premium" in result.output.lower()
 
     def test_policy_list_after_create(self, handler):
         """policy list shows created policies."""
-        handler.execute("policy create listpolicy")
+        handler.execute("policy create listpolicy --networks 4663")
         result = handler.execute("policy list")
         assert result.success
         assert "listpolicy" in result.output
 
     def test_policy_show(self, handler):
         """policy show displays policy details."""
-        handler.execute("policy create showpolicy --day 200")
+        handler.execute("policy create showpolicy --networks 4663 --day 200")
         result = handler.execute("policy show showpolicy")
         assert result.success
         assert "200" in result.output
@@ -290,7 +290,7 @@ class TestPolicyCommands:
 
     def test_policy_edit(self, handler):
         """policy edit modifies a policy."""
-        handler.execute("policy create editpolicy")
+        handler.execute("policy create editpolicy --networks 4663")
         result = handler.execute("policy edit editpolicy --day 300")
         assert result.success
         assert "updated" in result.output.lower()

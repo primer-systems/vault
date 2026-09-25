@@ -346,7 +346,7 @@ class TestPolicyLifecycle:
 
     def test_create_policy_defaults(self, handler):
         """Create policy with default limits."""
-        result = handler.execute("policy create standard")
+        result = handler.execute("policy create standard --networks 4663")
         assert result.success
 
         show = handler.execute("policy show standard")
@@ -355,7 +355,7 @@ class TestPolicyLifecycle:
 
     def test_create_policy_custom_limits(self, handler):
         """Create policy with custom limits."""
-        result = handler.execute("policy create premium --day 500 --txn 50 --auto 5")
+        result = handler.execute("policy create premium --networks 4663 --day 500 --txn 50 --auto 5")
         assert result.success
 
         show = handler.execute("policy show premium")
@@ -365,7 +365,7 @@ class TestPolicyLifecycle:
 
     def test_edit_policy(self, handler):
         """Edit existing policy limits."""
-        handler.execute("policy create editable")
+        handler.execute("policy create editable --networks 4663")
 
         result = handler.execute("policy edit editable --day 200")
         assert result.success
@@ -375,7 +375,7 @@ class TestPolicyLifecycle:
 
     def test_policy_delete_with_confirmation(self, handler):
         """Delete policy requires confirmation."""
-        handler.execute("policy create deletable")
+        handler.execute("policy create deletable --networks 4663")
 
         result = execute_with_inputs(
             handler,
@@ -400,14 +400,14 @@ class TestDependenciesAndCascades:
             "wallet create deptest",
             {"password": "testpassword", "confirm": "testpassword"}
         )
-        handler.execute("policy create testpolicy --day 100")
+        handler.execute("policy create testpolicy --networks 4663 --day 100")
         handler.execute("agent register testagent")
         return handler
 
     def test_commission_requires_unlocked_wallet(self, handler):
         """Commission should fail if wallet is locked."""
         # Setup with unlocked wallet
-        handler.execute("policy create pol1")
+        handler.execute("policy create pol1 --networks 4663")
         handler.execute("agent register ag1")
         # Lock the wallet
         handler.execute("wallet lock")
@@ -530,7 +530,7 @@ class TestEndToEndWorkflows:
         assert result.success, "Wallet creation failed"
 
         # 2. Create policy
-        result = handler.execute("policy create standard --day 100 --txn 10 --auto 1")
+        result = handler.execute("policy create standard --networks 4663 --day 100 --txn 10 --auto 1")
         assert result.success, "Policy creation failed"
 
         # 3. Register agent
@@ -573,8 +573,8 @@ class TestEndToEndWorkflows:
         handler.execute("address create")
 
         # Create policies
-        handler.execute("policy create lowlimit --day 10 --txn 1 --auto 0")
-        handler.execute("policy create highlimit --day 1000 --txn 100 --auto 50")
+        handler.execute("policy create lowlimit --networks 4663 --day 10 --txn 1 --auto 0")
+        handler.execute("policy create highlimit --networks 4663 --day 1000 --txn 100 --auto 50")
 
         # Register agents
         handler.execute("agent register untrusted-bot")
@@ -743,7 +743,7 @@ class TestHistoryWithTransactions:
             "wallet create histtest",
             {"password": "testpassword", "confirm": "testpassword"}
         )
-        handler.execute("policy create testpolicy")
+        handler.execute("policy create testpolicy --networks 4663")
         handler.execute("agent register histagent")
         handler.execute("agent commission histagent testpolicy A001")
 
@@ -864,7 +864,7 @@ class TestMandateGeneration:
             "wallet create mandatetest3",
             {"password": "testpass", "confirm": "testpass"}
         )
-        handler.execute("policy create pol")
+        handler.execute("policy create pol --networks 4663")
         handler.execute("agent register ag")
         handler.execute("agent commission ag pol A001")
         handler.execute("wallet lock")
@@ -901,7 +901,7 @@ class TestSigningApprovalFlow:
             "wallet create approvaltest",
             {"password": "testpassword", "confirm": "testpassword"}
         )
-        handler.execute("policy create testpolicy --day 100 --txn 10 --auto 0")  # No auto-approve
+        handler.execute("policy create testpolicy --networks 4663 --day 100 --txn 10 --auto 0")  # No auto-approve
         handler.execute("agent register approvalagent")
         handler.execute("agent commission approvalagent testpolicy A001")
 

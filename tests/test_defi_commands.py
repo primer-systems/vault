@@ -372,12 +372,12 @@ class TestPolicyFlags:
         return commands
 
     def test_morpho_is_off_unless_asked_for(self, commands):
-        commands._create(["plain"])
+        commands._create(["plain", "--networks", "4663"])
 
         assert commands._created["defi_rules"] is None
 
     def test_the_flag_enables_it_restricted_by_default(self, commands):
-        commands._create(["lender", "--morpho"])
+        commands._create(["lender", "--networks", "4663", "--morpho"])
 
         rules = commands._created["defi_rules"]
         assert rules.enabled is True
@@ -385,12 +385,12 @@ class TestPolicyFlags:
         assert rules.morpho_curators, "the shipped curator was not applied"
 
     def test_no_restrict_opens_the_venue_gate(self, commands):
-        commands._create(["lender", "--morpho", "--no-restrict"])
+        commands._create(["lender", "--networks", "4663", "--morpho", "--no-restrict"])
 
         assert commands._created["defi_rules"].restrict_to_steakhouse is False
 
     def test_the_limits_are_settable(self, commands):
-        commands._create(["lender", "--morpho", "--morpho-max", "50",
+        commands._create(["lender", "--networks", "4663", "--morpho", "--morpho-max", "50",
                           "--morpho-total", "250", "--morpho-percent", "40",
                           "--morpho-ops", "5", "--morpho-auto", "2.5"])
 
@@ -408,12 +408,13 @@ class TestPolicyFlags:
         ["--morpho", "--morpho-total", "nope"],
     ])
     def test_a_bad_value_is_refused_rather_than_defaulted(self, commands, args):
-        result = commands._create(["lender"] + args)
+        result = commands._create(["lender", "--networks", "4663"] + args)
 
         assert not result.success
 
     def test_an_unknown_morpho_flag_is_refused(self, commands):
-        assert not commands._create(["lender", "--morpho-curator", "0xabc"]).success
+        assert not commands._create(
+            ["lender", "--networks", "4663", "--morpho-curator", "0xabc"]).success
 
     def test_the_help_documents_the_flags(self, commands):
         text = commands._create_help().output

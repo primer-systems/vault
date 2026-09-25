@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "primer-vault"
-version = "0.3.0"
+version = "0.4.0"
 description = "Self-custodial execution wallet for AI agents on Robinhood Chain"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -61,6 +61,12 @@ dependencies = [
 # the concrete cost of the two editions sharing one dependency list.
 desktop = [
     "PyQt6>=6.10,<7",
+    # QtSvg ships inside the PyQt6 wheel rather than as a separate
+    # distribution, so there is nothing extra to pin here - but the import is
+    # load-bearing (ui/network_icons.py renders the chain marks from SVG), and
+    # a build that silently lacks it loses every network icon. Vault.spec lists
+    # PyQt6.QtSvg in hiddenimports for the same reason: PyInstaller cannot see
+    # an import that only happens inside a function.
 ]
 
 [project.scripts]

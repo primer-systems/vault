@@ -49,6 +49,55 @@ TYPE_LEND = "lend"
 TYPE_APPROVE = "approve"
 
 
+# -----------------------------------------------------------------------------
+# Timestamp display
+# -----------------------------------------------------------------------------
+#
+# Records are stored as tz-aware UTC (every constructor below writes
+# `datetime.now(timezone.utc).isoformat()`), and every human-facing surface
+# renders them in the viewer's local time. The rule, app-wide:
+#
+#   stored UTC  ->  displayed local  ->  except where the artifact is meant to
+#                                        be shared or machine-read
+#
+# The two deliberate exceptions, both of which say so where they are written:
+#   - Receipts (ui/dialogs.py) print UTC and *label* it. A receipt is a formal,
+#     shareable document; whose local time it was is not a property of the
+#     transaction, and an unlabelled local time on a shared artifact is
+#     genuinely ambiguous.
+#   - CSV export writes `tx.timestamp` raw - full ISO with offset. Machine
+#     output should be unambiguous and comparable between users, not localised.
+#
+# Anything else rendering a stored timestamp should go through format_stamp()
+# rather than calling strftime on a parsed value, which is how the History
+# column came to show UTC while claiming to show the user's day.
+
+
+def _to_local(dt: datetime) -> datetime:
+    """Interpret `dt` as UTC if it is naive, then convert to local time.
+
+    Naive timestamps predate the tz-aware constructors; UTC is what they would
+    have been written as, so assuming anything else would shift them.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone()
+
+
+def format_stamp(value: Optional[str], fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Render a stored ISO timestamp in local time.
+
+    Returns the raw value when it cannot be parsed, and "" when it is missing -
+    a display helper should never take a window down over a bad record.
+    """
+    if not value:
+        return ""
+    try:
+        return _to_local(datetime.fromisoformat(value.replace("Z", "+00:00"))).strftime(fmt)
+    except (ValueError, TypeError, AttributeError):
+        return value
+
+
 @dataclass
 class Transaction:
     """A payment, trade, or transfer record."""
@@ -409,36 +458,81 @@ class Transaction:
         return cls(**data)
 
     def format_amount(self) -> str:
-        """Format amount as USDG with 6 decimal precision."""
-        return f"{self.amount_micro / 1_000_000:.6f} USDG"
+        """Format the x402 amount, in the chain's reference stablecoin.
+
+        amount_micro == 0 means unpriced (see signing.py's
+        _price_in_reference_micro), not free - shows the real requested
+        asset/amount from x402_data instead of a misleading "0.000000".
+        """
+        if self.amount_micro <= 0:
+            try:
+                entry = (self.x402_data or {}).get("accepts", [{}])[0]
+                asset = entry.get("asset", "unknown asset")
+                amount = entry.get("amount") or entry.get("maxAmountRequired", "?")
+            except (AttributeError, IndexError, TypeError):
+                asset, amount = "unknown asset", "?"
+            return f"{amount} units of {asset} (unpriced)"
+
+        from ..networks import resolve_network, REFERENCE_STABLECOIN
+
+        symbol = "USDG"
+        net_cfg = resolve_network(self.network) if self.network else None
+        if net_cfg:
+            symbol = REFERENCE_STABLECOIN.get(net_cfg.chain_id, symbol)
+        return f"{self.amount_micro / 1_000_000:.6f} {symbol}"
 
     def format_amount_precise(self) -> str:
         """Format amount with full 6-decimal precision for formal documents."""
-        return f"{self.amount_micro / 1_000_000:.6f} USDG"
+        return self.format_amount()
 
     def format_time(self) -> str:
-        """Format timestamp as MM-DD HH:MM (11 chars)."""
+        """Format for the history table's Time column, relative to today.
+
+        Today's rows show a clock time ("14:22"); older rows show a day and
+        abbreviated month ("19 Aug"). Two formats in one column only works if
+        they cannot be mistaken for each other, which is why the older form is
+        `19 Aug` rather than `08-19`: digits-separator-digits has the same
+        silhouette as a clock time at a glance, and a month name has none.
+
+        Both forms are ~6 characters against the old 11, which is what lets the
+        column give its width back to Activity. The full timestamp is still one
+        double-click away (format_datetime, shown in the details dialog) and is
+        what the CSV export writes, so nothing here loses information.
+
+        Converted to local time first. Timestamps are stored as UTC (see the
+        `datetime.now(timezone.utc)` calls in this module's constructors), and
+        this column previously rendered them raw - so a row was labelled with
+        its UTC clock time rather than the user's. That is wrong on its own,
+        and "is this today?" cannot be answered at all without converting.
+        """
         try:
             dt = datetime.fromisoformat(self.timestamp.replace('Z', '+00:00'))
-            return dt.strftime("%m-%d %H:%M")
         except (ValueError, AttributeError):
-            return self.timestamp[:11] if len(self.timestamp) >= 11 else self.timestamp
+            # An unparseable timestamp falls back to showing it raw. `or ""`
+            # because a None timestamp used to reach len() here and raise -
+            # a missing timestamp should render as an empty cell, not take the
+            # history table down with it.
+            return (self.timestamp or "")[:11]
+
+        local = _to_local(dt)
+
+        if local.date() == datetime.now().astimezone().date():
+            return local.strftime("%H:%M")
+        # %-d/%#d (no zero padding) is platform-specific, so pad manually to
+        # keep this identical on Windows and POSIX.
+        return f"{local.day} {local.strftime('%b')}"
 
     def format_date(self) -> str:
-        """Format timestamp as YYYY-MM-DD."""
+        """Format timestamp as YYYY-MM-DD, in local time."""
         try:
             dt = datetime.fromisoformat(self.timestamp.replace('Z', '+00:00'))
-            return dt.strftime("%Y-%m-%d")
+            return _to_local(dt).strftime("%Y-%m-%d")
         except (ValueError, AttributeError):
-            return self.timestamp[:10] if len(self.timestamp) >= 10 else self.timestamp
+            return (self.timestamp or "")[:10]
 
     def format_datetime(self) -> str:
-        """Format timestamp as YYYY-MM-DD HH:MM:SS."""
-        try:
-            dt = datetime.fromisoformat(self.timestamp.replace('Z', '+00:00'))
-            return dt.strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, AttributeError):
-            return self.timestamp
+        """Format timestamp as YYYY-MM-DD HH:MM:SS, in local time."""
+        return format_stamp(self.timestamp)
 
     # -------------------------------------------------------------------------
     # Type-aware display helpers (for unified history display)
@@ -481,7 +575,7 @@ class Transaction:
             amount = self.transfer_amount or "?"
             return f"Send {amount} {sym} to {self._short(self.recipient)}"
         # x402
-        return f"Pay {self.resource or self.request_url or 'unknown resource'}"
+        return f"Pay {self.format_amount()} for {self.resource or self.request_url or 'unknown resource'}"
 
     def display_amount(self) -> str:
         """The single value this row moved, or '—' for a row that moves

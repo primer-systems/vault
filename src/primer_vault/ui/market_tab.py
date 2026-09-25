@@ -431,7 +431,7 @@ class MarketTab(QWidget):
 
         lines.append("")
         lines.append("Use the x402 payment protocol. When you receive HTTP 402, "
-                      "sign the payment via Vault at localhost:4663/sign and retry with the PAYMENT-SIGNATURE header.")
+                      "sign the payment via Vault at localhost:9402/sign and retry with the PAYMENT-SIGNATURE header.")
 
         snippet = "\n".join(lines)
         QApplication.clipboard().setText(snippet)

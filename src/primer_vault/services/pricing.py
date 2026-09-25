@@ -119,15 +119,21 @@ def get_eth_usd(timeout: float = 8.0, url: str = COINGECKO_ETH_USD) -> float:
 
 
 def value_base_leg(base_token: str, amount_atomic: int, decimals: int,
-                   usdg_addr: str, weth_addr: str,
+                   stablecoin_addrs, weth_addr: str,
                    eth_usd: Optional[float] = None) -> float:
-    """Value a base-asset leg (USDG or WETH/ETH) in USDG notional.
+    """Value a base-asset leg (a trusted stablecoin, or WETH/ETH) in USD notional.
 
-    `base_token` must be USDG or WETH; the caller identifies which leg is the
-    base asset. Returns a float USDG amount (USDG is treated as $1).
+    `base_token` must be one of `stablecoin_addrs` or WETH; the caller
+    identifies which leg is the base asset. Returns a float USD amount
+    (each trusted stablecoin is treated as $1 - see
+    networks.get_trusted_stablecoin_addresses).
+
+    `stablecoin_addrs` accepts either a single address (str, kept for
+    backward compatibility) or an iterable of addresses.
     """
     human = Decimal(amount_atomic) / (Decimal(10) ** decimals)
-    if base_token.lower() == usdg_addr.lower():
+    addrs = [stablecoin_addrs] if isinstance(stablecoin_addrs, str) else list(stablecoin_addrs)
+    if any(base_token.lower() == addr.lower() for addr in addrs):
         return float(human)
     if base_token.lower() == weth_addr.lower():
         price = eth_usd if eth_usd is not None else get_eth_usd()

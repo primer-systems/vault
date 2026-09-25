@@ -22,7 +22,9 @@ from primer_vault.networks import TOKENS
 
 RHC = 4663
 USDG = TOKENS["USDG"].addresses[RHC]
-USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+# Ethereum mainnet - unsupported (chain 1 is not in NETWORKS, unlike Base,
+# which Vault supports as of 0.4).
+USDC_MAINNET = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 PAY_TO = "0x00000000000000000000000000000000000c0De0"
 
 TYPES = {
@@ -58,9 +60,9 @@ def x402_payload(amount, *, multi_offer=False):
     if multi_offer:
         accepts.insert(0, {
             "scheme": "exact",
-            "network": "eip155:8453",
+            "network": "eip155:1",
             "amount": "999999999",
-            "asset": USDC_BASE,
+            "asset": USDC_MAINNET,
             "payTo": "0x000000000000000000000000000000000000dEaD",
             "extra": {"name": "USD Coin", "version": "2"},
         })

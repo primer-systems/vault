@@ -179,6 +179,11 @@ class DefiRules:
     #: the rest being empty, test, or junk, most with a bespoke oracle nobody
     #: has vetted.
     #:
+    #: Holds one curator address per supported chain (see
+    #: networks.all_default_curators) rather than one flat choice - a curator
+    #: address only ever matches vaults on the chain it was read from, so the
+    #: combined list is safe to check against any chain a request names.
+    #:
     #: Named for its protocol because "curator" is a Morpho concept and does not
     #: generalise - Aave has no such role. The money limits above it are
     #: protocol-agnostic and stay flat; only the allowlist is protocol-shaped.

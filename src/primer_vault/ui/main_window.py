@@ -1163,7 +1163,7 @@ class MainWindow(QMainWindow):
     def on_approval_needed(self, request: SigningRequest):
         """Handle a signing request that needs manual approval."""
         self.update_activity(
-            f"Approval needed: {request.agent_name} ({request.agent_id}) requests {request.amount_micro/1_000_000:.6f} USDG",
+            f"Approval needed: {request.agent_name} ({request.agent_id}) requests {request.display_amount()}",
             is_warning=True
         )
 
@@ -1172,7 +1172,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'tray') and self.tray.isVisible():
                 self.tray.showMessage(
                     "Payment Approval Required",
-                    f"{request.agent_name} is requesting {request.amount_micro/1_000_000:.6f} USDG",
+                    f"{request.agent_name} is requesting {request.display_amount()}",
                     QSystemTrayIcon.MessageIcon.Information,
                     5000
                 )
@@ -1208,7 +1208,7 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
 
-        amount_str = f"{request.amount_micro/1_000_000:.6f} USDG"
+        amount_str = request.display_amount()
 
         # Show only the origin (scheme://host) of the payee/agent URL, never the
         # raw string. These fields are attacker-controlled; rendered whole, a
@@ -2007,14 +2007,21 @@ class MainWindow(QMainWindow):
             # Persist core-managed settings
             self.core.settings_manager.set_allow_lan(new_settings.get("allow_lan", False))
             self.core.settings_manager.set_verify_settlements(new_settings.get("verify_settlements", True))
-            # The RPC endpoint belongs to the core: quoting, trading, sending
-            # and settlement verification all resolve through it. Stored only
+            # The RPC endpoints belong to the core: quoting, trading, sending
+            # and settlement verification all resolve through them. Stored only
             # in the GUI's own settings file, this box tested the URL the user
             # typed, reported it reachable, and then changed nothing.
-            from ..networks import DEFAULT_NETWORK
+            #
+            # Per chain, from the dialog's own network tabs. An empty box means
+            # no override, which is None - that removes the key and restores
+            # the registry default rather than saving an empty string.
             from ..core.settings import DEFAULT_PORT
-            self.core.settings_manager.set_rpc_endpoint(
-                DEFAULT_NETWORK, new_settings.get("rhc_rpc", "").strip() or None)
+            for chain_id, endpoint in new_settings.get("rpc_endpoints", {}).items():
+                self.core.settings_manager.set_rpc_endpoint(chain_id, endpoint.strip() or None)
+            # The per-network kill switches. Unticking one rejects every
+            # request on that chain regardless of what any policy allows.
+            for chain_id, enabled in new_settings.get("enabled_networks", {}).items():
+                self.core.set_network_enabled(chain_id, enabled)
             # The port and the rate limit are the core's too: the daemon serves
             # the same agent API, and `vault config set port` writes the same
             # value. The GUI kept its own copies, so the window could listen on
@@ -2153,7 +2160,7 @@ class MainWindow(QMainWindow):
             ("3.", "Start the Server", "Settings > Network"),
             ("4.", "Register an Agent", "Agents tab"),
             ("5.", "Give your agent the provided configuration", ""),
-            ("6.", 'Direct your agent to <a href="http://localhost:4663/agent">http://localhost:4663/agent</a> for instructions', ""),
+            ("6.", 'Direct your agent to <a href="http://localhost:9402/agent">http://localhost:9402/agent</a> for instructions', ""),
         ]
 
         for num, text, hint in steps:

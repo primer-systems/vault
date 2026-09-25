@@ -49,8 +49,9 @@ class TestDamagedWalletIsReportedNotRaised:
 class TestGuiStartsWithADamagedWallet:
 
     def test_wallet_tab_builds_when_the_default_wallet_is_damaged(self, tmp_path):
-        """tabs.py -> 1198 -> 1175 runs during widget construction, so this
-        is the whole GUI failing to open, not one dialog misbehaving."""
+        """Loading the default wallet runs during widget construction, so a
+        damaged file must not crash the whole GUI on open, not just one
+        dialog."""
         pytest.importorskip("PyQt6")
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PyQt6.QtWidgets import QApplication

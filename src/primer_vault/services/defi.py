@@ -42,7 +42,10 @@ from web3.exceptions import Web3RPCError
 
 from ..models.defi import PositionRequest, PositionQuote, PositionResult
 from ..models.transaction import STATUS_REJECTED, Transaction
-from ..networks import NETWORKS, DEFAULT_NETWORK, TOKENS, get_morpho
+from ..networks import (NETWORKS, DEFAULT_NETWORK, get_morpho,
+                        get_reference_stablecoin_address,
+                        get_reference_stablecoin_decimals,
+                        get_trusted_stablecoin_addresses)
 from ..wallet.ledger import LedgerError
 from .dex import to_atomic
 from .morpho import (
@@ -312,7 +315,10 @@ class DefiService:
     # ---- exposure --------------------------------------------------------
 
     def _usdg_address(self, chain_id: int) -> Optional[str]:
-        return TOKENS["USDG"].addresses.get(chain_id)
+        return get_reference_stablecoin_address(chain_id)
+
+    def _trusted_stablecoin_addresses(self, chain_id: int) -> set[str]:
+        return {addr.lower() for addr in get_trusted_stablecoin_addresses(chain_id)}
 
     def _remembered_venues(self, chain_id: int, agent) -> list:
         """Venues this agent has supplied to before, rebuilt from their ids.
@@ -334,11 +340,13 @@ class DefiService:
                      cache_only: bool = False) -> Optional[float]:
         """What this address currently has deployed, in USD, read from chain.
 
-        USDG is the only asset counted, and it is treated as $1 - the same
-        assumption `pricing.value_base_leg` already makes. A venue denominated
-        in anything else contributes nothing, which is deliberately conservative:
-        a limit denominated in something Vault cannot price independently is a
-        limit an attacker can move.
+        Only the chain's trusted stablecoins are counted (USDG on RHC,
+        USDC+USDT on Base - networks.TRUSTED_STABLECOINS), each treated as
+        $1 - the same set and the same assumption `pricing.value_base_leg`
+        makes for trading. A venue denominated in anything else contributes
+        nothing, which is deliberately conservative: a limit denominated in
+        something Vault cannot price independently is a limit an attacker
+        can move.
 
         Returns None if the chain could not be read. That is unknown, not zero -
         treating an unreadable position as an empty one would let every limit
@@ -351,7 +359,7 @@ class DefiService:
         missing in the first place.
         """
         adapter = self._adapter(chain_id)
-        usdg = (self._usdg_address(chain_id) or "").lower()
+        trusted = self._trusted_stablecoin_addresses(chain_id)
         if cache_only:
             venue_list = self._cached_venues(chain_id, curators)
             if venue_list is None:
@@ -366,13 +374,12 @@ class DefiService:
             if venue.id.lower() in seen:
                 continue
             seen.add(venue.id.lower())
-            if isinstance(venue, VaultVenue) and venue.asset.lower() == usdg:
+            if isinstance(venue, VaultVenue) and venue.asset.lower() in trusted:
                 priced.append(venue)
-            elif isinstance(venue, MarketVenue) and venue.loan_token.lower() == usdg:
+            elif isinstance(venue, MarketVenue) and venue.loan_token.lower() in trusted:
                 priced.append(venue)
 
-        # One position read per USDG-denominated venue, independent of the
-        # others - run concurrently rather than one after another. Any single
+        # One position read per priced venue, run concurrently. Any single
         # unreadable venue makes the whole total unknown (see docstring), so
         # the first MorphoError found wins regardless of which worker hit it.
         def position(venue) -> float:
@@ -404,7 +411,8 @@ class DefiService:
         except Exception as e:
             logger.warning("could not read USDG balance for %s: %s", owner, e)
             return None
-        return int(raw) / 10 ** TOKENS["USDG"].decimals
+        decimals = get_reference_stablecoin_decimals(chain_id) or 6
+        return int(raw) / 10 ** decimals
 
     def reserved_exposure_for(self, agent_id: str) -> float:
         """USD this agent has promised to operations not yet visible on chain.
@@ -603,12 +611,12 @@ class DefiService:
                    chain_id: int) -> Optional[float]:
         """Value an amount in USD, or None if it cannot be valued.
 
-        Only USDG, and only at $1. Any other asset is unvaluable here, which
-        escalates to a human rather than proceeding - the same rule the trading
-        lane applies to a leg it cannot trust-price.
+        Only a trusted stablecoin (networks.TRUSTED_STABLECOINS), and only
+        at $1. Any other asset is unvaluable here, which escalates to a
+        human rather than proceeding - the same rule the trading lane
+        applies to a leg it cannot trust-price.
         """
-        usdg = self._usdg_address(chain_id)
-        if not usdg or asset.lower() != usdg.lower():
+        if asset.lower() not in self._trusted_stablecoin_addresses(chain_id):
             return None
         return amount_atomic / 10 ** decimals
 
@@ -807,7 +815,8 @@ class DefiService:
         }
 
     def handle_venues_request(self, agent_id: str,
-                              signature: Optional[str] = None) -> dict:
+                              signature: Optional[str] = None,
+                              position: Optional[dict] = None) -> dict:
         """What this agent may actually deposit into, and what it holds there.
 
         Published because the alternative is an agent finding out by being
@@ -816,8 +825,11 @@ class DefiService:
         wrong guess costs a round trip and reads as a policy failure.
 
         Authenticated like everything else - the answer depends on the caller's
-        policy, so it is not public.
+        policy, so it is not public. `position` carries only `chain_id` (or is
+        empty/omitted for the default network) - signed the same way a real
+        position is, so a chain selection can't be swapped in transit.
         """
+        position = position or {}
         agent = (self._policy_store.get_agent_by_id(agent_id)
                  if self._policy_store else None)
         if agent is None:
@@ -825,7 +837,7 @@ class DefiService:
                     "error": f"No agent with id {agent_id}"}
 
         if self._auth_verifier is not None:
-            auth_err = self._authenticate(agent, agent_id, signature, {})
+            auth_err = self._authenticate(agent, agent_id, signature, position)
             if auth_err is not None:
                 return auth_err
 
@@ -834,7 +846,11 @@ class DefiService:
             return {"status": "error", "code": error.get("code", "DEFI_DISABLED"),
                     "error": error.get("reason", "Morpho lending is not available")}
 
-        chain_id = DEFAULT_NETWORK
+        chain_id = position.get("chain_id", DEFAULT_NETWORK)
+        if get_morpho(chain_id) is None:
+            return {"status": "error", "code": "UNSUPPORTED_NETWORK",
+                    "error": f"No Morpho deployment configured for chain {chain_id}"}
+
         owner = agent.wallet_address
         adapter = self._adapter(chain_id)
 

@@ -12,10 +12,10 @@ from contextlib import redirect_stdout
 
 import pytest
 
-#: Flags that used to choose how Vault ran. There are no modes now - the
-#: edition decides the interface and the instance lock decides start-or-attach -
-#: so seeing any of these in the usage text means the help is describing a
-#: program that no longer exists.
+#: Flags for choosing how Vault ran under a mode system that no longer
+#: exists - the edition decides the interface and the instance lock decides
+#: start-or-attach instead. Seeing any of these in the usage text means the
+#: help is describing a program that no longer exists.
 DELETED_MODE_FLAGS = ("--cli", "--headless", "--gui", "--unattended",
                       "--admin-open", "--admin-port")
 

@@ -3,7 +3,7 @@
 Each test encodes the safe behaviour as its assertion:
 
 1. A second instance on one data directory is refused (instance lock).
-2. A second bind to a busy admin port fails, also on Windows.
+2. A second bind to a busy agent-API port fails, also on Windows.
 3. A failed settings save leaves the previous file intact and is reported.
 4. A corrupted wallet file is reported as damaged, not as "Wrong password",
    and every save keeps a `.previous` copy as the file-level recovery path.
@@ -69,18 +69,15 @@ def test_released_directory_can_be_reopened(temp_data_dir):
 
 
 # ---------------------------------------------------------------------------
-# a second bind to a busy admin port fails, also on Windows
+# a second bind to a busy agent-API port fails, also on Windows
 # ---------------------------------------------------------------------------
 
 def test_second_agent_api_bind_on_same_port_is_refused():
-    """On Windows, SO_REUSEADDR let a second bind to an actively-listening port
-    succeed, so "bind failed" never fired and Vault would announce an agent API
-    that something else was answering. The server uses SO_EXCLUSIVEADDRUSE on
-    Windows instead.
-
-    This used to be checked on the admin API, which no longer exists. The agent
-    API is where it matters now - and it always mattered more, since that is
-    the port agents actually send money through.
+    """On Windows, SO_REUSEADDR would let a second bind to an actively-listening
+    port succeed, so "bind failed" would never fire and Vault would announce an
+    agent API that something else was answering. The server uses
+    SO_EXCLUSIVEADDRUSE on Windows instead - this is the port agents send money
+    through, so a silent double-bind here is the one that matters most.
     """
     from primer_vault.services.server import ThreadedHTTPServer, AgentRequestHandler
 

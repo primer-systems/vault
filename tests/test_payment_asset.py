@@ -1,14 +1,28 @@
 """
 x402 payment asset tests.
 
-Vault denominates every spending limit in USDG and reads the requested amount as
-micro-USDG. The asset is named by whoever issued the 402 response, and EIP-3009
-is an open standard - anyone can deploy a token implementing it with any number
-of decimals. A token with fewer than six decimals would make a large payment
-count as a small one against the daily and per-request limits.
+0.4 rewrite (2026-09-23): Vault no longer restricts x402 to one allowlisted
+asset per chain - see Planning-private/vault/0.4/2026-09-23-multi-network-base.md.
+x402 itself is asset-agnostic per request (the resource server names whatever
+asset it wants), so Vault will sign for any asset on a supported chain.
 
-The asset is therefore checked against the chain's USDG address before the amount
-is interpreted, and again immediately before signing.
+The safety property this file protects has not changed, only the mechanism:
+Vault denominates every spending limit in one reference stablecoin per chain
+(USDG on RHC, USDC on Base) and reads the requested amount as micro-units of
+it. A token with fewer decimals than assumed, or one with no real value,
+would make a large payment count as a small one against the daily and
+per-request limits if its raw amount were ever taken at face value.
+
+Previously this was prevented by refusing anything that was not exactly the
+allowlisted asset. Now it is prevented by pricing: the reference stablecoin
+itself is 1:1 (no RPC call - _price_in_reference_micro reads its raw amount
+directly, which is safe only because it IS the 6-decimal reference asset).
+Any other asset must be priced via an on-chain quote before its amount is
+trusted; a token that cannot be priced (no real liquidity - the case for an
+attacker-deployed token with no genuine pool) is never assigned a value. It
+is also never treated as free: it is routed to mandatory human approval and
+excluded from limit accounting entirely (amount_micro=0), rather than
+auto-processed at a guessed or wrong scale.
 """
 
 import sys
@@ -22,9 +36,14 @@ from primer_vault.networks import TOKENS
 from primer_vault.services.signing import SigningService
 
 USDG = TOKENS["USDG"].addresses[4663]
+USDC_BASE = TOKENS["USDC"].addresses[8453]
 RHC = 4663
+BASE = 8453
 
-# An attacker-deployed EIP-3009 token. Nothing stops anyone shipping one.
+# An attacker-deployed EIP-3009 token. Nothing stops anyone shipping one, and
+# it has no real Uniswap liquidity - _quote_to_reference_micro correctly
+# returns None for it in practice. Tests below monkeypatch that specific
+# outcome rather than hit a real RPC, to stay fast and offline.
 HOSTILE_TOKEN = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 
@@ -45,69 +64,75 @@ def x402(asset=USDG, amount="1000000", network="eip155:4663"):
     }
 
 
-class TestAssetCheck:
-    """Direct tests of the guard."""
+class TestReferenceStablecoinPricesDirectly:
+    """The reference stablecoin needs no quote - its raw atomic amount IS the
+    micro amount, since it's the 6-decimal asset limits are denominated in."""
 
     @pytest.fixture
     def service(self):
         return SigningService()
 
-    def test_usdg_is_accepted(self, service):
-        assert service._check_asset_supported(RHC, USDG) is None
+    def test_usdg_is_priced_1to1(self, service):
+        assert service._price_in_reference_micro(RHC, USDG, "1000000") == 1_000_000
 
     def test_usdg_accepted_regardless_of_case(self, service):
         """Addresses arrive in whatever case the merchant chose to send."""
-        assert service._check_asset_supported(RHC, USDG.lower()) is None
-        assert service._check_asset_supported(RHC, USDG.upper()) is None
+        assert service._price_in_reference_micro(RHC, USDG.lower(), "1000000") == 1_000_000
+        assert service._price_in_reference_micro(RHC, USDG.upper(), "1000000") == 1_000_000
 
-    def test_arbitrary_token_is_rejected(self, service):
-        error = service._check_asset_supported(RHC, HOSTILE_TOKEN)
-        assert error is not None
-        assert "USDG" in error
+    def test_usdc_on_base_is_priced_1to1(self, service):
+        """Base's reference stablecoin is USDC, not USDG - it must price the
+        same way USDG does on RHC."""
+        assert service._price_in_reference_micro(BASE, USDC_BASE, "2500000") == 2_500_000
 
-    @pytest.mark.parametrize("asset", [
-        "",
-        None,
-        "0x0000000000000000000000000000000000000000",
-        "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d169",  # USDG, last digit changed
-    ])
-    def test_missing_or_near_miss_addresses_rejected(self, service, asset):
-        assert service._check_asset_supported(RHC, asset) is not None
+    def test_amount_is_read_as_six_decimals(self, service):
+        """1_000_000 atomic units == $1.00, which is only true at 6 decimals -
+        both USDG and USDC are 6-decimal tokens."""
+        assert service._price_in_reference_micro(RHC, USDG, "1000000") == 1_000_000
 
-    def test_chain_without_a_configured_asset_is_rejected(self, service):
-        """Base (8453) is not configured, so nothing on it can be paid."""
-        error = service._check_asset_supported(8453, USDG)
-        assert error is not None
-        assert "8453" in error
+    def test_unreasonably_large_amount_is_rejected(self, service):
+        with pytest.raises(ValueError):
+            service._price_in_reference_micro(RHC, USDG, str(10**16))
 
-    def test_unknown_chain_is_rejected(self, service):
-        assert service._check_asset_supported(0, USDG) is not None
+    @pytest.mark.parametrize("amount", ["", None, "not-a-number", "-5", "0"])
+    def test_malformed_or_nonpositive_amount_is_rejected(self, service, amount):
+        with pytest.raises(ValueError):
+            service._price_in_reference_micro(RHC, USDG, amount)
 
 
-class TestDecimalAssumptionIsGuarded:
-    """The amount is read as micro-USDG, which only holds for a 6-decimal asset.
-
-    These pin the connection between the two: the reason the assumption is safe
-    is that the guard runs first. If the guard is removed, these fail.
-    """
+class TestUnpriceableAssetIsNeverGuessedAt:
+    """A token _price_in_reference_micro can't value (no real quote route)
+    must never be silently assigned a value - the caller must fail closed."""
 
     @pytest.fixture
     def service(self):
-        return SigningService()
+        svc = SigningService()
+        # No real Uniswap liquidity for an attacker-deployed token - this is
+        # what _quote_to_reference_micro returns in that case in practice.
+        # Monkeypatched here to keep the test fast and offline rather than
+        # hitting a real RPC/quoter.
+        svc._quote_to_reference_micro = lambda *a, **k: None
+        return svc
 
-    def test_amount_is_read_as_six_decimals(self, service):
-        """1_000_000 atomic units == $1.00, which is only true at 6 decimals."""
-        assert service._bounded_amount_micro("1000000") == 1_000_000
+    def test_hostile_token_cannot_be_priced(self, service):
+        assert service._price_in_reference_micro(RHC, HOSTILE_TOKEN, "1000000") is None
 
-    def test_a_low_decimal_token_cannot_reach_the_amount_reader(self, service):
-        """A 2-decimal token would make $1,000 read as $0.10.
+    def test_chain_without_a_reference_stablecoin_cannot_price_anything(self, service):
+        """A chain with no REFERENCE_STABLECOIN entry (unsupported chain)
+        has nothing to price against."""
+        assert service._price_in_reference_micro(999999, USDG, "1000000") is None
 
-        It never gets that far: the asset is refused first.
-        """
-        assert service._check_asset_supported(RHC, HOSTILE_TOKEN) is not None
+    def test_a_low_decimal_token_is_never_taken_at_face_value(self, service):
+        """A 2-decimal hostile token's raw '1000000' is NOT 1_000_000
+        micro-units of anything real - pricing it (rather than assuming
+        1:1) is exactly what prevents a mis-scaled amount from reaching the
+        limit checks. Since it can't be priced, the answer is None, not a
+        guessed number."""
+        priced = service._price_in_reference_micro(RHC, HOSTILE_TOKEN, "1000000")
+        assert priced is None
 
 
-class TestSigningRefusesUnsupportedAssets:
+class TestSigningRoutesUnpriceableAssetsToApproval:
     """End to end through the request handler."""
 
     @pytest.fixture
@@ -126,24 +151,21 @@ class TestSigningRefusesUnsupportedAssets:
             per_request_max_micro=50_000_000, auto_approve_below_micro=10_000_000)
         address = core.get_wallet_addresses()[0]
         core.commission_agent(agent.code, policy.id, address["address"])
-        return core._signing_service, agent, token
+        svc = core._signing_service
+        # See TestUnpriceableAssetIsNeverGuessedAt - avoid a real RPC call.
+        svc._quote_to_reference_micro = lambda *a, **k: None
+        return svc, agent, token
 
-    def test_hostile_token_is_refused(self, service):
+    def test_hostile_token_is_queued_for_approval_not_auto_processed(self, service):
         svc, agent, token = service
         result = svc.handle_sign_request(
             agent_id=agent.id, signature=token, x402_data=x402(asset=HOSTILE_TOKEN))
-        assert result["status"] == "error"
-        assert result["code"] == "UNSUPPORTED_ASSET"
-
-    def test_refusal_is_recorded_for_audit(self, service):
-        """Rejections leave a receipt, like every other policy refusal."""
-        svc, agent, token = service
-        result = svc.handle_sign_request(
-            agent_id=agent.id, signature=token, x402_data=x402(asset=HOSTILE_TOKEN))
-        assert "transaction_id" in result
+        assert result["status"] == "pending"
+        assert result["code"] == "APPROVAL_REQUIRED"
 
     def test_hostile_token_does_not_consume_the_daily_limit(self, service):
-        """A refused payment must not move the agent's spend counter."""
+        """An unpriced payment must not move the agent's spend counter -
+        it was never assigned a value to debit."""
         svc, agent, token = service
         before = svc._policy_store.get_agent_by_id(agent.id).spent_today_micro
         svc.handle_sign_request(
@@ -151,13 +173,11 @@ class TestSigningRefusesUnsupportedAssets:
         after = svc._policy_store.get_agent_by_id(agent.id).spent_today_micro
         assert after == before
 
-    def test_usdg_is_not_blocked_by_the_guard(self, service):
-        """The guard must not break the supported path."""
+    def test_usdg_is_not_blocked_and_can_auto_approve(self, service):
+        """The reference-asset path must not be affected by the pricing
+        change - it still auto-approves below threshold as before."""
         svc, agent, token = service
         result = svc.handle_sign_request(
             agent_id=agent.id, signature=token, x402_data=x402())
-        assert result.get("code") != "UNSUPPORTED_ASSET"
-
-    def test_http_status_is_forbidden(self):
-        from primer_vault.services.server import get_http_status_for_error
-        assert get_http_status_for_error("UNSUPPORTED_ASSET") == 403
+        assert result.get("code") != "APPROVAL_REQUIRED"
+        assert result["status"] == "success"

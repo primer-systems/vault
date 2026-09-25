@@ -285,10 +285,16 @@ def generate_intent_mandate(
             "address": wallet_address,
         },
 
-        # Issuer (Vault app). This is the app's version - the schema's own
-        # version is the "ap2.primer/v0.1" above, and the two move separately.
+        # Issuer. The product, not the edition: a mandate is issued by Vault,
+        # and which skin the operator happened to be using when they
+        # commissioned the agent is neither the merchant's business nor stable
+        # (the same agent can be managed from either). It said "VaultDesktop"
+        # until 0.3, when there stopped being only one edition to be.
+        #
+        # This is the app's version - the schema's own version is the
+        # "ap2.primer/v0.1" above, and the two move separately.
         "issuer": {
-            "type": "VaultDesktop",
+            "type": "Vault",
             "version": __version__,
         },
     }

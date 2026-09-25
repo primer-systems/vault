@@ -1,0 +1,371 @@
+---
+name: vault-1claw
+description: Store, read, and rotate secrets in 1Claw's HSM-backed vault; sign and broadcast on-chain transactions via the Intents API; request human approvals for actions outside your policy. 1Claw holds the keys — you never do. The agent decides what to sign; 1Claw enforces the human's guardrails, signs it, and broadcasts it or rejects it.
+license: MIT
+compatibility:
+  models: ["*"]
+  runtimes: ["*"]
+metadata:
+  author: 1Claw
+  version: 0.1.0
+  homepage: https://1claw.co
+  repository: https://github.com/1clawAI/1claw
+---
+
+# 1Claw — Secrets & On-Chain Signing
+
+You can store secrets, sign transactions, and request human approvals through
+1Claw. You decide the action; 1Claw is an HSM-backed vault that holds the keys,
+checks every request against the human's guardrails, and either executes, rejects,
+or escalates to the user. 1Claw never decides *what* to do — it only permits,
+rejects, or asks.
+
+The 1Claw API key is in `ONECLAW_AGENT_API_KEY` (starts with `ocv_`).
+The API base is `https://api.1claw.co`.
+
+## Two integration paths
+
+1. **MCP server** — if Vault's MCP client is available, run
+   `npx @1claw/mcp@latest` with `ONECLAW_AGENT_API_KEY` set. It auto-discovers
+   your agent ID and vault, handles token refresh, and exposes tools based on
+   your entitlements. Tools that don't appear mean you're not entitled; don't
+   try to call them.
+2. **REST API** — direct HTTP calls. Documented below.
+
+Everything in MCP is a wrapper around the REST API. If you can use MCP, prefer
+it; if not, the REST path does everything MCP does.
+
+## Authenticate first
+
+Exchange your API key for a short-lived JWT. You'll use this JWT for every
+subsequent call.
+
+```
+POST https://api.1claw.co/v1/auth/agent-token
+Content-Type: application/json
+
+{ "api_key": "ocv_..." }
+```
+
+The `agent_id` field is optional — the server resolves the agent from the key's
+stored prefix.
+
+Response:
+
+```json
+{
+  "token": "eyJ...",
+  "agent_id": "uuid",
+  "vault_ids": ["uuid"],
+  "entitlements": {
+    "intents_api": true,
+    "execution_intents": false,
+    "memory": true,
+    "shroud": false,
+    "cards": false,
+    "treasury_signer": false,
+    "has_delegations": false,
+    "discoverable": false
+  }
+}
+```
+
+What to do with each field:
+
+- **`token`** — attach as `Authorization: Bearer <token>` on every request.
+  Tokens last 1–2 hours. Re-exchange when you get a 401.
+- **`vault_ids`** — the vaults you can access. Use the first unless you have a
+  reason to pick another.
+- **`entitlements`** — what you're allowed to do. `intents_api: true` means you
+  can sign transactions. `memory: true` means you can use agent memory. If a
+  capability is `false`, the endpoints for it will return 403.
+
+## Know your limits before you act
+
+`GET /v1/agents/{agent_id}` returns the guardrails the human set, plus your
+current spend. Check it at the start of a task rather than discovering a ceiling
+by hitting it.
+
+The response includes:
+
+```json
+{
+  "tx_to_allowlist": ["0x..."],
+  "tx_max_value_eth": "1.0",
+  "tx_daily_limit_eth": "10.0",
+  "tx_allowed_chains": ["ethereum", "base"],
+  "tx_spent_today_by_chain": { "ethereum": "0.5", "base": "0.0" },
+  "tx_count_today": 3,
+  "tx_max_per_day": 100
+}
+```
+
+What to do with each:
+
+- **`tx_to_allowlist`** — if non-empty, you can only send to these addresses.
+  A transaction to an unlisted address is **rejected**.
+- **`tx_max_value_eth`** — a single transaction valued above this is rejected.
+  Split it.
+- **`tx_daily_limit_eth`** — rolling 24h spend cap. Once hit, all transactions
+  are rejected until the window rolls forward.
+- **`tx_spent_today_by_chain`** — what you've already spent today per chain.
+  Pace against the remaining budget (`tx_daily_limit_eth` minus the sum), not
+  the total limit.
+- **`tx_allowed_chains`** — if non-empty, you can only transact on these chains.
+- **`tx_max_per_day`** — daily transaction count cap. `null` means unlimited.
+- **`tx_count_today`** — how many you've already used today.
+
+The human sets all of these. You cannot change them, and nothing you send in a
+request overrides them.
+
+## Secrets
+
+Store and retrieve credentials, API keys, configuration, and any sensitive data.
+
+**List secrets:**
+
+```
+GET /v1/vaults/{vault_id}/secrets?prefix=config/
+```
+
+Returns `{ secrets: [{ path, type, created_at, updated_at }] }`. Omit `prefix`
+to list everything.
+
+**Read a secret:**
+
+```
+GET /v1/vaults/{vault_id}/secrets/{path}
+```
+
+Returns `{ value, type, version, created_at }`.
+
+**Write a secret:**
+
+```
+PUT /v1/vaults/{vault_id}/secrets/{path}
+Content-Type: application/json
+
+{ "value": "sk-abc123...", "type": "api_key" }
+```
+
+Every PUT to an existing path creates a new version. Old versions are preserved
+and can be listed with `GET /v1/vaults/{vault_id}/secret-versions/{path}`.
+
+**Rotate (server-generated):**
+
+```
+POST /v1/vaults/{vault_id}/secret-rotate/{path}
+Content-Type: application/json
+
+{ "length": 32, "charset": "base64" }
+```
+
+Options: `hex`, `base64`, `alphanumeric`, `ascii`. Default length 32. The old
+value is kept as a prior version.
+
+Secret paths are validated: no `..`, no null bytes, no zero-width characters.
+Invalid paths return 400.
+
+## On-chain signing (Intents API)
+
+Requires `intents_api: true` in your entitlements.
+
+### Submit a transaction (sign + broadcast)
+
+```
+POST /v1/agents/{agent_id}/transactions
+Content-Type: application/json
+Idempotency-Key: <uuid>
+
+{
+  "chain": "base",
+  "to": "0x...",
+  "value": "0.01",
+  "simulate_first": true
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `chain` | `ethereum`, `base`, `polygon`, `arbitrum`, `optimism`, `sepolia`, `bitcoin`, `solana`, `xrp`, `cardano`, `tron` |
+| `to` | Recipient address |
+| `value` | Major-unit decimal string (`"0.01"` = 0.01 ETH/SOL/BTC/etc.) |
+| `data` | Hex calldata (EVM only). Or provide `token_mint` and the server builds ERC-20 `transfer` calldata |
+| `token_mint` | ERC-20/SPL/TRC-20 contract address — server builds the transfer calldata |
+| `simulate_first` | Run Tenderly simulation before signing. Reverts → 422, tx NOT signed |
+| `max_fee_per_gas` | EIP-1559: when provided, uses Type 2 signing |
+| `Idempotency-Key` | Prevents duplicate submissions on retry. Single-use within 24h |
+
+**Sign only (no broadcast):**
+
+```
+POST /v1/agents/{agent_id}/transactions/sign
+```
+
+Same body. Returns `signed_tx` hex and `tx_hash` — you broadcast it yourself.
+
+**Unified sign endpoint:**
+
+```
+POST /v1/agents/{agent_id}/sign
+Content-Type: application/json
+
+{
+  "intent_type": "personal_sign",
+  "chain": "ethereum",
+  "message": "0x48656c6c6f"
+}
+```
+
+`intent_type` values: `transaction`, `personal_sign`, `typed_data`,
+`eip712_digest`, `digest`.
+
+### Handle the response
+
+- **`broadcast`** — the transaction is on-chain. You get `tx_hash`,
+  `signed_tx`, `from`.
+- **`sign_only`** — signed but not broadcast. You get `signed_tx`, `tx_hash`,
+  `from`. Broadcast it yourself via your own RPC.
+- **`simulation_failed` (422)** — Tenderly says it would revert. Do not submit.
+  `simulation_result` has the revert reason.
+
+If you get 403, the `detail` field tells you which guardrail blocked it.
+Do not retry without changing the request.
+
+## Approvals
+
+When you need human authorization for something outside your policy, request
+an approval and poll for the decision.
+
+**Request:**
+
+```
+POST /v1/approvals/request
+Content-Type: application/json
+
+{
+  "action": "rebalance.execute",
+  "summary": "Transfer 5 ETH to 0xABC...",
+  "reason": "Rebalancing portfolio per weekly schedule",
+  "risk_tier": 2
+}
+```
+
+The approval is directed to the human who created you. `action` must contain a
+dot (e.g. `namespace.verb`). `risk_tier` defaults to 1; higher tiers require
+stronger re-authentication from the human.
+
+**Poll:**
+
+```
+GET /v1/approvals/{approval_id}/status
+```
+
+Returns `{ status, expires_at }`.
+
+- **`pending`** — the human hasn't decided yet. Poll every 30–60 seconds.
+- **`approved`** — proceed with the action.
+- **`denied`** — stop. Do not retry the same request.
+- **`expired`** — the approval window (72h) closed. Resubmit if the action is
+  still worth doing.
+
+**Cancel (if you no longer need it):**
+
+```
+POST /v1/approvals/{approval_id}/cancel
+```
+
+First answer wins — if the human already decided, cancel is a no-op.
+
+## x402 billing
+
+When your monthly quota is exceeded (or you're calling without authentication),
+the API returns HTTP 402 with payment options:
+
+```json
+{
+  "x402Version": 1,
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "eip155:8453",
+      "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "maxAmountRequired": "4500",
+      "payTo": "0x...",
+      "extra": { "name": "USD Coin", "version": "2" }
+    },
+    {
+      "scheme": "exact",
+      "network": "eip155:4663",
+      "asset": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+      "maxAmountRequired": "4500",
+      "payTo": "0x...",
+      "extra": { "name": "Global Dollar", "version": "1" }
+    }
+  ]
+}
+```
+
+Pick whichever rail you can pay on. If you have Vault's `vault-x402-payment`
+skill, this is exactly the shape it handles — forward the accept you chose to
+Vault's `/sign` endpoint as `x402_data` rather than building the payment
+yourself. Otherwise: sign an EIP-3009 `TransferWithAuthorization` for the
+chosen asset on its chain, base64-encode the signed payload, and send it as
+the `X-PAYMENT` header when you replay the original request. The `extra`
+object is the EIP-712 domain the signature must use.
+
+| Network | Chain ID | Asset | Decimals | EIP-712 domain |
+|---------|----------|-------|----------|----------------|
+| Base | 8453 | USDC `0x8335...2913` | 6 | `("USD Coin", "2")` |
+| Robinhood Chain | 4663 | USDG `0x5fc5...d168` | 6 | `("Global Dollar", "1")` |
+
+**Prices (free-tier x402, USD):**
+
+| Operation | USD |
+|-----------|-----|
+| Read secret | $0.0045 |
+| Write secret | $0.0225 |
+| Simulate tx | $0.225 |
+| Sign/submit tx | $0.225 |
+| Generic API call | $0.001 |
+
+Authenticated agents on a paid plan get higher monthly quotas and lower
+per-call overage rates. x402 is the overage fallback, not the expected path.
+
+## Error codes
+
+| Status | Meaning | What to do |
+|--------|---------|-----------|
+| 400 | Bad request | Fix the request body. `detail` says what's wrong |
+| 401 | Token expired or revoked | Re-exchange the API key via `/v1/auth/agent-token` |
+| 402 | Payment required | Pay via x402 or wait for the monthly quota to reset |
+| 403 | Policy / guardrail blocked | Read `detail` — retrying unchanged cannot succeed |
+| 404 | Not found | Check `vault_id`, `path`, or `agent_id` |
+| 409 | Conflict / duplicate | Idempotency collision — use the cached response |
+| 422 | Simulation reverted | Do not submit the transaction. Check `simulation_result` |
+| 429 | Rate limited | Back off per the `Retry-After` header |
+
+All error responses include a `detail` field with a human-readable explanation.
+
+## Important constraints
+
+- **This is a separate wallet from Vault's.** 1Claw holds its own keys under
+  its own custody; it is not another way to move funds out of the wallet Vault
+  manages, and Vault's network kill switch and policies have no visibility
+  into what 1Claw authorizes. Treat the two as independent trust boundaries
+  with independent human-set limits, not two doors to the same funds.
+- **You cannot update your own configuration.** Guardrails, signing key
+  provisioning, entitlement toggles, and delegation policies are human-only.
+  Attempting it returns 403.
+- **System vault reads are blocked.** `__agent-keys` and `__treasury-keys`
+  vaults return 403. Private keys can only be accessed through designated
+  export endpoints by the human.
+- **Private key reads are blocked when Intents API is on.** The point is that
+  you sign through the server, not by reading keys. If you need a signature,
+  use `/v1/agents/{id}/sign` or `/v1/agents/{id}/transactions`.
+- **Tokens are short-lived.** Re-exchange on 401. Do not cache for more than
+  1 hour.
+- **Idempotency keys are single-use.** A duplicate key within 24h returns the
+  cached response (200). An in-flight duplicate returns 409.
+
+**NEVER output, log, or share your `ONECLAW_AGENT_API_KEY` or JWT token.**

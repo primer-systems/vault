@@ -5,6 +5,7 @@ History command implementations.
 from typing import TYPE_CHECKING
 
 from .result import CommandResult
+from ..models.transaction import format_stamp
 
 if TYPE_CHECKING:
     from ..core import Vault
@@ -109,11 +110,24 @@ Subcommands:
             # One line per row, built from the same activity sentence the
             # desktop UI and CSV export use - one place formatting lives,
             # rather than a third re-implementation per type here.
-            lines.append(f"  {tx.id[:8]}  {agent}  {tx.display_activity()}  [{tx_type}/{status}]")
+            #
+            # The timestamp is local, and fuller than the Desktop column's
+            # abbreviation: a terminal has width to spare and no tooltip or
+            # double-click to fall back on, so the date has to be on the line
+            # itself. This listing previously showed no time at all - the only
+            # way to tell when a row happened was `history show <id>`.
+            when = format_stamp(tx.timestamp, "%Y-%m-%d %H:%M")
+            lines.append(
+                f"  {when:16}  {tx.id[:8]}  {agent}  {tx.display_activity()}  [{tx_type}/{status}]"
+            )
 
         return CommandResult.ok("\n".join(lines), data={"transactions": [
             {
                 "id": tx.id,
+                # Raw stored value - UTC with its offset, not the localised
+                # string the human-readable lines show. A machine consumer
+                # wants the unambiguous one, same as the CSV export.
+                "timestamp": tx.timestamp,
                 "type": getattr(tx, 'type', 'x402'),
                 "agent_name": tx.agent_name,
                 "amount": tx.amount_micro / 1_000_000,
@@ -141,7 +155,10 @@ Subcommands:
             f"  Agent:      {match.agent_name or 'unknown'}",
             f"  Status:     {match.status}",
             f"  Network:    {match.network}",
-            f"  Created:    {match.timestamp[:19] if match.timestamp else 'Unknown'}",
+            # Local time, like the rest of the app's human-facing output. This
+            # sliced the raw ISO string before, which showed UTC - and did so
+            # unlabelled, so there was no way to tell from the output.
+            f"  Created:    {format_stamp(match.timestamp) or 'Unknown'}",
         ]
 
         if tx_type == 'trade':

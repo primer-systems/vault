@@ -39,14 +39,11 @@ def test_a_second_primer_vault_attaches_instead_of_being_refused(tmp_path):
     """README.md, "Single Instance".
 
     One process per data directory, because two would each save whole files and
-    erase the other's spend records and seeds. What used to follow from that was
-    a refusal: a second `primer-vault` printed "Vault is already running" and
-    stopped, and the only way in was an unauthenticated HTTP port that shipped
-    switched off.
-
-    It now attaches. The lock is no longer an error path, it is the router - and
-    an engine started by the system at boot has to be reachable, or a queued
-    approval can never be answered.
+    erase the other's spend records and seeds. A second `primer-vault` attaches
+    to the running one instead of being refused: the lock is the router, not an
+    error path, which is what lets an engine started by the system at boot stay
+    reachable - a queued approval has to be answerable from a second command,
+    not just from the one that started the engine.
     """
     from primer_vault.core import Vault
     from primer_vault.commands import CommandHandler

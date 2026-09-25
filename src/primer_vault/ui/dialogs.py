@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLine
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread
 from PyQt6.QtGui import QFont
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -131,11 +131,12 @@ def copy_sensitive_to_clipboard(text: str, parent: QWidget = None, timeout_sec: 
         FramelessMessageBox.information(parent, "Copied", "Copied to clipboard.")
 from ..models import SpendPolicy, Agent, TradingRules
 from ..models.policy import DefiRules
-from ..models.transaction import STATUS_SETTLED
+from ..models.transaction import STATUS_SETTLED, format_stamp
 from ..version import USER_AGENT
 from ..wallet import WalletInfo, AddressEntry
 from ..networks import (NETWORKS, DEFAULT_NETWORK, format_address,
-                        resolve_network, get_dex)
+                        resolve_network, get_dex, get_network)
+from .network_icons import network_icon
 from ..utils import agent_config_snippet
 
 # Type alias for wallet info objects (both old and new)
@@ -1293,11 +1294,17 @@ class ViewInstructionsDialog(FramelessDialog):
 # New Policy Dialog
 # ============================================
 
-#: Where a user goes to see what Steakhouse currently runs. The slug is part
-#: of the route - the address alone lands on a generic page - so it is written
-#: out rather than built from the address.
-STEAKHOUSE_URL = ("https://app.morpho.org/robinhood-chain/vault/"
-                  "0xBeEff033F34C046626B8D0A041844C5d1A5409dd/steakhouse-usdg")
+#: Where a user goes to see what Steakhouse currently runs, per network. The
+#: slug is part of the route - the address alone lands on a generic page - so
+#: each is written out rather than built from the address. "Restrict to
+#: Steakhouse" is a single checkbox across every network a policy covers, so
+#: both need a link.
+STEAKHOUSE_URLS = {
+    4663: ("https://app.morpho.org/robinhood-chain/vault/"
+           "0xBeEff033F34C046626B8D0A041844C5d1A5409dd/steakhouse-usdg"),
+    8453: ("https://app.morpho.org/base/vault/"
+           "0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183/steakhouse-usdc"),
+}
 
 
 class NewPolicyDialog(FramelessDialog):
@@ -1334,6 +1341,9 @@ class NewPolicyDialog(FramelessDialog):
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
+        # General tab (FAR LEFT) - network scope, shared across every lane
+        self._create_general_tab(policy)
+
         # Trading tab (LEFT)
         self._create_trading_tab(policy)
 
@@ -1350,6 +1360,57 @@ class NewPolicyDialog(FramelessDialog):
         buttons.accepted.connect(self.validate_and_accept)
         buttons.rejected.connect(self.reject)
         main_layout.addWidget(buttons)
+
+    def _create_general_tab(self, policy: SpendPolicy = None):
+        """General tab: network scope, shared by every lane. No default -
+        Save is blocked until at least one network is checked."""
+        from ..networks import NETWORKS
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+
+        group = QGroupBox("Networks")
+        group_layout = QVBoxLayout(group)
+
+        self.network_all_checkbox = QCheckBox("All enabled networks")
+        group_layout.addWidget(self.network_all_checkbox)
+
+        self._network_checkboxes: dict[int, QCheckBox] = {}
+        existing_networks = set(policy.networks) if policy and policy.networks else set()
+        for chain_id, cfg in sorted(NETWORKS.items(), key=lambda kv: kv[1].display_name):
+            cb = QCheckBox(f"{cfg.display_name} ({chain_id})")
+            if chain_id in existing_networks:
+                cb.setChecked(True)
+            group_layout.addWidget(cb)
+            self._network_checkboxes[chain_id] = cb
+
+        # "All" checks every box; resolves to an explicit list at save time,
+        # not a stored sentinel.
+        def _on_all_toggled(checked):
+            for cb in self._network_checkboxes.values():
+                cb.setChecked(checked)
+
+        self.network_all_checkbox.toggled.connect(_on_all_toggled)
+        if existing_networks and existing_networks == set(NETWORKS.keys()):
+            self.network_all_checkbox.setChecked(True)
+
+        layout.addWidget(group)
+        layout.addStretch()
+
+        help_label = QLabel(
+            "Which networks this policy authorizes. Applies to every lane "
+            "(Trading, Morpho, x402) - at least one network is required."
+        )
+        help_label.setWordWrap(True)
+        help_label.setProperty("role", "hint")
+        layout.addWidget(help_label)
+
+        self.tabs.addTab(tab, "General")
+
+    def _selected_networks(self) -> list[int]:
+        """Explicit list of checked networks, in registry order."""
+        return [chain_id for chain_id, cb in self._network_checkboxes.items() if cb.isChecked()]
 
     def _create_trading_tab(self, policy: SpendPolicy = None):
         """Create the Trading tab with enable toggle and fields."""
@@ -1503,8 +1564,10 @@ class NewPolicyDialog(FramelessDialog):
         form.addRow(self.defi_restrict)
 
         restrict_hint = QLabel(
-            f'<a href="{STEAKHOUSE_URL}">Steakhouse\'s vaults and the markets '
-            f'they lend into</a>')
+            'Steakhouse\'s vaults and the markets they lend into, on '
+            f'<a href="{STEAKHOUSE_URLS[4663]}">Robinhood Chain</a> or '
+            f'<a href="{STEAKHOUSE_URLS[8453]}">Base</a>'
+        )
         restrict_hint.setOpenExternalLinks(True)
         restrict_hint.setProperty("role", "hint")
         form.addRow("", restrict_hint)
@@ -1608,12 +1671,11 @@ class NewPolicyDialog(FramelessDialog):
         """
         if not self.defi_enabled.isChecked():
             return None
-        from ..networks import DEFAULT_NETWORK, get_morpho
-        config = get_morpho(DEFAULT_NETWORK)
+        from ..networks import all_default_curators
         return DefiRules(
             enabled=True,
             restrict_to_steakhouse=self.defi_restrict.isChecked(),
-            morpho_curators=list(config.default_curators) if config else [],
+            morpho_curators=all_default_curators(),
             max_deposit_usd=self.defi_max_deposit_input.value(),
             max_total_deployed_usd=self.defi_max_total_input.value(),
             max_deployed_percent=(self.defi_percent_input.value()
@@ -1812,6 +1874,13 @@ class NewPolicyDialog(FramelessDialog):
             )
             return
 
+        if not self._selected_networks():
+            FramelessMessageBox.warning(
+                self, "Validation Error",
+                "At least one network must be selected on the General tab."
+            )
+            return
+
         # A DeFi lane with no curator refuses everything, so a policy saved that
         # way looks enabled and does nothing. The model already knows; asking it
         # here means the user finds out at the dialog rather than at the first
@@ -1867,8 +1936,7 @@ class NewPolicyDialog(FramelessDialog):
                 max_price_impact_percent=self.max_impact_input.value(),
             )
 
-        # Networks: always include the default network (4663 - Robinhood Chain)
-        networks = [4663]
+        networks = self._selected_networks()
 
         return SpendPolicy.create(
             name=name,
@@ -1887,8 +1955,7 @@ class NewPolicyDialog(FramelessDialog):
         """Return policy parameters as dict for core.create_policy()."""
         name = self.name_input.text().strip()
 
-        # Networks: always include the default network (4663 - Robinhood Chain)
-        networks = [4663]
+        networks = self._selected_networks()
 
         # x402 settings
         if self.x402_enabled.isChecked():
@@ -2133,63 +2200,88 @@ class SettingsDialog(FramelessDialog):
 # Network Settings Dialog
 # ============================================
 
-# Default RHC RPC endpoint
-DEFAULT_RHC_RPC = "https://rpc.mainnet.chain.robinhood.com"
-
-# Uniswap v3 contract addresses on RHC — single source of truth is networks.DEX
-# (Qt-free, shared with the trading engine).
-_RHC_DEX = get_dex(4663)
-RHC_UNISWAP_FACTORY = _RHC_DEX.factory
-RHC_UNISWAP_QUOTER_V2 = _RHC_DEX.quoter_v2
-RHC_UNISWAP_ROUTER = _RHC_DEX.swap_router
-
-
 class NetworkSettingsDialog(FramelessDialog):
-    """Dialog for network settings (agent server, RPC, advanced)."""
+    """Network settings: one General tab, plus a tab per registered network.
 
-    # Signals for thread-safe UI updates (Qt signals are thread-safe)
-    rhc_status_signal = pyqtSignal(bool, int, str)  # connected, block_num, error
-    dex_status_signal = pyqtSignal(bool, str)  # available, error
+    The per-network tabs are generated from `NETWORKS` rather than written out,
+    so a chain added to the registry appears here with no change to this file.
+    That is the specific thing that went wrong before: this dialog was written
+    around one chain, and adding Base left a supported network with no UI at
+    all - unreachable settings, and a kill switch nobody could reach to lift.
+
+    What belongs where: General holds what is genuinely app-wide (the agent
+    link, the rate limit, settlement verification). Anything that is a property
+    of one chain - its RPC, its contracts, whether it is switched on - lives on
+    that chain's own tab, next to its live status.
+    """
+
+    # Status arrives from worker threads; the chain id rides along so one pair
+    # of signals serves every tab rather than a pair per generated tab.
+    rpc_status_signal = pyqtSignal(int, bool, int, str)   # chain, ok, block, error
+    dex_status_signal = pyqtSignal(int, bool, str)        # chain, available, error
 
     def __init__(self, core, settings: dict, parent=None):
-        super().__init__("Network Settings", parent, width=480)
+        super().__init__("Network Settings", parent, width=520)
         self.core = core
 
         self._settings = settings.copy()
         self._changed = False
 
-        # Connect signals to update methods (runs on main thread when emitted from any thread)
-        self.rhc_status_signal.connect(self._update_rhc_status)
+        # Per-chain widget registries, keyed by chain id. Populated by
+        # _build_network_tab; read back by get_settings and the status slots.
+        self._rpc_inputs: dict[int, QLineEdit] = {}
+        self._enabled_checks: dict[int, QCheckBox] = {}
+        self._rpc_status_labels: dict[int, QLabel] = {}
+        self._dex_status_labels: dict[int, QLabel] = {}
+
+        self.rpc_status_signal.connect(self._update_rpc_status)
         self.dex_status_signal.connect(self._update_dex_status)
 
         layout = self.content_layout
 
-        # === Status Section ===
-        status_group = QGroupBox("Status")
-        status_layout = QFormLayout(status_group)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_general_tab(), "General")
+        for cfg in NETWORKS.values():
+            self.tabs.addTab(
+                self._build_network_tab(cfg),
+                network_icon(cfg.chain_id),
+                cfg.display_name,
+            )
+        layout.addWidget(self.tabs)
 
-        # Server status
-        self.server_status_label = QLabel()
-        self._update_server_status()
-        status_layout.addRow("Agent Link:", self.server_status_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
-        # RHC status
-        self.rhc_status_label = QLabel("Checking...")
-        status_layout.addRow("Robinhood Chain:", self.rhc_status_label)
+        self._poll_status()
 
-        # DEX status (Uniswap v3 on RHC)
-        self.dex_status_label = QLabel("Checking...")
-        status_layout.addRow("Uniswap:", self.dex_status_label)
+        # Poll every 60 seconds while dialog is open
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll_status)
+        self._poll_timer.start(60000)
 
-        layout.addWidget(status_group)
+    # -------------------------------------------------------------------------
+    # Tab construction
+    # -------------------------------------------------------------------------
 
-        # === Agent Link Section ===
+    def _build_general_tab(self) -> QWidget:
+        """App-wide settings: the agent link and the signing/limit controls."""
+        from ..core.settings import DEFAULT_PORT
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # === Agent Link ===
         agent_group = QGroupBox("Agent Link")
         agent_layout = QFormLayout(agent_group)
 
-        from ..core.settings import DEFAULT_PORT
+        self.server_status_label = QLabel()
+        self._update_server_status()
+        agent_layout.addRow("Status:", self.server_status_label)
 
-        # Port input with server button on same row
         port_row = QHBoxLayout()
         # The port comes from the core, which is where `vault config set port`
         # and the daemon read it too - one copy, so the window and a headless
@@ -2214,7 +2306,6 @@ class NetworkSettingsDialog(FramelessDialog):
 
         port_row.addStretch()
 
-        # Server start/stop button (inline with port)
         self.server_btn = QPushButton()
         self._update_server_button()
         self.server_btn.clicked.connect(self._toggle_server)
@@ -2222,14 +2313,12 @@ class NetworkSettingsDialog(FramelessDialog):
 
         agent_layout.addRow("Port:", port_row)
 
-        # Allow LAN (read from core settings)
         self.allow_lan_checkbox = QCheckBox("Allow LAN connections")
         self.allow_lan_checkbox.setToolTip("Bind to 0.0.0.0 to allow network access")
         self.allow_lan_checkbox.setChecked(self.core.settings_manager.get_allow_lan())
         self.allow_lan_checkbox.stateChanged.connect(self._on_setting_changed)
         agent_layout.addRow("", self.allow_lan_checkbox)
 
-        # Auto-start server
         self.auto_start_checkbox = QCheckBox("Start automatically on launch")
         self.auto_start_checkbox.setChecked(self._settings.get("auto_start_server", True))
         self.auto_start_checkbox.stateChanged.connect(self._on_setting_changed)
@@ -2237,39 +2326,10 @@ class NetworkSettingsDialog(FramelessDialog):
 
         layout.addWidget(agent_group)
 
-        # === RHC RPC Section ===
-        rpc_group = QGroupBox("Robinhood Chain RPC")
-        rpc_layout = QVBoxLayout(rpc_group)
-
-        rpc_desc = QLabel("Custom RPC endpoint for RHC mainnet. Leave blank to use default.")
-        rpc_desc.setWordWrap(True)
-        rpc_desc.setProperty("role", "muted")
-        rpc_layout.addWidget(rpc_desc)
-
-        rpc_row = QHBoxLayout()
-        self.rpc_input = QLineEdit()
-        self.rpc_input.setPlaceholderText(DEFAULT_RHC_RPC)
-        # From the core settings, which is what every chain call resolves
-        # through, so what this box shows is what a chain call will use.
-        self.rpc_input.setText(
-            self.core.settings_manager.get_rpc_endpoint(DEFAULT_NETWORK) or "")
-        self.rpc_input.setFont(QFont(Theme.MONO_FONT, 9))
-        self.rpc_input.textChanged.connect(self._on_setting_changed)
-        rpc_row.addWidget(self.rpc_input)
-
-        reset_btn = QPushButton("Reset")
-        reset_btn.setMaximumWidth(60)
-        reset_btn.clicked.connect(self._reset_rpc)
-        rpc_row.addWidget(reset_btn)
-
-        rpc_layout.addLayout(rpc_row)
-        layout.addWidget(rpc_group)
-
-        # === Advanced Section ===
+        # === Advanced ===
         advanced_group = QGroupBox("Advanced")
         advanced_layout = QFormLayout(advanced_group)
 
-        # Rate limit
         self.rate_limit_input = QSpinBox()
         self.rate_limit_input.setRange(0, 1000)
         # Also the core's: the ceiling protects the agent server, which the
@@ -2282,77 +2342,134 @@ class NetworkSettingsDialog(FramelessDialog):
         self.rate_limit_input.valueChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("Rate limit:", self.rate_limit_input)
 
-        # Verify settlements (read from core settings)
         self.verify_checkbox = QCheckBox("Verify settlements on-chain")
         self.verify_checkbox.setToolTip("Verify transaction hashes on-chain after settlement")
         self.verify_checkbox.setChecked(self.core.settings_manager.get_verify_settlements())
         self.verify_checkbox.stateChanged.connect(self._on_setting_changed)
         advanced_layout.addRow("", self.verify_checkbox)
 
-        # Uniswap v3 contract addresses, shown so they can be checked against
-        # a block explorer.
+        layout.addWidget(advanced_group)
+        layout.addStretch()
+        return tab
+
+    def _build_network_tab(self, cfg) -> QWidget:
+        """One chain's tab: status, RPC override, contracts, kill switch."""
+        chain_id = cfg.chain_id
+
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # === Kill switch ===
+        #
+        # First on the tab, and worded as a stop rather than a setup step.
+        # Which chains an agent may use is decided by its policies, which name
+        # their networks explicitly; this sits above all of them, for the
+        # case where something is wrong with a chain and everything should
+        # stop touching it now, without editing every policy under time
+        # pressure.
+        enabled_check = QCheckBox(f"Allow transactions on {cfg.display_name}")
+        enabled_check.setChecked(self.core.settings_manager.is_network_enabled(chain_id))
+        enabled_check.setToolTip(
+            "Unticking this rejects every request on this network, whatever "
+            "any agent's policy allows."
+        )
+        enabled_check.stateChanged.connect(self._on_setting_changed)
+        self._enabled_checks[chain_id] = enabled_check
+        layout.addWidget(enabled_check)
+
+        # === Status ===
+        status_group = QGroupBox("Status")
+        status_layout = QFormLayout(status_group)
+
+        rpc_label = QLabel("Checking...")
+        self._rpc_status_labels[chain_id] = rpc_label
+        status_layout.addRow("Chain:", rpc_label)
+
+        # Not every chain has a DEX in the registry; the row is only offered
+        # for those that do, rather than showing a permanently blank field.
+        if get_dex(chain_id):
+            dex_label = QLabel("Checking...")
+            self._dex_status_labels[chain_id] = dex_label
+            status_layout.addRow("Uniswap:", dex_label)
+
+        explorer = QLabel(f'<a href="{cfg.explorer_url}">{cfg.explorer_url}</a>')
+        explorer.setOpenExternalLinks(True)
+        status_layout.addRow("Explorer:", explorer)
+
+        status_layout.addRow("Chain ID:", QLabel(str(chain_id)))
+        status_layout.addRow("Currency:", QLabel(cfg.native_symbol))
+
+        layout.addWidget(status_group)
+
+        # === RPC ===
+        rpc_group = QGroupBox("RPC Endpoint")
+        rpc_layout = QVBoxLayout(rpc_group)
+
+        rpc_desc = QLabel(
+            f"Custom RPC endpoint for {cfg.display_name}. Leave blank to use the default."
+        )
+        rpc_desc.setWordWrap(True)
+        rpc_desc.setProperty("role", "muted")
+        rpc_layout.addWidget(rpc_desc)
+
+        rpc_row = QHBoxLayout()
+        rpc_input = QLineEdit()
+        rpc_input.setPlaceholderText(cfg.rpc_url)
+        # From the core settings, which is what every chain call resolves
+        # through, so what this box shows is what a chain call will use.
+        rpc_input.setText(self.core.settings_manager.get_rpc_endpoint(chain_id) or "")
+        rpc_input.setFont(QFont(Theme.MONO_FONT, 9))
+        rpc_input.textChanged.connect(self._on_setting_changed)
+        self._rpc_inputs[chain_id] = rpc_input
+        rpc_row.addWidget(rpc_input)
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.setMaximumWidth(60)
+        reset_btn.clicked.connect(lambda _, c=chain_id: self._reset_rpc(c))
+        rpc_row.addWidget(reset_btn)
+
+        rpc_layout.addLayout(rpc_row)
+        layout.addWidget(rpc_group)
+
+        # === Contracts ===
         #
         # Read-only, and deliberately so. The trading path takes these
         # addresses from the network registry, and they stay uneditable here:
         # the router is the contract a swap approves to move tokens, and a box
         # that repoints it is a way to lose funds to a typo or to a persuasive
         # stranger.
-        uniswap_label = QLabel("Uniswap v3 Addresses")
-        uniswap_label.setProperty("role", "muted")
-        advanced_layout.addRow(uniswap_label)
-
-        # Read-only fields are greyed by the QLineEdit:read-only QSS rule.
-
-        # Factory address
-        self.uniswap_factory_input = QLineEdit()
-        self.uniswap_factory_input.setText(RHC_UNISWAP_FACTORY)
-        self.uniswap_factory_input.setFont(QFont(Theme.MONO_FONT, 9))
-        self.uniswap_factory_input.setToolTip("Uniswap v3 Factory contract (used for status check)")
-        self.uniswap_factory_input.setReadOnly(True)
-        advanced_layout.addRow("Factory:", self.uniswap_factory_input)
-
-        # QuoterV2 address
-        self.uniswap_quoter_input = QLineEdit()
-        self.uniswap_quoter_input.setText(RHC_UNISWAP_QUOTER_V2)
-        self.uniswap_quoter_input.setFont(QFont(Theme.MONO_FONT, 9))
-        self.uniswap_quoter_input.setToolTip("Uniswap v3 QuoterV2 contract")
-        self.uniswap_quoter_input.setReadOnly(True)
-        advanced_layout.addRow("QuoterV2:", self.uniswap_quoter_input)
-
-        # SwapRouter02 address
-        self.uniswap_router_input = QLineEdit()
-        self.uniswap_router_input.setText(RHC_UNISWAP_ROUTER)
-        self.uniswap_router_input.setFont(QFont(Theme.MONO_FONT, 9))
-        self.uniswap_router_input.setToolTip("Uniswap v3 SwapRouter02 contract")
-        self.uniswap_router_input.setReadOnly(True)
-        advanced_layout.addRow("Router:", self.uniswap_router_input)
-
-        layout.addWidget(advanced_group)
+        dex_cfg = get_dex(chain_id)
+        if dex_cfg:
+            contracts_group = QGroupBox("Uniswap v3 Addresses")
+            contracts_layout = QFormLayout(contracts_group)
+            for label, address, tip in (
+                ("Factory:", dex_cfg.factory, "Uniswap v3 Factory contract (used for status check)"),
+                ("QuoterV2:", dex_cfg.quoter_v2, "Uniswap v3 QuoterV2 contract"),
+                ("Router:", dex_cfg.swap_router, "Uniswap v3 SwapRouter02 contract"),
+            ):
+                field = QLineEdit()
+                field.setText(address or "")
+                field.setFont(QFont(Theme.MONO_FONT, 9))
+                field.setToolTip(tip)
+                field.setReadOnly(True)
+                contracts_layout.addRow(label, field)
+            layout.addWidget(contracts_group)
 
         layout.addStretch()
 
-        # Buttons
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        return tab
 
-        # Initial status checks
-        self._check_rhc_connection()
-        self._check_dex_connection()
-
-        # Poll every 60 seconds while dialog is open
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._poll_status)
-        self._poll_timer.start(60000)  # 60 seconds
+    # -------------------------------------------------------------------------
+    # Status polling
+    # -------------------------------------------------------------------------
 
     def _poll_status(self):
-        """Periodic status poll."""
+        """Periodic status poll: the server, then every network's chain/DEX."""
         self._update_server_status()
-        self._check_rhc_connection()
-        self._check_dex_connection()
+        for chain_id in self._rpc_status_labels:
+            self._check_rpc_connection(chain_id)
+        for chain_id in self._dex_status_labels:
+            self._check_dex_connection(chain_id)
 
     def closeEvent(self, event):
         """Stop polling when dialog closes."""
@@ -2360,61 +2477,14 @@ class NetworkSettingsDialog(FramelessDialog):
             self._poll_timer.stop()
         super().closeEvent(event)
 
-    def _update_server_status(self):
-        """Update the server status label."""
-        if self.core.is_server_running():
-            port = self.core.server_port
-            self.server_status_label.setText(f"● Running on port {port}")
-            set_role(self.server_status_label, status="on")
-        else:
-            self.server_status_label.setText("● Stopped")
-            set_role(self.server_status_label, status="muted")
-
-    def _update_server_button(self):
-        """Update the server button text."""
-        if self.core.is_server_running():
-            self.server_btn.setText("Stop Server")
-        else:
-            self.server_btn.setText("Start Server")
-
-    def _toggle_server(self):
-        """Start or stop the server."""
-        if self.core.is_server_running():
-            self.core.stop_server()
-        else:
-            from ..core.settings import DEFAULT_PORT
-            port = self.port_input.value() if self.custom_port_checkbox.isChecked() else DEFAULT_PORT
-            allow_lan = self.allow_lan_checkbox.isChecked()
-            self.core.start_server(port, allow_lan)
-
-        # Update UI after a short delay
-        QTimer.singleShot(100, self._update_server_status)
-        QTimer.singleShot(100, self._update_server_button)
-
-    def _on_custom_port_toggled(self, state: int):
-        """Handle custom port checkbox toggle."""
-        enabled = state == Qt.CheckState.Checked.value
-        self.port_input.setEnabled(enabled)
-        if not enabled:
-            from ..core.settings import DEFAULT_PORT
-            self.port_input.setValue(DEFAULT_PORT)
-        self._on_setting_changed(state)
-
-    def _reset_rpc(self):
-        """Reset RPC to default."""
-        self.rpc_input.clear()
-        self._changed = True
-
-    def _on_setting_changed(self, value):
-        """Handle any setting change."""
-        self._changed = True
-
-    def _check_rhc_connection(self):
-        """Check RHC RPC connectivity in background (eth_blockNumber call)."""
+    def _check_rpc_connection(self, chain_id: int):
+        """Check one network's RPC connectivity in background."""
         import threading
 
-        # Capture values from UI thread before spawning background thread
-        rpc_url = self.rpc_input.text().strip() or DEFAULT_RHC_RPC
+        # Capture from the UI thread before spawning: the box may be mid-edit,
+        # and reading a widget off-thread is not safe.
+        typed = self._rpc_inputs[chain_id].text().strip()
+        rpc_url = typed or get_network(chain_id).rpc_url
 
         def check():
             import urllib.request
@@ -2423,7 +2493,8 @@ class NetworkSettingsDialog(FramelessDialog):
             try:
                 req = urllib.request.Request(
                     rpc_url,
-                    data=json.dumps({"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}).encode(),
+                    data=json.dumps({"jsonrpc": "2.0", "method": "eth_blockNumber",
+                                     "params": [], "id": 1}).encode(),
                     headers={
                         "Content-Type": "application/json",
                         "User-Agent": USER_AGENT,
@@ -2432,44 +2503,46 @@ class NetworkSettingsDialog(FramelessDialog):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read())
                     if "error" in data:
-                        self.rhc_status_signal.emit(False, 0, "RPC error")
+                        self.rpc_status_signal.emit(chain_id, False, 0, "RPC error")
                     else:
-                        block_hex = data.get("result", "0x0")
-                        block_num = int(block_hex, 16)
-                        self.rhc_status_signal.emit(True, block_num, "")
+                        block_num = int(data.get("result", "0x0"), 16)
+                        self.rpc_status_signal.emit(chain_id, True, block_num, "")
             except socket.timeout:
-                self.rhc_status_signal.emit(False, 0, "Timeout")
+                self.rpc_status_signal.emit(chain_id, False, 0, "Timeout")
             except urllib.error.URLError as e:
                 reason = str(e.reason) if hasattr(e, 'reason') else str(e)
-                self.rhc_status_signal.emit(False, 0, reason[:30])
+                self.rpc_status_signal.emit(chain_id, False, 0, reason[:30])
             except Exception as e:
-                self.rhc_status_signal.emit(False, 0, str(e)[:30])
+                self.rpc_status_signal.emit(chain_id, False, 0, str(e)[:30])
 
         threading.Thread(target=check, daemon=True).start()
 
-    def _update_rhc_status(self, connected: bool, block: int, error: str = ""):
-        """Update RHC status label."""
+    def _update_rpc_status(self, chain_id: int, connected: bool, block: int, error: str = ""):
+        """Update one network's chain status label."""
+        label = self._rpc_status_labels.get(chain_id)
+        if label is None:
+            return
         if connected:
-            self.rhc_status_label.setText(f"● Block #{block:,}")
-            set_role(self.rhc_status_label, status="on")
+            label.setText(f"● Block #{block:,}")
+            set_role(label, status="on")
         else:
-            msg = f"● Unreachable ({error})" if error else "● Unreachable"
-            self.rhc_status_label.setText(msg)
-            set_role(self.rhc_status_label, status="error")
+            label.setText(f"● Unreachable ({error})" if error else "● Unreachable")
+            set_role(label, status="error")
 
-    def _check_dex_connection(self):
-        """Check Uniswap availability by verifying Factory contract has code."""
+    def _check_dex_connection(self, chain_id: int):
+        """Check one network's Uniswap by verifying the Factory has code."""
         import threading
 
-        # Capture values from UI thread before spawning background thread
-        factory_addr = self.uniswap_factory_input.text().strip() or RHC_UNISWAP_FACTORY
-        rpc_url = self.rpc_input.text().strip() or DEFAULT_RHC_RPC
+        # Capture from the UI thread before spawning.
+        factory_addr = get_dex(chain_id).factory
+        typed = self._rpc_inputs[chain_id].text().strip()
+        rpc_url = typed or get_network(chain_id).rpc_url
 
         def check():
             import urllib.request
             import json
             try:
-                # Check if Uniswap Factory contract has code (proves deployment)
+                # Contract has code == it is actually deployed on this chain.
                 call_data = {
                     "jsonrpc": "2.0",
                     "method": "eth_getCode",
@@ -2487,36 +2560,98 @@ class NetworkSettingsDialog(FramelessDialog):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read())
                     if "error" in data:
-                        self.dex_status_signal.emit(False, "RPC error")
+                        self.dex_status_signal.emit(chain_id, False, "RPC error")
                     else:
                         code = data.get("result", "0x")
-                        # Contract has code if result is more than just "0x"
                         if code and len(code) > 2:
-                            self.dex_status_signal.emit(True, "")
+                            self.dex_status_signal.emit(chain_id, True, "")
                         else:
-                            self.dex_status_signal.emit(False, "No contract")
+                            self.dex_status_signal.emit(chain_id, False, "No contract")
             except Exception as e:
-                self.dex_status_signal.emit(False, str(e)[:20])
+                self.dex_status_signal.emit(chain_id, False, str(e)[:20])
 
         threading.Thread(target=check, daemon=True).start()
 
-    def _update_dex_status(self, available: bool, error: str = ""):
-        """Update DEX status label."""
+    def _update_dex_status(self, chain_id: int, available: bool, error: str = ""):
+        """Update one network's DEX status label."""
+        label = self._dex_status_labels.get(chain_id)
+        if label is None:
+            return
         if available:
-            self.dex_status_label.setText("● Available")
-            set_role(self.dex_status_label, status="on")
+            label.setText("● Available")
+            set_role(label, status="on")
         else:
-            msg = f"● Unavailable ({error})" if error else "● Unavailable"
-            self.dex_status_label.setText(msg)
-            set_role(self.dex_status_label, status="error")
+            label.setText(f"● Unavailable ({error})" if error else "● Unavailable")
+            set_role(label, status="error")
+
+    # -------------------------------------------------------------------------
+    # Agent link controls (General tab)
+    # -------------------------------------------------------------------------
+
+    def _update_server_status(self):
+        """Update server status label."""
+        if self.core.is_server_running():
+            port = self.core.settings_manager.get_default_port()
+            self.server_status_label.setText(f"● Running on port {port}")
+            set_role(self.server_status_label, status="on")
+        else:
+            self.server_status_label.setText("● Stopped")
+            set_role(self.server_status_label, status="error")
+
+    def _update_server_button(self):
+        """Update server button text."""
+        if self.core.is_server_running():
+            self.server_btn.setText("Stop Server")
+        else:
+            self.server_btn.setText("Start Server")
+
+    def _toggle_server(self):
+        """Start or stop the agent server."""
+        if self.core.is_server_running():
+            self.core.stop_server()
+        else:
+            port = (self.port_input.value()
+                    if self.custom_port_checkbox.isChecked()
+                    else self.core.settings_manager.get_default_port())
+            self.core.start_server(port=port)
+
+        self._update_server_button()
+        self._update_server_status()
+
+    def _on_custom_port_toggled(self, state: int):
+        """Enable/disable port input based on custom checkbox."""
+        from ..core.settings import DEFAULT_PORT
+        checked = bool(state)
+        self.port_input.setEnabled(checked)
+        if not checked:
+            self.port_input.setValue(DEFAULT_PORT)
+        self._on_setting_changed(None)
+
+    def _reset_rpc(self, chain_id: int):
+        """Clear one network's RPC override, falling back to the registry."""
+        self._rpc_inputs[chain_id].clear()
+        self._on_setting_changed(None)
+
+    def _on_setting_changed(self, value):
+        """Mark settings as changed."""
+        self._changed = True
+
+    # -------------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------------
 
     def get_settings(self) -> dict:
         """Return the modified settings.
 
-        Only things the user can actually change. The Uniswap addresses are
+        Only things the user can actually change. The contract addresses are
         displayed, not edited, so they are not settings and are not returned;
         `server_port` and `rate_limit` are the core's, and the caller writes
         them there rather than to the GUI's file.
+
+        The two per-chain entries are dicts keyed by chain id rather than the
+        single `rhc_rpc` string this used to return - that key could only ever
+        describe one network, which is how Base ended up with settings nothing
+        could write.
         """
         from ..core.settings import DEFAULT_PORT
 
@@ -2527,15 +2662,23 @@ class NetworkSettingsDialog(FramelessDialog):
                             if self.custom_port_checkbox.isChecked() else DEFAULT_PORT),
             "allow_lan": self.allow_lan_checkbox.isChecked(),
             "auto_start_server": self.auto_start_checkbox.isChecked(),
-            "rhc_rpc": self.rpc_input.text().strip(),
             "rate_limit": self.rate_limit_input.value(),
             "verify_settlements": self.verify_checkbox.isChecked(),
+            # Empty string means "no override" - the caller turns that into
+            # None, which removes the key and restores the registry default.
+            "rpc_endpoints": {
+                chain_id: widget.text().strip()
+                for chain_id, widget in self._rpc_inputs.items()
+            },
+            "enabled_networks": {
+                chain_id: widget.isChecked()
+                for chain_id, widget in self._enabled_checks.items()
+            },
         }
 
     def has_changes(self) -> bool:
         """Check if settings were modified."""
         return self._changed
-
 
 # ============================================
 # Transaction Detail Dialog
@@ -2671,30 +2814,18 @@ class TransactionDetailDialog(FramelessDialog):
 
         timeline_layout.addRow("Received:", QLabel(tx.format_datetime()))
 
+        # All local time, like the history column this dialog opens from - it
+        # showed raw UTC before, so a row reading "14:22" opened a dialog
+        # saying 13:22 for the same transaction, neither of them labelled.
         if tx.signed_at:
-            try:
-                dt = datetime.fromisoformat(tx.signed_at.replace('Z', '+00:00'))
-                signed_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError):
-                signed_str = tx.signed_at
             auto_str = " (auto)" if tx.auto_approved else ""
-            timeline_layout.addRow("Signed:", QLabel(f"{signed_str}{auto_str}"))
+            timeline_layout.addRow("Signed:", QLabel(f"{format_stamp(tx.signed_at)}{auto_str}"))
 
         if tx.submitted_at:
-            try:
-                dt = datetime.fromisoformat(tx.submitted_at.replace('Z', '+00:00'))
-                submitted_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError):
-                submitted_str = tx.submitted_at
-            timeline_layout.addRow("Submitted:", QLabel(submitted_str))
+            timeline_layout.addRow("Submitted:", QLabel(format_stamp(tx.submitted_at)))
 
         if tx.settled_at:
-            try:
-                dt = datetime.fromisoformat(tx.settled_at.replace('Z', '+00:00'))
-                settled_str = dt.strftime("%Y-%m-%d %H:%M:%S")
-            except (ValueError, TypeError):
-                settled_str = tx.settled_at
-            timeline_layout.addRow("Settled:", QLabel(settled_str))
+            timeline_layout.addRow("Settled:", QLabel(format_stamp(tx.settled_at)))
 
         if tx.reject_reason:
             reason_label = QLabel(tx.reject_reason)
@@ -3027,9 +3158,20 @@ class MandateViewerDialog(FramelessDialog):
         # Timestamps
         issued_at = self.mandate.get('issuedAt', '')
         if issued_at:
+            # Deliberately UTC, and labelled - unlike every other timestamp in
+            # the GUI, which renders local. A receipt is a formal artifact
+            # meant to be shared, and whose local time it was is not a property
+            # of the mandate.
+            #
+            # Converted, not just labelled: fromisoformat keeps whatever offset
+            # the string carried, so an issuedAt arriving as "+01:00" used to
+            # print its local clock time with "UTC" appended - a wrong claim on
+            # exactly the document that should be trustworthy.
             try:
                 dt = datetime.fromisoformat(issued_at.replace('Z', '+00:00'))
-                issued_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                issued_str = dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             except (ValueError, TypeError):
                 issued_str = issued_at
             issued_label = QLabel(f"Issued: {issued_str}")

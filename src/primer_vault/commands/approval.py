@@ -48,8 +48,7 @@ class ApprovalCommands:
 
         lines = ["Pending Requests:"]
         for req in pending:
-            amount = req.amount_micro / 1_000_000
-            lines.append(f"  {req.id[:8]}  {req.agent_name}  ${amount:.6f}  {req.network}")
+            lines.append(f"  {req.id[:8]}  {req.agent_name}  {req.display_amount()}  {req.network}")
             # The recipient in full, on its own line, for the reason the GUI
             # dialog gives (main_window, "Recipient:"): approving is the one
             # moment a person is asked to authorise a destination. A 16-character
@@ -65,6 +64,7 @@ class ApprovalCommands:
                 "id": req.id,
                 "agent_name": req.agent_name,
                 "amount": req.amount_micro / 1_000_000,
+                "priced": req.amount_micro > 0,  # False: amount is 0, not free
                 "recipient": req.recipient,
             }
             for req in pending

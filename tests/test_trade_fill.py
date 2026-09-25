@@ -213,9 +213,9 @@ class TestWhatGetsRecorded:
         assert tx.amount_out_quoted == "2.5"
 
     def test_an_unreadable_fill_stays_empty_rather_than_borrowing_the_quote(self):
-        """The defect this replaced, stated as a test: when the fill cannot be
-        read, the record must say so. Writing the quote there is what made an
-        estimate look like a settled fact."""
+        """When the fill cannot be read, the record must say so rather than
+        borrowing the quote - writing the quote there would make an estimate
+        look like a settled fact."""
         tx = self._record(filled=None, quoted=2_500_000_000_000_000_000)
         assert tx.amount_out is None
         assert tx.amount_out_quoted == "2.5"

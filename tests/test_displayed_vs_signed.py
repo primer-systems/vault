@@ -28,23 +28,25 @@ from primer_vault.networks import TOKENS
 USDG = TOKENS["USDG"].addresses[4663]
 RHC = 4663
 
-# USDC on Base - a real, unsupported offer a multi-chain merchant would send.
-USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+# USDC on Ethereum mainnet - a real, unsupported offer a multi-chain
+# merchant would send (chain 1 is not in NETWORKS - unlike Base, which
+# Vault supports as of 0.4).
+USDC_MAINNET = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 
 PAY_TO = "0x00000000000000000000000000000000000c0De0"
 
 
 def multi_offer_x402(amount="1000000"):
-    """A 402 offering [USDC on Base, USDG on RHC] - the exact shape the
-    _select_offer comment in eip3009.py says must be supported."""
+    """A 402 offering [USDC on Ethereum mainnet, USDG on RHC] - the exact
+    shape the _select_offer comment in eip3009.py says must be supported."""
     return {
         "x402Version": 2,
         "accepts": [
             {
                 "scheme": "exact",
-                "network": "eip155:8453",
+                "network": "eip155:1",
                 "amount": "999999999",  # deliberately different from the RHC offer
-                "asset": USDC_BASE,
+                "asset": USDC_MAINNET,
                 "payTo": PAY_TO,
                 "maxTimeoutSeconds": 60,
                 "extra": {"name": "USD Coin", "version": "2"},
@@ -102,7 +104,7 @@ class TestMultiOfferAuditRecord:
         # The amount comes from the selected (RHC) offer - this should pass.
         assert tx.amount_micro == 1_000_000
         # The network must too. Current code records accepts[0].network
-        # ("eip155:8453"), the offer that was NOT signed.
+        # ("eip155:1"), the offer that was NOT signed.
         assert tx.network == "eip155:4663", (
             f"transaction record says the payment is on {tx.network!r}, "
             f"but the authorization was signed for chain 4663")
@@ -163,7 +165,7 @@ class TestMultiOfferEchoedExtra:
 
         # Signed under the RHC offer's domain...
         assert recover("Global Dollar", "1").lower() == wallet_address.lower()
-        # ...and NOT under the Base offer's domain.
+        # ...and NOT under the unsupported offer's domain.
         assert recover("USD Coin", "2").lower() != wallet_address.lower()
 
     def test_echoed_extra_matches_the_signed_domain(self, signing_setup):

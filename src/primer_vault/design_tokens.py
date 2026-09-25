@@ -51,6 +51,19 @@ class Theme:
 
 
 # =============================================================================
+# Network Brand Colors
+# =============================================================================
+
+#: Fallback for a chain with no brand artwork in ui/assets (an older row, or a
+#: chain this build doesn't know): a neutral grey ring, so the row still reads
+#: as "some network" instead of looking networkless and the column stays
+#: aligned. Chains that *do* have artwork carry their own color inside the SVG
+#: - a brand color belongs to that chain, not to our light/dark palette, so
+#: there are deliberately no per-theme variants of it.
+NETWORK_BRAND_UNKNOWN = "#8A8F98"
+
+
+# =============================================================================
 # Color Palettes
 # =============================================================================
 

@@ -97,6 +97,22 @@ jobs:
       - name: Record what went into this build
         run: pip freeze
 
+      # Rotating the shared Blockscout Pro API key only needs updating this
+      # secret, not a source commit + release. Falls back to whatever's
+      # committed in version.py if the secret is unset (e.g. fork builds).
+      - name: Bake current Blockscout Pro API key into the build
+        if: ${{ secrets.BLOCKSCOUT_PRO_API_KEY != '' }}
+        shell: python
+        env:
+          BLOCKSCOUT_PRO_API_KEY: ${{ secrets.BLOCKSCOUT_PRO_API_KEY }}
+        run: |
+          import os, re
+          path = 'src/primer_vault/version.py'
+          text = open(path, encoding='utf-8').read()
+          key = os.environ['BLOCKSCOUT_PRO_API_KEY']
+          text = re.sub(r'BLOCKSCOUT_PRO_API_KEY = ".*?"', 'BLOCKSCOUT_PRO_API_KEY = ' + repr(key), text)
+          open(path, 'w', encoding='utf-8').write(text)
+
       - name: Build with PyInstaller
         run: pyinstaller Vault.spec
 

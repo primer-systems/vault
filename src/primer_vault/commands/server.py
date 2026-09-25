@@ -5,6 +5,7 @@ Server command implementations.
 from typing import TYPE_CHECKING
 
 from .result import CommandResult
+from ..core.settings import DEFAULT_PORT
 
 if TYPE_CHECKING:
     from ..core import Vault
@@ -28,7 +29,7 @@ class ServerCommands:
         if subcmd == "start":
             if "--help" in args or "-h" in args:
                 return self._start_help()
-            port = 4663
+            port = DEFAULT_PORT
             if len(args) > 1:
                 port_str = args[1]
                 # Accept "server start --port 9410" as well as "server start 9410"
@@ -64,22 +65,22 @@ class ServerCommands:
 
     def _help(self) -> CommandResult:
         """Show server command help."""
-        help_text = """server - Manage the agent API server
+        help_text = f"""server - Manage the agent API server
 
 Subcommands:
-  start [port]    - Start server (default port: 4663)
+  start [port]    - Start server (default port: {DEFAULT_PORT})
   stop            - Stop server
   status          - Show server status"""
         return CommandResult.ok(help_text)
 
     def _start_help(self) -> CommandResult:
         """Help for server start."""
-        return CommandResult.ok("""server start - Start the agent API server
+        return CommandResult.ok(f"""server start - Start the agent API server
 
 Usage: server start [port]
 
 Arguments:
-  [port]   Port number (default: 4663)
+  [port]   Port number (default: {DEFAULT_PORT})
 
 Example:
   server start 8080""")

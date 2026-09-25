@@ -1,7 +1,9 @@
 """
 Vault Networks - Chain configurations and balance fetching via Blockscout API.
 
-Robinhood Chain (RHC) mainnet only. Multi-network capable — add a NetworkConfig entry to support more.
+Robinhood Chain (RHC) and Base. Curated, not "every EVM chain" - add a
+NetworkConfig entry (plus TokenConfig/DexConfig/DexConfigV4/MorphoConfig) to
+support more.
 
 Token discovery is automatic via Blockscout's V2 API - no hardcoded token lists needed.
 """
@@ -10,12 +12,13 @@ from dataclasses import dataclass, field
 from typing import Optional
 import json
 import logging
+import os
 import urllib.request
 import urllib.error
 
 from web3 import Web3
 
-from .version import BLOCKSCOUT_USER_AGENT
+from .version import BLOCKSCOUT_USER_AGENT, BLOCKSCOUT_PRO_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +55,23 @@ NETWORKS = {
         name="robinhood",
         display_name="Robinhood Chain",
         rpc_url="https://rpc.mainnet.chain.robinhood.com",
-        explorer_url="https://robinhoodchain.blockscout.com",
-        blockscout_api="https://robinhoodchain.blockscout.com/api/v2",
+        explorer_url="https://robin.etherscan.io",
+        blockscout_api="https://api.blockscout.com/4663/api/v2",
         is_testnet=False,
         native_symbol="ETH",
         aliases=["rhc", "robinhood-chain"],
+    ),
+    # === BASE ===
+    8453: NetworkConfig(
+        chain_id=8453,
+        name="base",
+        display_name="Base",
+        rpc_url="https://mainnet.base.org",
+        explorer_url="https://basescan.org",
+        blockscout_api="https://base.blockscout.com/api/v2",
+        is_testnet=False,
+        native_symbol="ETH",
+        aliases=["base-mainnet"],
     ),
 }
 
@@ -138,7 +153,68 @@ TOKENS = {
             4663: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
         }
     ),
+    "USDC": TokenConfig(
+        symbol="USDC",
+        name="USD Coin",
+        decimals=6,
+        addresses={
+            # Native USDC, not the bridged USDbC (different token).
+            8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        }
+    ),
+    "USDT": TokenConfig(
+        symbol="USDT",
+        name="Tether USD",
+        decimals=6,
+        addresses={
+            # Bridged, not Tether-issued directly - de facto standard USDT
+            # contract on Base regardless.
+            8453: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2",
+        }
+    ),
 }
+
+# Each chain's single settlement currency for x402 spend-limit accounting.
+# x402 itself accepts any asset a request names (see services/eip3009.py) -
+# this is only which token counts 1:1 without an on-chain quote.
+REFERENCE_STABLECOIN = {
+    4663: "USDG",
+    8453: "USDC",
+}
+
+
+def get_reference_stablecoin_address(chain_id: int) -> Optional[str]:
+    """Contract address of the chain's reference stablecoin, or None."""
+    symbol = REFERENCE_STABLECOIN.get(chain_id)
+    if not symbol:
+        return None
+    return TOKENS[symbol].addresses.get(chain_id)
+
+
+def get_reference_stablecoin_decimals(chain_id: int) -> Optional[int]:
+    """Decimals of the chain's reference stablecoin, or None."""
+    symbol = REFERENCE_STABLECOIN.get(chain_id)
+    if not symbol:
+        return None
+    return TOKENS[symbol].decimals
+
+
+# Stablecoins trading/Morpho trust as $1 without a quote (services/trading.py,
+# services/defi.py). Superset of REFERENCE_STABLECOIN - not a single
+# settlement currency, just "is this leg USD-pegged".
+TRUSTED_STABLECOINS = {
+    4663: ("USDG",),
+    8453: ("USDC", "USDT"),
+}
+
+
+def get_trusted_stablecoin_addresses(chain_id: int) -> tuple[str, ...]:
+    """Every stablecoin address trading trusts as $1 on this chain."""
+    return tuple(
+        TOKENS[symbol].addresses[chain_id]
+        for symbol in TRUSTED_STABLECOINS.get(chain_id, ())
+        if chain_id in TOKENS[symbol].addresses
+    )
 
 # ============================================
 # DEX (Uniswap v3) Configuration
@@ -187,6 +263,13 @@ DEX = {
         swap_router="0xCaf681a66D020601342297493863E78C959E5cb2",
         weth="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
     ),
+    # Base. Live-verified 2026-09-23.
+    8453: DexConfig(
+        factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+        quoter_v2="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+        swap_router="0x2626664c2603336E57B271c5C0b26F421741e481",
+        weth="0x4200000000000000000000000000000000000006",
+    ),
 }
 
 
@@ -202,12 +285,12 @@ class DexConfigV4:
     V4 uses a singleton PoolManager architecture. Pools are identified by PoolKey:
     (currency0, currency1, fee, tickSpacing, hooks).
 
-    RHC (chain 4663) has a modified UniversalRouter: its
-    `IV4Router.ExactInputSingleParams` carries an extra `uint256 minHopPriceX36`
-    between `amountOutMinimum` and `hookData`, so standard Uniswap SDK swap
-    calldata will REVERT. Confirmed against the router's verified source on
-    Blockscout. The quoter, StateView, PoolManager and Permit2 are all stock
-    Uniswap - only the router differs. See services/dex_v4.py.
+    `IV4Router.ExactInputSingleParams` carries a `uint256 minHopPriceX36`
+    field between `amountOutMinimum` and `hookData` - standard current
+    Uniswap v4-periphery behavior, not chain-specific. `universal_router`
+    must be the CURRENT UniversalRouter version for the chain - Base alone
+    has five versions live at different addresses; an old one has a
+    different calldata shape.
 
     Addresses from: https://github.com/Uniswap/contracts/blob/main/deployments/4663.md
     """
@@ -215,7 +298,7 @@ class DexConfigV4:
     position_manager: str       # NFT position manager
     state_view: str             # For reading pool state (slot0, liquidity)
     quoter: str                 # V4Quoter contract
-    universal_router: str       # V4 router (RHC-modified with minHopPriceX36)
+    universal_router: str       # V4 router - current version only, see class docstring
     permit2: str                # Token approval management
     weth: str                   # WETH address (still needed for WETH pools)
 
@@ -229,6 +312,17 @@ DEX_V4 = {
         universal_router="0x8876789976dEcBfCbBbe364623C63652db8C0904",
         permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
         weth="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+    ),
+    # Base. universal_router is UniversalRouterV2.1.2, the current version
+    # (Base has five live at different addresses). Live-verified 2026-09-23.
+    8453: DexConfigV4(
+        pool_manager="0x498581fF718922c3f8e6A244956aF099B2652b2b",
+        position_manager="0x7C5f5A4bBd8fD63184577525326123B519429bDc",
+        state_view="0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71",
+        quoter="0x0d5e0F971ED27FBfF6c2837bf31316121532048D",
+        universal_router="0xd6145b2D3F379919E8CdEda7B97e37c4b2Ca9c40",
+        permit2="0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        weth="0x4200000000000000000000000000000000000006",
     ),
 }
 
@@ -293,12 +387,42 @@ MORPHO = {
             "0xE9c34c8Fe2d8452807eA13148b3F52b91354eA04",
         ),
     ),
+    # Base. Steakhouse's curator address differs per chain - not RHC's
+    # 0x9023...d2fb. Seed set is the top 3 vaults by TVL of 17
+    # curator-matched vaults.
+    8453: MorphoConfig(
+        morpho="0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb",
+        adaptive_curve_irm="0x46415998764C29aB2a25CbeA6254146D50D22687",
+        vault_factory="0xFf62A7c278C62eD665133147129245053Bbf5918",
+        default_curators=("0x827e86072B06674a077f592A531dcE4590aDeCdB",),
+        seed_vaults=(
+            "0xbeeF010f9cb27031ad51e3333f9aF9C6B1228183",  # Steakhouse USDC
+            "0xBeEf2d50B428675a1921bC6bBF4bfb9D8cF1461A",  # Grove x Steakhouse USDC High Yield
+            "0xBEEFE94c8aD530842bfE7d8B397938fFc1cb83b2",  # Steakhouse Prime USDC
+        ),
+    ),
 }
 
 
 def get_morpho(chain_id: int) -> Optional[MorphoConfig]:
     """Return the Morpho deployment for a chain, or None if unsupported."""
     return MORPHO.get(chain_id)
+
+
+def all_default_curators() -> list[str]:
+    """Every chain's shipped Steakhouse curator address, one list.
+
+    A curator address only ever matches vaults on the chain it was read from
+    - `MorphoAdapter.resolve_venues` checks a vault's `curator()` against this
+    list, but only among vaults on the one chain that adapter is scoped to.
+    So one combined list works for every chain a policy covers: RHC's address
+    never matches a Base vault and vice versa, and a new policy trusts
+    whichever chains it is created for without per-chain bookkeeping.
+    """
+    curators: list[str] = []
+    for cfg in MORPHO.values():
+        curators.extend(cfg.default_curators)
+    return curators
 
 
 # ============================================
@@ -343,6 +467,10 @@ class BlockscoutClient:
     def _request(self, endpoint: str) -> dict:
         """Make an API request to Blockscout."""
         url = f"{self.api_base}{endpoint}"
+        api_key = os.environ.get("PRIMER_VAULT_BLOCKSCOUT_API_KEY") or BLOCKSCOUT_PRO_API_KEY
+        if api_key:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}apikey={api_key}"
         req = urllib.request.Request(
             url,
             headers={"User-Agent": BLOCKSCOUT_USER_AGENT, "Accept": "application/json"}

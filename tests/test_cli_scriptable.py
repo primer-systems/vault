@@ -172,7 +172,7 @@ class TestScriptableIntegration:
     def test_policy_delete_with_yes_flag(self, handler, core):
         """policy delete works with --yes flag (simulated)."""
         # Create a policy first
-        result = handler.execute("policy create test-policy")
+        result = handler.execute("policy create test-policy --networks 4663")
         assert result.success
 
         # Simulate the --yes flag by passing pre-confirmed input

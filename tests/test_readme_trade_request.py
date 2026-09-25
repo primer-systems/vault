@@ -72,7 +72,7 @@ def test_the_readme_register_command_and_the_readme_trade_body_fit_together(tmp_
         handler = CommandHandler(core)
         for command in [
             "wallet create main",
-            "policy create standard --day 100 --txn 50 --auto 5 "
+            "policy create standard --networks 4663 --day 100 --txn 50 --auto 5 "
             "--trading --trade-max 100 --trade-daily 500",
         ]:
             assert _drive(handler, command).success, command

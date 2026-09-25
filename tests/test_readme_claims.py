@@ -61,7 +61,7 @@ def test_no_allow_list_allows_any_merchant(handler):
     """A policy with no allowlist restricts nothing - that is how "any domain"
     is expressed, and it is the default when the flag is omitted."""
     h, core = handler
-    result = _drive(h, "policy create standard --day 100 --txn 50")
+    result = _drive(h, "policy create standard --networks 4663 --day 100 --txn 50")
     assert result.success, result.error
 
     policy = next(p for p in core.get_all_policies() if p.name == "standard")
@@ -70,12 +70,11 @@ def test_no_allow_list_allows_any_merchant(handler):
 
 
 def test_policy_create_and_edit_treat_a_domain_value_identically(handler):
-    """The bug this replaces: `create` stored the value literally while `edit`
-    read "all"/"none" as sentinels, so one flag meant two things across the two
-    commands. With the sentinels gone, a named domain is a named domain on both,
-    and an empty value clears on both."""
+    """`create` and `edit` must agree on what a domain value means: a named
+    domain is a named domain on both, and an empty value clears the allowlist
+    on both."""
     h, core = handler
-    assert _drive(h, "policy create p1 --day 100 --txn 50 --allow-domains api.example.com").success
+    assert _drive(h, "policy create p1 --networks 4663 --day 100 --txn 50 --allow-domains api.example.com").success
     p1 = next(p for p in core.get_all_policies() if p.name == "p1")
     assert p1.allowed_domains == ["api.example.com"], p1.allowed_domains
 
@@ -97,7 +96,7 @@ def test_empty_block_list_leaves_domain_restrictions_off(handler):
     path-only resource - the common x402 shape - is not refused for want of a
     checkable domain, and a junk 'none' entry must not flip it on."""
     h, core = handler
-    result = _drive(h, "policy create standard --day 100 --txn 50")
+    result = _drive(h, "policy create standard --networks 4663 --day 100 --txn 50")
     assert result.success, result.error
 
     policy = next(p for p in core.get_all_policies() if p.name == "standard")
@@ -159,7 +158,7 @@ def test_agent_commission_accepts_a_full_address_in_any_case(handler):
     """
     h, core = handler
     _drive(h, "wallet create main")
-    _drive(h, "policy create standard --day 100 --txn 50")
+    _drive(h, "policy create standard --networks 4663 --day 100 --txn 50")
     _drive(h, "agent register MyAgent --auth bearer")
 
     full = core.get_wallet_addresses()[0]["address"]

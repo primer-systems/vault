@@ -157,7 +157,7 @@ def test_the_readme_agent_setup_works_in_the_console(tmp_path):
         # The setup the README's other sections provide: a wallet and the
         # `standard` policy its Policy Management example creates.
         for command in ["wallet create main",
-                        "policy create standard --day 100 --txn 50 --auto 5"]:
+                        "policy create standard --networks 4663 --day 100 --txn 50 --auto 5"]:
             result = _drive(handler, command)
             assert result.success, f"setup {command!r} -> {result.error}"
         for command in console:
@@ -176,11 +176,9 @@ def test_the_readme_agent_setup_works_in_the_console(tmp_path):
 def test_the_single_instance_section_says_a_second_command_attaches():
     """A second `primer-vault` against a running engine attaches to it.
 
-    This used to be the opposite: the second command was refused, and the only
-    way in was an unauthenticated HTTP port that shipped switched off, so the
-    section had to explain how to open it. Now the lock is the router, and the
-    section has to say so - a reader who believes the old behaviour will kill a
-    running server to run one command against it.
+    The lock is the router, not a refusal, so the README section on
+    one-instance-per-folder has to say so plainly - a reader who expects a
+    refusal will kill a running server to run one command against it.
     """
     start = README.index("### One instance per data folder")
     section = README[start:README.index("---", start)]

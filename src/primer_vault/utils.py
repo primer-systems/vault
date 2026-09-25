@@ -168,7 +168,7 @@ def validate_name(name: str, field: str = "Name") -> str:
 # ============================================
 
 def agent_config_snippet(agent_id: str, token: str, auth_mode: str,
-                         url: str = "http://localhost:4663") -> str:
+                         url: str = "http://localhost:9402") -> str:
     """The paste-into-system-prompt block handed to an agent at commissioning.
 
     Single source of truth for this copy (GUI dialogs + CLI both use it), so it

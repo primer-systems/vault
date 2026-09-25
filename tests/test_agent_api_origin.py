@@ -205,8 +205,8 @@ class TestCallbackAuthentication:
         assert running_server.calls == [("callback", "ABC123", "submitted", "SIG:1:deadbeef")]
 
     def test_the_helper_builds_what_the_server_verifies(self):
-        """The signed shape has to match on both sides. They drifted once
-        before, and every signature the helper produced was rejected."""
+        """The signed shape has to match on both sides, or every signature
+        the helper produces is rejected."""
         import hashlib
         import hmac
         sys.path.insert(0, str(

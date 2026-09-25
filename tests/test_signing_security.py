@@ -422,8 +422,11 @@ class TestTimestampReplayProtection:
 class TestX402AmountValidation:
     """Test amount validation in x402 payloads."""
 
-    def test_zero_amount_handling(self, signing_service):
-        """Zero amount should be handled gracefully."""
+    def test_zero_amount_is_a_well_formed_request(self):
+        """A zero amount is structurally valid at this layer; policy, not
+        parsing, is what would refuse a zero-value payment downstream."""
+        from primer_vault.services.signing import validate_x402_request
+
         x402_data = {
             "accepts": [{
                 "network": "robinhood",
@@ -433,11 +436,13 @@ class TestX402AmountValidation:
             }]
         }
 
-        is_valid, version, error = signing_service._validate_x402_request(x402_data) if hasattr(signing_service, '_validate_x402_request') else (True, 1, "")
-        assert isinstance(is_valid, bool)
+        is_valid, version, error = validate_x402_request(x402_data)
+        assert is_valid is True
+        assert error == ""
 
-    def test_extremely_large_amount(self):
-        """Extremely large amount should be handled without overflow."""
+    def test_extremely_large_amount_does_not_overflow(self):
+        """A large integer amount parses without overflow or truncation - it
+        is carried through as a string, not coerced into a fixed-width type."""
         from primer_vault.services.signing import validate_x402_request
 
         x402_data = {
@@ -449,12 +454,13 @@ class TestX402AmountValidation:
             }]
         }
 
-        # Should validate without overflow
         is_valid, version, error = validate_x402_request(x402_data)
-        assert isinstance(is_valid, bool)
+        assert is_valid is True
+        assert error == ""
 
-    def test_string_amount_handling(self):
-        """String amounts should be handled properly."""
+    def test_string_amount_is_accepted_as_is(self):
+        """A numeric string is a valid amount - parsing does not require the
+        wire value to already be an int."""
         from primer_vault.services.signing import validate_x402_request
 
         x402_data = {
@@ -467,7 +473,8 @@ class TestX402AmountValidation:
         }
 
         is_valid, version, error = validate_x402_request(x402_data)
-        # Implementation may accept string numbers or reject
+        assert is_valid is True
+        assert error == ""
 
     def test_null_amount_rejected(self):
         """Null amount should be rejected."""

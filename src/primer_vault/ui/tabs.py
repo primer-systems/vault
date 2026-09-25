@@ -28,6 +28,7 @@ from .dialogs import (
     AgentRegistrationDialog, CommissionDialog, EditAgentDialog,
     NewPolicyDialog
 )
+from .network_icons import network_icon
 from ..models import SpendPolicy, Agent, Transaction
 from ..version import USER_AGENT, BLOCKSCOUT_USER_AGENT
 from ..wallet import VaultWallet, AddressEntry, WalletInfo, NO_PASSWORD_SENTINEL
@@ -37,7 +38,7 @@ from .wallet_dialogs import (
     VaultWalletUnlockDialog, CreateWalletWizard,
     AddWalletChoiceDialog, WalletFilenameDialog, WalletSettingsDialog,
 )
-from ..networks import DEFAULT_NETWORK, MultiNetworkBalanceFetcher, format_address, Balance
+from ..networks import DEFAULT_NETWORK, NETWORKS, MultiNetworkBalanceFetcher, format_address, Balance, resolve_network
 from ..version import __version__
 # Note: Do NOT import get_wallet_dir or get_app_dir here. Use core methods instead.
 # See ARCHITECTURE.md "Common Mistakes" section.
@@ -624,6 +625,20 @@ class HistoryTab(QWidget):
         self.status_filter.currentIndexChanged.connect(self.apply_filters)
         filters.addWidget(self.status_filter)
 
+        # Network filter. History deliberately shows every chain at once (the
+        # multi-network decision: an agent may transact across chains and an
+        # audit needs the whole picture by default), so this defaults to "All
+        # Networks" and exists only to *narrow* on request - it is what lets the
+        # Network column go away without losing the ability to isolate a chain.
+        # Built from the registry rather than a literal list, so a chain added
+        # to NETWORKS shows up here with no change to this tab.
+        self.network_filter = QComboBox()
+        self.network_filter.addItem("All Networks", None)
+        for cfg in NETWORKS.values():
+            self.network_filter.addItem(network_icon(cfg.chain_id), cfg.display_name, cfg.chain_id)
+        self.network_filter.currentIndexChanged.connect(self.apply_filters)
+        filters.addWidget(self.network_filter)
+
         filters.addStretch()
 
         refresh_btn = QPushButton("Refresh")
@@ -641,24 +656,39 @@ class HistoryTab(QWidget):
         layout.addLayout(filters)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        # Column order: Time, Activity, Amount, Status, Agent, Address
-        self.table.setHorizontalHeaderLabels(["Time", "Activity", "Amount", "Status", "Agent", "Address"])
-        # Activity is a free-text sentence describing the row (it has to carry
-        # "Approve USDG for VaultV2" as well as "Swap 0.5 ETH for USDG", which
-        # a fixed Out/In pair can't - an approval moves no value at all), so
-        # it stretches; the rest stay fixed.
+        self.table.setColumnCount(5)
+        # Column order: Time, Activity, Status, Agent, Address
+        # Unfiltered by design - shows every chain, not just the active one.
+        # No separate Amount column: display_activity() already carries the
+        # amount inline for every transaction type (including x402's "Pay X
+        # for <resource>"), so a dedicated column just repeated it.
+        # No separate Network column either: the chain rides along as a brand
+        # mark on the Address cell (see network_icons), which is where a wallet
+        # user looks for it anyway. The information stays visible - the
+        # multi-network audit's requirement - without a 150px column of mostly
+        # identical repeated names. The network *filter* above covers the case
+        # the column served on its own: isolating one chain's activity.
+        self.table.setHorizontalHeaderLabels(["Time", "Activity", "Status", "Agent", "Address"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)  # Time
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Activity - flex
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Amount
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # Status
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # Agent
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)  # Address
-        self.table.setColumnWidth(0, 100)   # Time
-        self.table.setColumnWidth(2, 140)   # Amount
-        self.table.setColumnWidth(3, 80)    # Status
-        self.table.setColumnWidth(4, 140)   # Agent
-        self.table.setColumnWidth(5, 140)   # Address
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # Status
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # Agent
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # Address
+        # Measured, not guessed: format_time()'s widest output at the table
+        # font is "19 Jan" at 72px (a date is wider than a clock time - "23:59"
+        # is only 60px), and Qt's cell padding wants ~10 on top. 85 clears both
+        # with a little slack for a wider system font; the original 90px column
+        # was set against an 11-char "MM-DD HH:MM" string that actually
+        # measured 132px, which is why every row silently elided to "09-03 ...".
+        # The ~45px saved goes to Activity, the flex column.
+        self.table.setColumnWidth(0, 85)    # Time
+        self.table.setColumnWidth(2, 70)    # Status
+        self.table.setColumnWidth(3, 130)   # Agent
+        self.table.setColumnWidth(4, 150)   # Address - wider: now carries the network mark
+        # Row numbers are a reverse-chronological count of the filtered view,
+        # not a transaction identifier - meaningless to show, and this space
+        # goes to Activity instead.
+        self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -759,6 +789,18 @@ class HistoryTab(QWidget):
             filtered = [tx for tx in filtered if tx.status in ("received", "signed", "submitted")]
         # "all status" shows everything
 
+        # Network. Compared on resolved chain id rather than on the stored
+        # string: tx.network is free-form (CAIP-2 "eip155:8453" on new rows, a
+        # bare v1 name on old ones), so a text match would silently drop a
+        # chain's older history from its own filter.
+        chain_id = self.network_filter.currentData()
+        if chain_id is not None:
+            filtered = [
+                tx for tx in filtered
+                if (cfg := resolve_network(tx.network) if tx.network else None)
+                and cfg.chain_id == chain_id
+            ]
+
         self.populate_table(filtered)
 
     def populate_table(self, transactions: list[Transaction]):
@@ -769,21 +811,25 @@ class HistoryTab(QWidget):
         self.table.setVisible(len(transactions) > 0)
 
         for row, tx in enumerate(transactions):
-            # Column order: Time(0), Activity(1), Amount(2), Status(3), Agent(4), Addr(5)
+            # Column order: Time(0), Activity(1), Status(2), Agent(3), Addr(4), Network(5)
 
             # Store transaction ID in the first column for double-click lookup
             time_item = QTableWidgetItem(tx.format_time())
             time_item.setData(Qt.ItemDataRole.UserRole, tx.id)
+            # The column shows a clock time for today and a date for anything
+            # older (see format_time). The two forms are already unmistakable
+            # by shape - "19 Aug" cannot be read as a time - and this dims the
+            # date form as a second, redundant cue rather than the only one.
+            if ":" not in time_item.text():
+                time_item.setForeground(QColor(active()["muted"]))
+            # Full timestamp on hover, since the cell itself is abbreviated.
+            time_item.setToolTip(tx.format_datetime())
             self.table.setItem(row, 0, time_item)
 
-            # Activity - one sentence describing what this row did. Replaces
-            # the old fixed Type/Out/In columns, which had no way to show a
-            # no-value approval row without it looking broken.
+            # Activity - one sentence describing what this row did, amount
+            # included (see display_activity/format_amount) - no separate
+            # Amount column, it would only repeat this.
             self.table.setItem(row, 1, QTableWidgetItem(tx.display_activity()))
-
-            # Amount - the single value this row moved, "—" for approvals.
-            amount_item = QTableWidgetItem(tx.display_amount())
-            self.table.setItem(row, 2, amount_item)
 
             # Status with color coding and verification indicator
             status_text = tx.status.upper()
@@ -808,19 +854,29 @@ class HistoryTab(QWidget):
 
             status_item = QTableWidgetItem(status_text)
             status_item.setForeground(QColor(color))
-            self.table.setItem(row, 3, status_item)
+            self.table.setItem(row, 2, status_item)
 
             # Agent name with ID
             agent_text = f"{tx.agent_name} ({tx.agent_id})"
-            self.table.setItem(row, 4, QTableWidgetItem(agent_text))
+            self.table.setItem(row, 3, QTableWidgetItem(agent_text))
 
-            # Wallet name (looked up from address)
+            # Wallet name, badged with the chain's mark. The icon replaces the
+            # old Network column; the chain name moves into the tooltip so it
+            # stays readable for anyone who doesn't recognise a mark by sight.
             wallet_text = ""
             if tx.wallet_address:
                 wallet_text = self._wallet_names.get(tx.wallet_address.lower(), tx.wallet_id or "")
             wallet_item = QTableWidgetItem(wallet_text)
-            wallet_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 5, wallet_item)
+            wallet_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            network_cfg = resolve_network(tx.network) if tx.network else None
+            wallet_item.setIcon(network_icon(network_cfg.chain_id if network_cfg else None))
+            network_text = network_cfg.display_name if network_cfg else (tx.network or "Unknown network")
+            wallet_item.setToolTip(network_text if not wallet_text else f"{wallet_text} - {network_text}")
+
+            self.table.setItem(row, 4, wallet_item)
 
     def on_row_double_clicked(self, index):
         """Handle double-click on a row to show transaction details."""
@@ -1016,6 +1072,16 @@ class WalletTab(QWidget):
         self.address_selector.send_requested.connect(
             lambda addr: self._open_send_dialog(from_address=addr))
         toolbar.addWidget(self.address_selector)
+
+        # Active chain for balance display and the Send dialog's target.
+        self.network_selector = QComboBox()
+        for chain_id, cfg in sorted(NETWORKS.items(), key=lambda kv: kv[1].display_name):
+            self.network_selector.addItem(cfg.display_name, chain_id)
+        default_index = self.network_selector.findData(DEFAULT_NETWORK)
+        if default_index >= 0:
+            self.network_selector.setCurrentIndex(default_index)
+        self.network_selector.currentIndexChanged.connect(self._on_network_changed)
+        toolbar.addWidget(self.network_selector)
 
         toolbar.addStretch()
 
@@ -2552,6 +2618,16 @@ class WalletTab(QWidget):
         for address in addresses:
             self.refresh_address_balance(address)
 
+    def _on_network_changed(self, index: int):
+        """Refetch on network change - _address_balances caches only the
+        selected chain, so a redraw alone would show stale numbers."""
+        chain_id = self.network_selector.itemData(index)
+        if chain_id is None or chain_id == self._selected_network_chain_id:
+            return
+        self._selected_network_chain_id = chain_id
+        if self._selected_address:
+            self.refresh_address_balance(self._selected_address)
+
     def refresh_address_balance(self, address: str):
         """Refresh balance for a single address."""
         # Logs only: a progress ping with no outcome does not belong in the
@@ -2766,14 +2842,12 @@ class SettingsTab(QWidget):
         version_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(version_label)
 
-    # There was a `set_settings()` here that repopulated every control from a
-    # dict. Nothing called it - the controls are populated once, at
-    # construction, from the same `self._settings` - and it had drifted: it read
-    # `auto_start_server` with a default of False while every live read of that
-    # key defaults to True. Wiring it up would have silently turned the agent
-    # server's auto-start off for every user whose settings file predates the
-    # key. Deleted rather than corrected, because a second population path that
-    # nothing exercises is how the defaults drift apart in the first place.
+    # Deliberately no `set_settings()` here to repopulate controls from a dict.
+    # The controls are populated once, at construction, from the same
+    # `self._settings`. A second, unexercised population path is exactly how a
+    # default like `auto_start_server` would drift out of step with the live
+    # reads elsewhere, silently changing behavior for anyone whose settings
+    # file predates the key.
 
     def get_settings(self) -> dict:
         """Get current settings as dict."""
@@ -2813,11 +2887,11 @@ PRIMER_VAULT_ASCII = (
     f'<span style="color: {CONSOLE["error"]};">▀▄▀ █▀█ █▄█ █▄▄  █ </span><br>'
     '</pre>'
     f'<span style="color: {CONSOLE["border"]};">═══════════════════════════════════════</span><br>'
-    f'<span style="color: {CONSOLE["muted"]};"> Agentic trading hub for RWA on Robinhood Chain</span>'
+    f'<span style="color: {CONSOLE["muted"]};"> Agentic trading interface for RWA and tokens</span>'
     f'  <span style="color: {CONSOLE["border"]};">│</span>'
     f'  <span style="color: {CONSOLE["text"]};">v{__version__}</span>'
     f'  <span style="color: {CONSOLE["border"]};">│</span>'
-    f'<span style="color: {CONSOLE["muted"]};">localhost:4663</span><br>'
+    f'<span style="color: {CONSOLE["muted"]};">localhost:9402</span><br>'
     f'<span style="color: {CONSOLE["border"]};">═══════════════════════════════════════</span><br>'
 )
 

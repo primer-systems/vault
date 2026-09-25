@@ -26,6 +26,7 @@ from typing import Optional, Callable, TYPE_CHECKING
 from ..design_tokens import web_css_vars, status_color, DARK
 from ..utils import is_browser_request, is_rebound_host
 from ..version import __version__
+from ..core.settings import DEFAULT_PORT
 
 if TYPE_CHECKING:
     from .defi import DefiService
@@ -199,7 +200,6 @@ ERROR_CODE_TO_HTTP_STATUS = {
     "NETWORK_DISABLED": 403,
     "NETWORK_NOT_ALLOWED_BY_POLICY": 403,
     "DOMAIN_NOT_ALLOWED": 403,
-    "UNSUPPORTED_ASSET": 403,
     "DOMAIN_URL_REQUIRED": 403,
     "AGENT_SUSPENDED": 403,
     "AGENT_NOT_COMMISSIONED": 403,
@@ -372,11 +372,26 @@ def get_agent_instructions() -> str:
     header = (
         "# Primer Vault — Agent Instructions\n\n"
         "Primer Vault holds the user's crypto keys and enforces their limits, so "
-        "you never handle keys directly. It does three things: **trading** (Uniswap "
-        "swaps on Robinhood Chain), **lending** (supplying USDG on Morpho) and "
-        "**x402 payments** (paying for APIs). All three are documented below.\n"
+        "you never handle keys directly. It does three things on Robinhood Chain "
+        "and Base: **trading** (Uniswap swaps), **lending** (supplying to Morpho) "
+        "and **x402 payments** (paying for APIs). All three are documented below.\n\n"
+        "If you also need to store secrets, sign on a chain Vault doesn't support, "
+        "or get a human approval outside Vault's own policy, Vault partners with "
+        "1Claw for that — a separate wallet with its own guardrails, not another "
+        "way into this one. See `GET /agent/1claw` for the full skill.\n"
     )
     return header + "\n\n---\n\n" + "\n\n---\n\n".join(sections)
+
+
+def get_1claw_instructions() -> str:
+    """Serve the standalone vault-1claw skill, fetched on demand rather than
+    folded into /agent - see get_agent_instructions for the one-line pointer.
+    Kept separate because it documents a different product's API (1Claw's,
+    not Vault's) that most agents won't need."""
+    section = _load_skill("vault-1claw")
+    if not section:
+        return "# Error\n\nCould not find the vault-1claw skill instructions."
+    return section
 
 
 def get_logo_base64() -> str:
@@ -554,7 +569,7 @@ def get_branded_html(port: int) -> str:
         <span class="panel-name">FUNCTION</span>
       </div>
       <div class="panel-body">
-        <p>This server takes requests from your local AI agents and answers them under the policy you set. Two kinds: <strong>trades</strong> on Uniswap v3 and v4, and <strong>x402 payment authorizations</strong>. Anything above your auto-approve threshold is held for you to approve in the Vault desktop app.</p>
+        <p>This server takes requests from your local AI agents and answers them under the policy you set. Two kinds: <strong>trades</strong> on Uniswap v3 and v4, and <strong>x402 payment authorizations</strong>. Anything above your auto-approve threshold is held, and your agent gets a "pending" reply to poll on while it waits for a person to approve or reject it.</p>
         <p style="margin-top: 12px;">Your keys never leave the app. Agents receive a code and a token that let them <em>ask</em> for a signature; every signature is produced here.</p>
       </div>
     </div>
@@ -585,6 +600,11 @@ def get_branded_html(port: int) -> str:
               <td><code>/agent</code></td>
               <td><span class="method method-get">GET</span></td>
               <td>Agent instructions (Markdown)</td>
+            </tr>
+            <tr>
+              <td><code>/agent/1claw</code></td>
+              <td><span class="method method-get">GET</span></td>
+              <td>1Claw skill (secrets, multi-chain signing, approvals)</td>
             </tr>
             <tr>
               <td><code>/status</code></td>
@@ -744,7 +764,7 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
     # Which endpoints accept which methods, so a wrong verb gets a 405 naming
     # the right one rather than a bare 404.
     # Note: /sign/status/{id} and /receipt/{id} are dynamic paths handled separately
-    GET_ENDPOINTS = frozenset(["/", "/agent", "/sign/helper", "/status", "/health"])
+    GET_ENDPOINTS = frozenset(["/", "/agent", "/agent/1claw", "/sign/helper", "/status", "/health"])
     POST_ENDPOINTS = frozenset(["/ping", "/sign", "/callback", "/mandate", "/trade",
                                 "/balances", "/position", "/venues"])
 
@@ -973,6 +993,8 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             port = self.server.server_address[1]
             self._send_html_response(200, get_branded_html(port))
+        elif self.path == "/agent/1claw":
+            self._send_text_response(200, get_1claw_instructions(), "text/plain")
         elif self.path.startswith("/agent"):
             self._send_text_response(200, get_agent_instructions(), "text/plain")
         elif self.path == "/sign/helper":
@@ -1313,14 +1335,20 @@ class AgentRequestHandler(BaseHTTPRequestHandler):
             # way everything else is: the answer depends on the caller's policy.
             agent_id = request_data.get("agent_id")
             signature = request_data.get("signature")
+            # Optional and empty by default - only `chain_id` ever goes in it.
+            # Omitting it (older callers) is the same as sending {}.
+            position = request_data.get("position", {})
             if not agent_id:
                 self._send_json_response(400, {"status": "error", "error": "Missing agent_id", "code": "MISSING_AGENT_ID"})
                 return
             if not signature:
                 self._send_json_response(400, {"status": "error", "error": "Missing signature", "code": "MISSING_SIGNATURE"})
                 return
+            if not isinstance(position, dict):
+                self._send_json_response(400, {"status": "error", "error": "position must be an object", "code": "BAD_REQUEST"})
+                return
             if _defi_service:
-                result = _defi_service.handle_venues_request(agent_id, signature)
+                result = _defi_service.handle_venues_request(agent_id, signature, position)
                 code = result.get("code")
                 if code == "WALLET_LOCKED":
                     self._send_service_unavailable(result)
@@ -1494,7 +1522,7 @@ class AgentServer:
     def __init__(self):
         self._server: Optional[ThreadedHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
-        self._port = 4663
+        self._port = DEFAULT_PORT
         self._running = False
 
         # Callbacks (replace Qt signals)
@@ -1539,7 +1567,7 @@ class AgentServer:
         global _defi_service
         _defi_service = defi_service
 
-    def start(self, port: int = 4663, allow_lan: bool = False) -> bool:
+    def start(self, port: int = DEFAULT_PORT, allow_lan: bool = False) -> bool:
         """
         Start the HTTP server on the specified port.
 

@@ -114,7 +114,7 @@ def sign_callback(agent_id: str, agent_token: str, transaction_id: str,
     return result
 
 
-def send_to_primer_vault(signed_request: dict, primer_vault_url: str = "http://localhost:4663") -> dict:
+def send_to_primer_vault(signed_request: dict, primer_vault_url: str = "http://localhost:9402") -> dict:
     """
     Send a signed request to Vault and get the payment header.
 

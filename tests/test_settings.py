@@ -47,7 +47,7 @@ class TestAppSettings:
         assert settings.version == 1
         assert settings.signing.verify_settlements is True
         assert settings.signing.max_request_age_seconds == 300
-        assert settings.server.default_port == 4663
+        assert settings.server.default_port == 9402
         assert settings.server.allow_lan is False
 
     def test_to_dict(self):
@@ -56,7 +56,7 @@ class TestAppSettings:
         d = settings.to_dict()
         assert d["version"] == 1
         assert d["signing"]["verify_settlements"] is True
-        assert d["server"]["default_port"] == 4663
+        assert d["server"]["default_port"] == 9402
 
     def test_from_dict(self):
         """AppSettings creates from dict correctly."""

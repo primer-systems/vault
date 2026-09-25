@@ -181,8 +181,8 @@ class TestRequestSizes:
     """Test handling of various request sizes."""
 
     def test_very_large_payload_handled(self):
-        """Very large payload should be handled (or rejected)."""
-        # Create a large x402 payload
+        """A large resource string does not stop the request from parsing -
+        there is no length cap on it at this layer."""
         large_resource = "https://example.com/" + "a" * 10000
 
         x402_data = {
@@ -195,9 +195,10 @@ class TestRequestSizes:
             "resource": large_resource
         }
 
-        # Should not crash
         from primer_vault.services.signing import validate_x402_request
         is_valid, version, error = validate_x402_request(x402_data)
+        assert is_valid is True
+        assert error == ""
 
     def test_many_accepts_entries(self):
         """Many entries in accepts array should be handled."""

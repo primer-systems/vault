@@ -4,9 +4,9 @@ One History row per on-chain transaction.
 An approval and the trade/lend it enables are two separate Transaction
 records, each settled independently the moment its own receipt resolves -
 not one record sharing a single tx_hash/status pair. These tests cover the
-model's new `approve` type and display helpers, and the real incident this
-was built to fix: an approval that settles while the leg after it fails must
-not end up mis-attributed or unverifiable.
+`approve` type and its display helpers, and the property that matters most:
+an approval that settles while the leg after it fails must not end up
+mis-attributed or unverifiable.
 """
 
 import sys
@@ -126,8 +126,8 @@ def test_display_amount_covers_every_type():
 
 class ApprovalSettlesThenSwapFailsAdapter:
     """The approval confirms cleanly; something raises while the swap is
-    being built/simulated - mirrors the real incident (approval settles in
-    under a second, the deposit/swap leg then errors)."""
+    being built/simulated - the approval settles quickly and the deposit/swap
+    leg then errors independently of it."""
 
     def __init__(self):
         self.sent = []
@@ -210,10 +210,9 @@ def test_settled_approval_is_not_lost_when_the_swap_leg_then_fails():
 
 # ---------------------------------------------------------------------------
 # 3. Verify: a settled approve row is verifiable even though the paired
-#    action failed - this is the exact "Verifying..." hang from the real
-#    incident. The bug was gating on the *operation's* status; each row now
-#    carries its own, so an approve row that settled is never blocked by
-#    whatever happened to the deposit/swap next to it.
+#    action failed. Each row carries its own status, so an approve row that
+#    settled is never blocked by whatever happened to the deposit/swap next
+#    to it.
 # ---------------------------------------------------------------------------
 
 def test_verify_proceeds_on_a_settled_approve_row():
@@ -259,7 +258,7 @@ def test_verify_refuses_a_failed_row_as_before():
 
 def _defi_service_that_rejects_at_broadcast():
     """A DefiService where the deposit is signed fine but the node refuses to
-    broadcast it - insufficient funds for gas, the real incident this covers.
+    broadcast it - insufficient funds for gas is the case that matters here.
     No approval step: the allowance is already in place, same as a retry
     after an earlier attempt already approved it."""
     from web3.exceptions import Web3RPCError

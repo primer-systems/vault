@@ -1,15 +1,15 @@
-# Vault v0.3.0
+# Vault v0.4.0
 
 ![Tests](https://github.com/primer-systems/Vault/actions/workflows/test.yml/badge.svg)
 
-**Secure Agentic Trading of RWA and Tokens on Robinhood Chain**
+**Secure Agentic Trading of RWA and Tokens on Robinhood Chain and Base**
 
 A desktop custody and authorization layer for AI agents, by Primer.
 
-Vault lets you delegate on-chain actions to AI agents without sharing private keys. It supports two authorization lanes:
+Vault lets you delegate on-chain actions to AI agents without sharing private keys. It supports two authorization lanes, both multi-network across Robinhood Chain and Base:
 
 - **x402 Payments** — Agents request signatures for paywalled services; Vault enforces spending policies and signs EIP-712 authorizations. Contains the full [MultiClaw engine](https://docs.primer.systems/multiclaw/overview.html) for AP2 protocol support.
-- **DeFi Trading** — Agents submit swap requests; Vault re-quotes independently, enforces trading limits, and executes on-chain (Uniswap v3 and v4 on Robinhood Chain).
+- **DeFi Trading** — Agents submit swap requests; Vault re-quotes independently, enforces trading limits, and executes on-chain (Uniswap v3 and v4).
 
 Both lanes share the same agent identity, policy system, and approval workflow. The agent never sees private keys.
 
@@ -106,7 +106,7 @@ commissioning. `A001` is the address ID shown by `address list`; a full `0x` add
 The example uses a **bearer** token, whose request format is the simple one
 shown under DeFi Trading below. For production, register with `--auth hmac`
 instead; HMAC requests are signed `SIG:<unix-time>:<hex>` and the exact
-format is served at `http://localhost:4663/agent`.
+format is served at `http://localhost:9402/agent`.
 
 A commissioned agent can learn what it's working with, no keys involved:
 `POST /mandate` returns its wallet address and live policy limits, and
@@ -133,12 +133,12 @@ Policies define what agents can do. Two independent lanes:
 - Min ETH balance (halts trading below this)
 
 ```bash
-primer-vault policy create standard \
+primer-vault policy create standard --networks 4663 \
   --day 100 --txn 50 --auto 5 \
   --trading --trade-max 100 --trade-daily 500
 
 # Trading-only policy (no x402 payments)
-primer-vault policy create trader --no-x402 --trading --trade-max 100
+primer-vault policy create trader --networks 4663 --no-x402 --trading --trade-max 100
 ```
 
 ### What a policy can and cannot enforce
@@ -316,7 +316,7 @@ Agent hits paywall → 402 + Payment-Required header
               Vault verifies on-chain, stores receipt
 ```
 
-Any agent framework can integrate via HTTP to `localhost:4663`. Bearer tokens for simplicity, HMAC-SHA256 for production security. The desktop window opens this port automatically; in the terminal edition, `server start` opens it (`server status` / `server stop` to manage it), and `config set start-agent-api on` makes it come up by itself at launch — which is what a machine with nobody sitting at it needs.
+Any agent framework can integrate via HTTP to `localhost:9402`. Bearer tokens for simplicity, HMAC-SHA256 for production security. The desktop window opens this port automatically; in the terminal edition, `server start` opens it (`server status` / `server stop` to manage it), and `config set start-agent-api on` makes it come up by itself at launch — which is what a machine with nobody sitting at it needs.
 
 ### Protocol Support
 
@@ -467,9 +467,10 @@ Agents can trade with native ETH directly:
 
 ### Network
 
-| Network | Chain ID | USDG | WETH |
-|---------|----------|------|------|
-| Robinhood Chain | 4663 | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
+| Network | Chain ID | Reference Stablecoin | WETH |
+|---------|----------|-----------------------|------|
+| Robinhood Chain | 4663 | USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` | `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73` |
+| Base | 8453 | USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | `0x4200000000000000000000000000000000000006` |
 
 ---
 
@@ -499,7 +500,7 @@ One command, and no modes.
 ```bash
 primer-vault                         # a session: prompt, live feed, all commands
 primer-vault agent list              # run one command and exit
-primer-vault policy create test --day 100
+primer-vault policy create test --networks 4663 --day 100
 
 # For scripts, supply the answers a command would otherwise ask for. Prefer the
 # environment variable to --password: a password on the command line is
@@ -715,24 +716,25 @@ contacts is listed here.
 
 | Host | When | What it learns |
 |---|---|---|
-| `rpc.mainnet.chain.robinhood.com` | Quotes, balances, allowances, and broadcasting transactions | Your addresses, and the transactions you send |
-| `robinhoodchain.blockscout.com` | Refreshing balances and discovering tokens | **Your wallet address** |
+| `rpc.mainnet.chain.robinhood.com` / `mainnet.base.org` | Quotes, balances, allowances, and broadcasting transactions | Your addresses, and the transactions you send |
+| `api.blockscout.com` (RHC) / `base.blockscout.com` (Base) | Refreshing balances and discovering tokens | **Your wallet address** |
 | `api.coingecko.com` | Valuing ETH-denominated trades against your policy limits | Nothing identifying — one price lookup, cached for a minute |
 | `ap2.primer.systems` | Only when you upload an Intent Mandate | The mandate: agent ID, wallet address, spending limits |
 
 Token icons are fetched from whatever URL Blockscout supplies for a token, so
 that host varies — commonly `assets.coingecko.com`. Only image data is read.
 
-**The RPC endpoint is yours to change.** Point it at your own node under
-**Settings → Network…** and the first row above goes with it. Blockscout refreshes
-your balances; CoinGecko values ETH-denominated trades against your policy
+**The RPC endpoint is yours to change, per network.** Point it at your own node
+under **Settings → Network…** and the first row above goes with it for that
+chain. Blockscout refreshes your balances; CoinGecko values ETH-denominated
+trades against your policy
 limits. Both fail gracefully, and a failed price lookup escalates a trade to
 manual approval rather than valuing it with a stale number.
 
-Vault also *listens* on `4663` for agents, and on an ephemeral loopback port for
+Vault also *listens* on `9402` for agents, and on an ephemeral loopback port for
 a second terminal to attach to a running engine. Both are bound to
 loopback and never accepts a connection from another machine. The agent API
-(`4663`) does too, unless you pass `--allow-lan`, which exposes only that port to
+(`9402`) does too, unless you pass `--allow-lan`, which exposes only that port to
 your local network. Both refuse any request a web page initiated.
 
 ---
@@ -742,7 +744,7 @@ your local network. Both refuse any request a web page initiated.
 - **Wallet Security:** AES-256-GCM encryption, Argon2id key derivation (256MB, 3 iterations); 8-character minimum password
 - **Payment Signing:** EIP-712 structured data, EIP-3009 `transferWithAuthorization`
 - **Trading:** Uniswap v3 SwapRouter02 and v4 UniversalRouter, multicall for atomic operations
-- **Network:** Robinhood Chain (4663)
+- **Network:** Robinhood Chain (4663), Base (8453)
 - **Protocol Support:** HTTP x402 v1/v2, A2A x402 (direct JSON)
 - **Auth Modes:** Bearer tokens (simple) or HMAC-SHA256 (production)
 

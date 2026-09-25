@@ -202,7 +202,7 @@ class TestTheCliRefusesANonFiniteLimit:
         from primer_vault.commands.policy import PolicyCommands
 
         cmd = PolicyCommands(core, handler=None)
-        result = cmd.execute(["create", "trader", "--trading",
+        result = cmd.execute(["create", "trader", "--networks", "4663", "--trading",
                               "--trade-daily", "nan", "--trade-max", "nan"])
         assert not result.success, (
             "'policy create --trade-daily nan' was accepted; the policy it "
@@ -212,7 +212,7 @@ class TestTheCliRefusesANonFiniteLimit:
         from primer_vault.commands.policy import PolicyCommands
 
         cmd = PolicyCommands(core, handler=None)
-        assert cmd.execute(["create", "trader", "--trading",
+        assert cmd.execute(["create", "trader", "--networks", "4663", "--trading",
                             "--trade-daily", "500"]).success
         result = cmd.execute(["edit", "trader", "--trade-daily", "nan"])
         assert not result.success, (

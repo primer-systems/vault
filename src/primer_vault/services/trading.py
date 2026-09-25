@@ -19,7 +19,8 @@ from ..models.agent import daily_allowance_is_due
 from ..models.trade import TradeRequest, TradeQuote, TradeResult
 from ..wallet.ledger import LedgerError
 from ..models.transaction import Transaction, STATUS_REJECTED
-from ..networks import (NETWORKS, DEFAULT_NETWORK, get_dex, get_dex_v4, TOKENS,
+from ..networks import (NETWORKS, DEFAULT_NETWORK, get_dex, get_dex_v4,
+                        get_trusted_stablecoin_addresses,
                         is_native_eth, is_wrap_trade, is_unwrap_trade)
 from .dex import DexAdapter, DexAdapterV3, DexError, to_atomic, from_atomic
 from .pending import PendingQueue, Reservations
@@ -232,14 +233,21 @@ class TradingService:
         cache[chain_id] = (rpc_url, adapter)
         return adapter
 
-    def _base_addresses(self, chain_id: int, version: str = "v3") -> tuple[str, str]:
-        """(usdg_address, weth_address) for the chain."""
+    def _base_addresses(self, chain_id: int, version: str = "v3") -> tuple[tuple[str, ...], str]:
+        """(trusted_stablecoin_addresses, weth_address) for the chain.
+
+        Trust-priced at $1, no quote (networks.TRUSTED_STABLECOINS).
+        Deliberately not quote-based like x402's pricing: quoting an
+        arbitrary pool to value the input leg is unsafe here, since a
+        manipulated thin pool could make a large, real trade quote as
+        artificially cheap and slide under the per-trade/daily cap.
+        """
         if version == "v4":
             dex = get_dex_v4(chain_id)
         else:
             dex = get_dex(chain_id)
-        usdg = TOKENS["USDG"].addresses.get(chain_id, "")
-        return usdg, dex.weth if dex else ""
+        stablecoins = get_trusted_stablecoin_addresses(chain_id)
+        return stablecoins, dex.weth if dex else ""
 
     # ---- daily volume accounting ----------------------------------------
     #
@@ -496,11 +504,11 @@ class TradingService:
         # like any other trade. Leaving it unpriced made every wrap escalate for
         # want of a number, whatever the auto-approve threshold was set to.
         def wrap_notional():
-            usdg_addr, _ = self._base_addresses(request.chain_id, version)
+            stablecoins, _ = self._base_addresses(request.chain_id, version)
             try:
                 return pricing.value_base_leg(
                     dex.weth, amount_in_atomic, meta_in["decimals"],
-                    usdg_addr, dex.weth)
+                    stablecoins, dex.weth)
             except pricing.PricingError:
                 return None  # unpriceable -> policy check escalates, as elsewhere
 
@@ -571,28 +579,30 @@ class TradingService:
             amount_in_atomic, expected_out)
 
         # Notional: value the INPUT leg only, and only when it is a base asset
-        # Vault can price independently (USDG = $1, WETH via the ETH feed).
+        # Vault can price independently (a trusted stablecoin = $1, WETH via
+        # the ETH feed).
         #
         # The input leg is what leaves the wallet, so it is what the per-trade
-        # cap must bound. Valuing the OUTPUT leg instead (the USDG/WETH received)
-        # measures the wrong side: an unknown token has no price Vault can trust
-        # - its only on-chain price is the pool being traded into, which an
-        # attacker can create and rig - so a sale of a whole token balance into
-        # a cheap pool would read as a tiny received amount and slip under the
-        # cap. When the input cannot be trust-priced the notional is left None,
-        # and an unvaluable trade escalates to a human rather than auto-executing.
-        usdg, weth = self._base_addresses(request.chain_id, version)
-        bases = {usdg.lower(), weth.lower()}
+        # cap must bound. Valuing the OUTPUT leg instead (the stablecoin/WETH
+        # received) measures the wrong side: an unknown token has no price
+        # Vault can trust - its only on-chain price is the pool being traded
+        # into, which an attacker can create and rig - so a sale of a whole
+        # token balance into a cheap pool would read as a tiny received amount
+        # and slip under the cap. When the input cannot be trust-priced the
+        # notional is left None, and an unvaluable trade escalates to a human
+        # rather than auto-executing.
+        stablecoins, weth = self._base_addresses(request.chain_id, version)
+        bases = {addr.lower() for addr in stablecoins} | {weth.lower()}
         # Native ETH is priced as WETH: same asset, same feed, same 18 decimals.
-        # It arrives as "ETH"/address(0), which is neither base address, so
-        # without this an ETH-input swap - a documented, common shape - would be
-        # left unvalued and escape the per-trade and daily caps.
+        # It arrives as "ETH"/address(0), which is not in `bases`, so without
+        # this an ETH-input swap - a documented, common shape - would be left
+        # unvalued and escape the per-trade and daily caps.
         base_in = weth if is_native_eth(request.token_in) else request.token_in
         notional = None
         if base_in.lower() in bases:
             try:
                 notional = pricing.value_base_leg(
-                    base_in, amount_in_atomic, meta_in["decimals"], usdg, weth)
+                    base_in, amount_in_atomic, meta_in["decimals"], stablecoins, weth)
             except pricing.PricingError:
                 notional = None  # feed down; unvaluable trades escalate
 

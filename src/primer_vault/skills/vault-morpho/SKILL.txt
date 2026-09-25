@@ -1,6 +1,6 @@
 ---
 name: vault-morpho
-description: Lend USDG on Morpho through the Vault desktop app - supply to a curated vault or market, withdraw, and see what you hold. Vault holds the keys, enforces the user's limits, and executes, rejects, or asks the user to approve.
+description: Lend on Morpho through the Vault desktop app on Robinhood Chain (USDG) or Base (USDC) - supply to a curated vault or market, withdraw, and see what you hold. Vault holds the keys, enforces the user's limits, and executes, rejects, or asks the user to approve.
 license: MIT
 compatibility:
   models: ["*"]
@@ -14,11 +14,18 @@ metadata:
 
 # Vault Morpho Lending Skill
 
-You can supply USDG to Morpho and withdraw it again through Vault. You decide
-what to do; Vault is a broker that holds the keys, checks each operation against
-the user's policy, and executes it or asks the user to approve.
+You can supply to Morpho and withdraw again through Vault, on Robinhood Chain
+(USDG) or Base (USDC). You decide what to do; Vault is a broker that holds the
+keys, checks each operation against the user's policy, and executes it or asks
+the user to approve.
 
-The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:4663`).
+Both networks work the same way - same endpoints, same request shape, same
+policy fields. Which one a request targets is `chain_id` inside the `position`
+object (`4663` for Robinhood Chain, `8453` for Base; defaults to `4663`).
+Everything below applies to either; it just says "USDG" throughout since
+that's Robinhood Chain's asset - read it as "the chain's asset" on Base.
+
+The Vault URL is in `PRIMER_VAULT_URL` (default `http://localhost:9402`).
 
 ## Authenticating
 
@@ -37,6 +44,7 @@ timestamp = int(time.time())
 
 position = {
     "action": "supply",
+    "chain_id": 4663,             # 4663 = Robinhood Chain, 8453 = Base; defaults to 4663
     "venue": "0xBeEff033F34C046626B8D0A041844C5d1A5409dd",
     "venue_kind": "vault",
     "amount": "25.5",             # human units, not atomic
@@ -55,17 +63,25 @@ body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}",
 Sign the object exactly as you send it. Vault verifies against what arrived, so
 a field added, dropped or reordered after signing fails as `AUTH_FAILED`.
 
-### /venues signs an empty position
+### /venues signs a position holding only chain_id
 
-`/venues` carries no position object, but it is signed under the same key with
-an empty one. This is not a typo - copy it exactly:
+`/venues` has no position of its own to sign, but it is signed under the same
+key as `/position` - empty for Robinhood Chain (the default), or holding just
+`chain_id` to ask about Base. This is not a typo - copy it exactly, and send
+that same object as `position` in the body so Vault can check the signature
+against it:
 
 ```python
-msg = json.dumps({"agent_id": agent_id, "timestamp": timestamp, "position": {}},
+venues_position = {}                      # Robinhood Chain (default)
+# venues_position = {"chain_id": 8453}    # Base
+
+msg = json.dumps({"agent_id": agent_id, "timestamp": timestamp,
+                  "position": venues_position},
                  separators=(",", ":"), sort_keys=True).encode()
 sig = hmac.new(bytes.fromhex(token[3:]), msg, hashlib.sha256).hexdigest()
 
-body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}"}
+body = {"agent_id": agent_id, "signature": f"SIG:{timestamp}:{sig}",
+        "position": venues_position}
 # POST body to  ${PRIMER_VAULT_URL}/venues
 ```
 

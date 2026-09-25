@@ -13,7 +13,7 @@ from typing import Optional, Callable, TYPE_CHECKING
 
 from .events import EventBus, Event, EventType
 from .interfaces import ApprovalHandler, HeadlessApprovalHandler
-from .settings import SettingsManager, AppSettings
+from .settings import SettingsManager, AppSettings, DEFAULT_PORT
 
 if TYPE_CHECKING:
     from ..models import PolicyStore, Agent, SpendPolicy, Transaction, TradingRules
@@ -289,7 +289,7 @@ class Vault:
         Best-effort only: an error here is logged and retried next cycle, and
         must never be allowed to affect startup or any request in flight.
         """
-        from ..networks import DEFAULT_NETWORK
+        from ..networks import NETWORKS
         from ..services.defi import VENUE_CACHE_SECONDS
 
         def warm_once() -> None:
@@ -300,9 +300,13 @@ class Vault:
                     if rules and rules.enabled and rules.morpho_curators:
                         curator_sets.add(tuple(sorted(
                             c.lower() for c in rules.morpho_curators)))
-                for curators in curator_sets:
-                    self._defi_service.venues(
-                        DEFAULT_NETWORK, list(curators), force=True)
+                # One combined curator list can name addresses from every
+                # chain (see all_default_curators) - warm each chain's cache
+                # with it, not just the default network's.
+                for chain_id in NETWORKS:
+                    for curators in curator_sets:
+                        self._defi_service.venues(
+                            chain_id, list(curators), force=True)
             except Exception:
                 logger.exception("DeFi venue warm-up failed; will retry")
 
@@ -1823,7 +1827,7 @@ class Vault:
     # Server Operations
     # -------------------------------------------------------------------------
 
-    def start_server(self, port: int = 4663, allow_lan: bool = False) -> bool:
+    def start_server(self, port: int = DEFAULT_PORT, allow_lan: bool = False) -> bool:
         """Start the agent HTTP server."""
         if self._agent_server.is_running:
             return True

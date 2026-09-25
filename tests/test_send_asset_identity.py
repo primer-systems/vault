@@ -231,9 +231,9 @@ class TestSendSignsTheAmountItShowed:
         dlg._execute_send()
 
         assert "0.001" in seen["message"], seen["message"]
-        # The bug was a native send of value = 0.001 * 10**21 = 1 ETH. No signed
-        # transaction may carry native value now: the ERC-20 path moves the
-        # token via calldata with value 0.
+        # A native send would carry value = 0.001 * 10**21 = 1 ETH, scaled by the
+        # counterfeit's decimals(21). No signed transaction may carry native
+        # value here: the ERC-20 path moves the token via calldata with value 0.
         moved = [tx.get("value", 0) for tx in signed_txs if tx.get("value", 0)]
         assert not moved, (
             f"selecting the counterfeit ERC-20 signed a native transfer of "

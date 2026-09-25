@@ -147,13 +147,16 @@ def _extract_resource(x402_data: Dict[str, Any], req: Dict[str, Any], version: i
 def _select_offer(accepts: list) -> Any:
     """Pick the offer Vault can settle, from a list of alternatives.
 
-    Supported means: a chain Vault knows, and USDG on that chain. The choice is
-    a convenience - every gate that matters runs afterwards on whatever is
-    returned here.
+    Supported means: a chain Vault knows. Any asset works for
+    signing/settlement (build_transfer_authorization_typed_data reads
+    decimals/domain live) - no asset allowlist here. An offer in the
+    chain's reference stablecoin is preferred (1:1, no quote needed); the
+    actual limit enforcement happens in signing.py, not here.
     """
-    from ..networks import NETWORKS, TOKENS
+    from ..networks import NETWORKS, get_reference_stablecoin_address
 
-    usdg = TOKENS["USDG"].addresses
+    reference_match = None
+    first_supported = None
     for entry in accepts:
         if not isinstance(entry, dict):
             continue
@@ -165,9 +168,19 @@ def _select_offer(accepts: list) -> Any:
             chain_id = parse_caip_network(to_caip_network(str(network)))
         except (ValueError, IndexError):
             continue
-        expected = usdg.get(chain_id)
-        if chain_id in NETWORKS and expected and str(asset).lower() == expected.lower():
-            return entry
+        if chain_id not in NETWORKS:
+            continue
+        if first_supported is None:
+            first_supported = entry
+        reference = get_reference_stablecoin_address(chain_id)
+        if reference and str(asset).lower() == reference.lower():
+            reference_match = entry
+            break
+
+    if reference_match is not None:
+        return reference_match
+    if first_supported is not None:
+        return first_supported
 
     # Nothing supported. Return the first so the error names its asset rather
     # than saying only that none of them matched.

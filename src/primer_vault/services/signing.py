@@ -206,6 +206,20 @@ class SigningRequest:
     signature: Optional[str] = None  # Original signature for idempotency cache updates
     cache_key: Optional[str] = None  # Full cache key including payload hash
 
+    def display_amount(self) -> str:
+        """Human-readable amount for approval surfaces. amount_micro == 0
+        means unpriced, not free - shows the real requested asset/amount
+        instead of a misleading "0.000000 USDG"."""
+        if self.amount_micro > 0:
+            return f"{self.amount_micro/1_000_000:.6f} USDG-equivalent"
+        try:
+            entry = self.x402_data.get("accepts", [{}])[0]
+            asset = entry.get("asset", "unknown asset")
+            amount = entry.get("amount") or entry.get("maxAmountRequired", "?")
+        except (AttributeError, IndexError, TypeError):
+            asset, amount = "unknown asset", "?"
+        return f"{amount} units of {asset} (unpriced - not counted against limits)"
+
 
 class SigningService:
     """
@@ -461,29 +475,97 @@ class SigningService:
         self._max_request_age_seconds = seconds
         logger.info(f"Max request age set to {seconds}s")
 
-    def _check_asset_supported(self, chain_id: int, asset: str) -> Optional[str]:
-        """Check the payment asset is USDG on this chain.
+    def _price_in_reference_micro(self, chain_id: int, asset: str, raw_amount) -> Optional[int]:
+        """Price a requested x402 payment in the chain's reference-stablecoin
+        micro-units, or None if it can't be priced.
 
-        Vault denominates every spending limit in USDG and reads the requested
-        amount as micro-USDG. The asset is chosen by whoever issued the 402, so
-        it is checked against the chain's USDG address here, before the amount
-        is interpreted or any limit is applied.
+        The reference stablecoin prices 1:1 (its own atomic amount IS the
+        micro amount, both USDG/USDC are 6-decimal). Any other asset gets a
+        bounded on-chain quote (_quote_to_reference_micro). None means
+        unpriceable - never treat it as zero or as the raw atomic amount;
+        the caller routes it to forced manual approval.
 
-        Returns None if the asset is supported, or an error message.
+        Raises ValueError on a malformed, non-positive, or absurdly large
+        raw amount.
         """
-        from ..networks import TOKENS
+        try:
+            raw = int(raw_amount)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Invalid amount: {raw_amount!r}") from e
+        if raw <= 0:
+            raise ValueError(f"amount must be positive, got {raw}")
 
-        expected = TOKENS["USDG"].addresses.get(chain_id)
-        if not expected:
-            return f"No supported payment asset is configured for chain {chain_id}"
+        from ..networks import get_reference_stablecoin_address
 
-        if not asset or asset.lower() != expected.lower():
-            return (
-                f"Unsupported payment asset {asset}. Vault settles x402 payments "
-                f"in USDG ({expected}) on chain {chain_id}."
-            )
+        reference = get_reference_stablecoin_address(chain_id)
+        if not reference:
+            return None
 
-        return None
+        if asset and asset.lower() == reference.lower():
+            if raw > 10**15:  # $1 billion in micro-units - unreasonable upper bound
+                raise ValueError(f"amount exceeds maximum ({raw} > 10^15)")
+            return raw
+
+        return self._quote_to_reference_micro(chain_id, asset, raw, reference)
+
+    def _quote_to_reference_micro(self, chain_id: int, asset: str,
+                                   amount_in_atomic: int, reference: str) -> Optional[int]:
+        """Bounded Uniswap v3 quote from `asset` to the chain's reference
+        stablecoin: direct pool first, one WETH hop if none, then give up.
+        Any failure (no pool/route, timeout, RPC error) returns None rather
+        than raising.
+        """
+        import concurrent.futures
+
+        from ..networks import get_dex, NETWORKS
+        from .dex import DexAdapterV3, DexError
+
+        config = get_dex(chain_id)
+        network = NETWORKS.get(chain_id)
+        if not config or not network or not asset:
+            return None
+
+        rpc_url = network.rpc_url
+        if self._rpc_resolver is not None:
+            try:
+                rpc_url = self._rpc_resolver(chain_id) or rpc_url
+            except Exception:
+                logger.exception("RPC resolver failed for chain %s", chain_id)
+
+        def _do_quote() -> Optional[int]:
+            adapter = DexAdapterV3(rpc_url, config)
+
+            for fee in config.fee_tiers:
+                try:
+                    result = adapter.quote_exact_input_single(
+                        asset, reference, amount_in_atomic, fee)
+                    return int(result["amount_out"])
+                except DexError:
+                    continue
+
+            if asset.lower() != config.weth.lower() and reference.lower() != config.weth.lower():
+                for fee_in in config.fee_tiers:
+                    try:
+                        leg1 = adapter.quote_exact_input_single(
+                            asset, config.weth, amount_in_atomic, fee_in)
+                    except DexError:
+                        continue
+                    for fee_out in config.fee_tiers:
+                        try:
+                            leg2 = adapter.quote_exact_input_single(
+                                config.weth, reference, int(leg1["amount_out"]), fee_out)
+                            return int(leg2["amount_out"])
+                        except DexError:
+                            continue
+
+            return None
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_do_quote)
+                return future.result(timeout=3)
+        except Exception:
+            return None  # timeout/RPC error -> unpriceable, fail closed
 
     def _check_daily_reset(self, agent: "Agent") -> bool:
         """Check if agent's daily spending needs to be reset (new calendar day).
@@ -1516,7 +1598,6 @@ class SigningService:
         from .eip3009 import parse_x402
         try:
             requirements = parse_x402(decoded_x402_data)
-            amount_micro = self._bounded_amount_micro(requirements.max_amount_required)
         except ValueError as e:
             self._emit_activity(f"Invalid x402 from {agent.name}: {e}", True)
             server_stats.rejected += 1
@@ -1538,22 +1619,22 @@ class SigningService:
         except (ValueError, IndexError):
             chain_id = 0
 
-        # Asset check runs before any limit is applied: the amount above was read
-        # as micro-USDG, which only holds for USDG.
-        asset_error = self._check_asset_supported(chain_id, requirements.asset)
-        if asset_error:
-            self._emit_activity(f"Request from {agent.name} rejected: {asset_error}", True)
+        # priced_micro is None when unpriceable - forces manual approval
+        # further down rather than an error; amount_micro=0 no-ops the
+        # numeric limit checks below.
+        try:
+            priced_micro = self._price_in_reference_micro(
+                chain_id, requirements.asset, requirements.max_amount_required)
+        except ValueError as e:
+            self._emit_activity(f"Invalid x402 amount from {agent.name}: {e}", True)
             server_stats.rejected += 1
-            tx = self._create_rejection_transaction(
-                agent, amount_micro, network, recipient, asset_error, resource,
-                decoded_x402_data, request_url=request_url
-            )
             return {
                 "status": "error",
-                "error": asset_error,
-                "code": "UNSUPPORTED_ASSET",
-                "transaction_id": tx.id
+                "error": str(e),
+                "code": "INVALID_X402_FORMAT"
             }
+        is_priced = priced_micro is not None
+        amount_micro = priced_micro if is_priced else 0
 
         if chain_id and not self.is_network_enabled(chain_id):
             network_name = network_to_v1(caip_network)
@@ -1572,8 +1653,10 @@ class SigningService:
                 "transaction_id": tx.id
             }
 
-        # Check if network is allowed by policy (policy-level restriction)
-        if chain_id and policy.networks and chain_id not in policy.networks:
+        # `is not None`, not truthy: None means unrestricted (legacy
+        # policies), [] means restricted to nothing - a truthy check would
+        # conflate the two.
+        if chain_id and policy.networks is not None and chain_id not in policy.networks:
             network_name = network_to_v1(caip_network)
             allowed_names = [network_to_v1(f"eip155:{cid}") for cid in policy.networks]
             reason = f"Network {network_name} not allowed by policy (allowed: {', '.join(allowed_names)})"
@@ -1668,7 +1751,10 @@ class SigningService:
                 "transaction_id": tx.id
             }
 
+        # An unpriced asset always needs approval - amount_micro is 0, which
+        # would otherwise trivially clear any auto_approve_below_micro.
         needs_approval = (
+            not is_priced or
             policy.auto_approve_below_micro is None or
             amount_micro >= policy.auto_approve_below_micro
         )
@@ -1705,7 +1791,7 @@ class SigningService:
                 time.monotonic() + PENDING_REQUEST_TTL_SECONDS)
 
             self._emit_activity(
-                f"Payment request from {agent.name}: {amount_micro/1_000_000:.6f} USDG - awaiting approval",
+                f"Payment request from {agent.name}: {request.display_amount()} - awaiting approval",
                 False
             )
             self._emit_approval_needed(request)
@@ -1837,8 +1923,9 @@ class SigningService:
                 "code": "NETWORK_DISABLED"
             }
 
-        # Re-validate network is allowed by policy (may have changed)
-        if chain_id and policy.networks and chain_id not in policy.networks:
+        # Re-validate network is allowed by policy (may have changed).
+        # `is not None`, not truthy - see the other call site's comment.
+        if chain_id and policy.networks is not None and chain_id not in policy.networks:
             self._drop_pending(request_id)
             return {
                 "status": "error",
@@ -2073,31 +2160,27 @@ class SigningService:
                         "code": "INVALID_PAYMENT_DATA"
                     }
 
-            # Every signing route converges here, so the asset is confirmed once
-            # more immediately before the signature is produced.
-            asset_error = self._check_asset_supported(
-                requirements.chain_id, requirements.asset)
-            if asset_error:
-                self._emit_activity(f"Signing blocked: {asset_error}", True)
-                return {
-                    "status": "error",
-                    "error": asset_error,
-                    "code": "UNSUPPORTED_ASSET"
-                }
-
-            # Bind the signature to the amount that was checked. amount_micro is
-            # the figure the limits were applied to, the daily spend is debited
-            # by, and the transaction records; the value about to be signed is
-            # read from the payload. In normal operation they are the same parse
-            # and always equal - but the signature must never commit to an
-            # amount that was never limit-checked, so refuse if they diverge.
-            if int(requirements.max_amount_required) != amount_micro:
-                return {
-                    "status": "error",
-                    "code": "AMOUNT_MISMATCH",
-                    "error": ("Payment amount does not match the checked amount; "
-                              "refusing to sign."),
-                }
+            # Bind the signature to the priced amount that was limit-checked.
+            # Re-prices rather than comparing raw wire value directly, since
+            # amount_micro is a quote for non-reference assets, not the raw
+            # amount. amount_micro == 0 is the unpriced case, already
+            # approved by a human with no numeric limit to reconfirm - skip.
+            if amount_micro > 0:
+                try:
+                    reconfirmed_micro = self._price_in_reference_micro(
+                        requirements.chain_id, requirements.asset, requirements.max_amount_required)
+                except ValueError:
+                    reconfirmed_micro = None
+                if reconfirmed_micro != amount_micro:
+                    self._emit_activity(
+                        f"Signing blocked: amount/price no longer matches what was checked "
+                        f"({agent.name})", True)
+                    return {
+                        "status": "error",
+                        "code": "AMOUNT_MISMATCH",
+                        "error": ("Payment amount no longer matches the checked amount "
+                                  "(price may have moved); refusing to sign."),
+                    }
 
             # Check if this is a Ledger address
             if addr_entry.is_hardware:
@@ -2483,27 +2566,3 @@ class SigningService:
         policy_name = policy.name if policy else None
 
         return tx.to_ap2_receipt(policy_name=policy_name)
-
-    def _bounded_amount_micro(self, raw_amount) -> int:
-        """
-        Convert a parsed atomic amount to a bounds-checked int of micro-USDG.
-
-        USDG has 6 decimals, so the atomic amount is already micro-USDG
-        (1_000_000 = $1.00). `_check_asset_supported` guarantees the asset is
-        USDG before this runs.
-
-        Raises ValueError on a non-integer, non-positive, or absurdly large
-        amount.
-        """
-        try:
-            amount_micro = int(raw_amount)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Invalid amount: {raw_amount!r}") from e
-
-        # Bounds validation
-        if amount_micro <= 0:
-            raise ValueError(f"amount must be positive, got {amount_micro}")
-        if amount_micro > 10**15:  # $1 billion in micro-USDG - unreasonable upper bound
-            raise ValueError(f"amount exceeds maximum ({amount_micro} > 10^15)")
-
-        return amount_micro

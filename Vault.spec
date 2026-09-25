@@ -79,6 +79,9 @@ a = Analysis(
         'PyQt6.QtCore',
         'PyQt6.QtGui',
         'PyQt6.QtWidgets',
+        # Network chain marks (ui/network_icons.py) render from SVG. Without
+        # this the frozen build raises ImportError on the History tab.
+        'PyQt6.QtSvg',
         # Cryptography - core modules for signing
         'cryptography.hazmat.primitives.asymmetric.ed25519',
         'cryptography.hazmat.primitives.asymmetric.ec',

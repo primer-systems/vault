@@ -253,37 +253,6 @@ class TestInvalidTxHash:
 class TestNetworkResolution:
     """Test network resolution for verification."""
 
-    def test_caip_network_format(self, signing_service):
-        """CAIP-2 network format should be parsed correctly."""
-        tx = Transaction.create(
-            agent_id="ABC123",
-            agent_name="TestAgent",
-            agent_code="TEST",
-            amount_micro=1000000,
-            recipient="0x" + "1" * 40,
-            network="eip155:4663"  # CAIP-2 format
-        )
-        tx.status = "settled"
-        tx.tx_hash = "0x" + "ab" * 32
-
-        # Chain ID should be extracted correctly
-        # Test would need actual RPC mock to verify
-
-    def test_v1_network_format(self, signing_service):
-        """v1 network format should be resolved correctly."""
-        tx = Transaction.create(
-            agent_id="ABC123",
-            agent_name="TestAgent",
-            agent_code="TEST",
-            amount_micro=1000000,
-            recipient="0x" + "1" * 40,
-            network="robinhood"  # v1 format
-        )
-        tx.status = "settled"
-        tx.tx_hash = "0x" + "ab" * 32
-
-        # Should resolve "robinhood" to chain ID 4663
-
     def test_unknown_network_handled(self, signing_service):
         """Unknown network should be handled gracefully."""
         tx = Transaction.create(

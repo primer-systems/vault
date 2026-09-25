@@ -14,7 +14,7 @@ metadata:
 
 # Vault x402 Payment Skill
 
-You have access to the Vault payment authorization system. The Vault URL is provided via the `PRIMER_VAULT_URL` environment variable, or defaults to `http://localhost:4663`.
+You have access to the Vault payment authorization system. The Vault URL is provided via the `PRIMER_VAULT_URL` environment variable, or defaults to `http://localhost:9402`.
 
 ## What This Does
 
@@ -44,7 +44,7 @@ If `PRIMER_VAULT_AUTH_MODE=bearer`, use this. No Python, no signing—just curl:
 PAYMENT_HEADER="eyJhY2NlcHRzIjpbey..."  # The value from Payment-Required header
 
 # 3. Send to Vault
-curl -X POST http://localhost:4663/sign \
+curl -X POST http://localhost:9402/sign \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "YOUR_CODE",
@@ -81,7 +81,7 @@ MSG="{\"agent_id\":\"$AGENT_ID\",\"payment_required\":\"$PAYMENT_HEADER\",\"requ
 SIG=$(echo -n "$MSG" | openssl dgst -sha256 -mac HMAC -macopt hexkey:${TOKEN:3} | cut -d' ' -f2)
 
 # Send to Vault
-curl -X POST http://localhost:4663/sign \
+curl -X POST http://localhost:9402/sign \
   -H "Content-Type: application/json" \
   -d "{\"agent_id\":\"$AGENT_ID\",\"signature\":\"SIG:$TIMESTAMP:$SIG\",\"payment_required\":\"$PAYMENT_HEADER\",\"request_url\":\"$URL\"}"
 ```
@@ -116,7 +116,7 @@ Just grab that header value (`eyJhY2NlcHRzIjpbey...`) and send it to Vault. Don'
   - `PRIMER_VAULT_AGENT_ID`: Your agent ID (e.g., "ABC123")
   - `PRIMER_VAULT_AGENT_TOKEN`: Your token (e.g., "AT_...")
   - `PRIMER_VAULT_AUTH_MODE`: Authentication mode (`bearer` or `hmac`)
-  - `PRIMER_VAULT_URL` (optional): Vault endpoint, defaults to `http://localhost:4663`
+  - `PRIMER_VAULT_URL` (optional): Vault endpoint, defaults to `http://localhost:9402`
 
 ---
 
@@ -138,7 +138,7 @@ If `PRIMER_VAULT_AUTH_MODE=hmac`, you need to sign each request. The bash/curl a
 ### Python Option 1: Helper Script
 
 ```bash
-curl ${PRIMER_VAULT_URL:-http://localhost:4663}/sign/helper -o vault_sign.py
+curl ${PRIMER_VAULT_URL:-http://localhost:9402}/sign/helper -o vault_sign.py
 ```
 
 ```python
@@ -315,7 +315,7 @@ if result.get("status") == "pending":
     # 2. Poll for approval (returns full result including payment header)
     while True:
         time.sleep(2)  # Poll every 2 seconds
-        status_url = f"http://localhost:4663/sign/status/{request_id}"
+        status_url = f"http://localhost:9402/sign/status/{request_id}"
         status = json.loads(urllib.request.urlopen(status_url).read())
 
         if status.get("status") == "success":
@@ -588,11 +588,16 @@ field inside each accept.
 
 ### Supported Network
 
-Vault operates on Robinhood Chain (use CAIP-2 format).
+Vault operates on Robinhood Chain and Base (use CAIP-2 format). A payment
+request may name any asset the resource server accepts - Vault is not
+restricted to the reference stablecoin below, though a request in a
+different asset that Vault can't get a price for will require manual
+approval regardless of amount (see services/signing.py).
 
-| Network | Identifier | USDG Contract |
-|---------|------------|---------------|
-| Robinhood Chain | `eip155:4663` | `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+| Network | Identifier | Reference Stablecoin |
+|---------|------------|----------------------|
+| Robinhood Chain | `eip155:4663` | USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` |
+| Base | `eip155:8453` | USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 
 **Important:** When using `x402_data`, sign over `x402_data` (not `payment_required`):
 

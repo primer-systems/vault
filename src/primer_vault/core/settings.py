@@ -16,8 +16,9 @@ from ..models.store import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
-# Canonical default port for Vault (RHC mainnet chain ID)
-DEFAULT_PORT = 4663
+# Canonical default port for Vault's agent API. Was 4663, coincidentally
+# also RHC's chain ID - decoupled in 0.4. Continues MultiClaw's numbering.
+DEFAULT_PORT = 9402
 
 #: Requests per minute one caller may make to the agent API. 0 means no ceiling.
 #:
@@ -33,8 +34,13 @@ DEFAULT_SETTINGS = {
     "signing": {
         "verify_settlements": True,
         "max_request_age_seconds": 300,
+        # Every registered network is on by default; see
+        # SettingsManager.is_network_enabled. Listed explicitly so a fresh
+        # settings file states what it does rather than leaving the reader to
+        # infer it from an empty dict.
         "enabled_networks": {
-            "4663": True,    # Robinhood Chain - enabled by default
+            "4663": True,    # Robinhood Chain
+            "8453": True,    # Base
         }
     },
     "server": {
@@ -49,9 +55,7 @@ DEFAULT_SETTINGS = {
     "display": {
         "default_network": 4663
     },
-    "rpc": {
-        "4663": None
-    }
+    "rpc": {}
 }
 
 
@@ -60,7 +64,10 @@ class SigningSettings:
     """Signing-related settings."""
     verify_settlements: bool = True
     max_request_age_seconds: int = 300
-    enabled_networks: dict = field(default_factory=lambda: {"4663": True})
+    # Empty = nothing explicitly set = every registered network enabled
+    # (see SettingsManager.is_network_enabled). Not a chain literal: this
+    # default outlives any particular chain being "the" chain.
+    enabled_networks: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -104,7 +111,9 @@ class DisplaySettings:
 @dataclass
 class RpcSettings:
     """Custom RPC endpoint settings."""
-    endpoints: dict = field(default_factory=lambda: {"4663": None})
+    # Empty = every network uses its registry rpc_url. An entry is only
+    # written when the user overrides one.
+    endpoints: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -151,7 +160,11 @@ class AppSettings:
             s = data["signing"]
             settings.signing.verify_settlements = s.get("verify_settlements", True)
             settings.signing.max_request_age_seconds = s.get("max_request_age_seconds", 300)
-            settings.signing.enabled_networks = s.get("enabled_networks", {"4663": True})
+            # Default to {} rather than a chain literal: an empty dict means
+            # "nothing explicitly set", and is_network_enabled reads that as
+            # every registered network enabled. A literal here would freeze
+            # one chain's name into the loader.
+            settings.signing.enabled_networks = s.get("enabled_networks", {})
 
         if "server" in data:
             s = data["server"]
@@ -449,8 +462,24 @@ class SettingsManager:
                 self._on_change(self._settings)
 
     def is_network_enabled(self, chain_id: int) -> bool:
-        """Check if a network is enabled."""
-        return self._settings.signing.enabled_networks.get(str(chain_id), False)
+        """Check if a network is enabled. Registered networks default to on.
+
+        Absence means enabled. This switch is a kill switch - a global "stop
+        touching this chain" that sits above every policy - and a kill switch
+        whose resting state is "everything already killed" is a setup step
+        wearing a safety feature's clothes. Authorization is the policies'
+        job; they name their chains explicitly since 0.4.
+
+        A network the registry does not know stays disabled - absence of a
+        record is only permission when there is something real to enable. An
+        explicit `false` always wins, which is what makes the toggle a kill
+        switch rather than a hint.
+        """
+        stored = self._settings.signing.enabled_networks.get(str(chain_id))
+        if stored is not None:
+            return bool(stored)
+        from ..networks import NETWORKS
+        return chain_id in NETWORKS
 
     def set_network_enabled(self, chain_id: int, enabled: bool) -> None:
         """Enable or disable a network."""

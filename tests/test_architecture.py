@@ -140,9 +140,9 @@ class TestNoQtInCore:
         """Rule 8: the shared tier imports on a machine with no PyQt6 at all.
 
         The rule above reads source; this one runs it. A Qt import inside a
-        function body - the shape that hid PyQt6 in utils.py for a year - is
-        invisible to a source scan and fatal to a Terminal install, because it
-        fails when the function is called rather than when the module loads.
+        function body is invisible to a source scan and fatal to a Terminal
+        install, because it fails when the function is called rather than
+        when the module loads.
 
         Runs in a subprocess with the Qt packages poisoned in sys.modules, so
         importing one raises exactly as it would on a bare server.

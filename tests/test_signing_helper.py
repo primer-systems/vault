@@ -1,15 +1,11 @@
 """
 Signing helper tests.
 
-`GET /sign/helper` serves a script agents run to sign x402 requests. It used to
-exist twice - inline in server.py and as a file in the skill folder - and the two
-drifted: the shipped file signed the field as "agent_code" while the server
-verifies "agent_id", so every signature it produced was rejected with "Invalid
-signature", which reads like a credentials problem rather than a bad helper.
-
-There is now one copy. These tests run the served script the way an agent would
-and check its output against the server's own verification, so the two cannot
-drift apart again without a failure.
+`GET /sign/helper` serves a script agents run to sign x402 requests, and the
+file in the skill folder is the one copy served - there is nothing else to
+drift out of step with it. These tests run the served script the way an agent
+would and check its output against the server's own verification, so the two
+cannot drift apart without a failure.
 """
 
 import hashlib

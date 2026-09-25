@@ -20,6 +20,16 @@ def _parse_limit_float(s: str) -> float:
     return v
 
 
+def _format_networks(networks) -> str:
+    """None = unrestricted (legacy), [] = no networks allowed - distinct
+    states, must not display the same."""
+    if networks is None:
+        return "All"
+    if not networks:
+        return "None (no network allowed)"
+    return ", ".join(str(n) for n in networks)
+
+
 def _parse_domain_list(args: list[str], i: int) -> tuple[list[str], int]:
     """Parse the value of a --allow-domains / --block-domains flag at args[i].
 
@@ -167,7 +177,7 @@ allowed/blocked domains, and network restrictions.""")
                 f"  Auto-approve:     ${auto:.2f}",
                 f"  Allowed Domains:  {', '.join(policy.allowed_domains) if policy.allowed_domains else 'All'}",
                 f"  Blocked Domains:  {', '.join(policy.blocked_domains) if policy.blocked_domains else 'None'}",
-                f"  Networks:         {', '.join(str(n) for n in policy.networks) if policy.networks else 'All'}",
+                f"  Networks:         {_format_networks(policy.networks)}",
             ])
 
         # Trading rules section
@@ -225,9 +235,13 @@ x402 Payment Options:
   --day <amount>           Daily spending limit in USD (default: 100)
   --txn <amount>           Per-transaction maximum in USD (default: 10)
   --auto <amount>          Auto-approve threshold in USD (default: none)
-  --networks <ids>         Comma-separated chain IDs (default: all)
   --allow-domains <list>   Comma-separated allowed domains (empty = allow any)
   --block-domains <list>   Comma-separated blocked domains (empty = block none)
+
+Required:
+  --networks <ids>         Comma-separated chain IDs, or 'all' for every
+                            currently-enabled network. No default - a new
+                            policy must state its network scope explicitly.
 
 Trading Options:
   --trading                Enable trading for this policy
@@ -248,11 +262,11 @@ Morpho Lending Options:
   --no-restrict            Allow any Morpho venue, not only Steakhouse's
 
 Examples:
-  policy create standard
-  policy create premium --day 500 --txn 50 --auto 5
-  policy create trader --trading --trade-max 200 --trade-daily 1000 --trade-auto 25
-  policy create trading-only --no-x402 --trading --trade-max 100
-  policy create lender --no-x402 --morpho --morpho-max 50 --morpho-total 250""")
+  policy create standard --networks all
+  policy create premium --networks 4663 --day 500 --txn 50 --auto 5
+  policy create trader --networks all --trading --trade-max 200 --trade-daily 1000 --trade-auto 25
+  policy create trading-only --networks 8453 --no-x402 --trading --trade-max 100
+  policy create lender --networks 4663 --no-x402 --morpho --morpho-max 50 --morpho-total 250""")
 
     def _create(self, args: list[str]) -> CommandResult:
         """Create a new policy."""
@@ -313,10 +327,21 @@ Examples:
                     return CommandResult.fail(f"Invalid value for --auto: {args[i + 1]}")
                 i += 2
             elif args[i] == "--networks" and i + 1 < len(args):
-                try:
-                    networks = [int(n.strip()) for n in args[i + 1].split(",")]
-                except ValueError:
-                    return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
+                if args[i + 1].strip().lower() == "all":
+                    from ..networks import NETWORKS
+                    networks = [
+                        chain_id for chain_id in NETWORKS
+                        if self.core.settings_manager.is_network_enabled(chain_id)
+                    ]
+                    if not networks:
+                        return CommandResult.fail("--networks all: no networks are currently enabled")
+                else:
+                    try:
+                        networks = [int(n.strip()) for n in args[i + 1].split(",")]
+                    except ValueError:
+                        return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
+                    if not networks:
+                        return CommandResult.fail("--networks requires at least one chain ID")
                 i += 2
             elif args[i] == "--allow-domains":
                 allow_domains, i = _parse_domain_list(args, i)
@@ -455,12 +480,11 @@ Examples:
         # check. Vault ships the list.
         defi_rules = None
         if morpho_enabled:
-            from ..networks import DEFAULT_NETWORK, get_morpho
-            config = get_morpho(DEFAULT_NETWORK)
+            from ..networks import all_default_curators
             defi_rules = DefiRules(
                 enabled=True,
                 restrict_to_steakhouse=morpho_restrict,
-                morpho_curators=list(config.default_curators) if config else [],
+                morpho_curators=all_default_curators(),
                 max_deposit_usd=morpho_max,
                 max_total_deployed_usd=morpho_total,
                 max_deployed_percent=morpho_percent,
@@ -470,6 +494,12 @@ Examples:
             ok, reason = defi_rules.validate()
             if not ok:
                 return CommandResult.fail(reason)
+
+        if networks is None:
+            return CommandResult.fail(
+                "--networks is required (comma-separated chain IDs, or 'all' "
+                "for every currently-enabled network). Use 'policy create --help'."
+            )
 
         try:
             policy = self.core.create_policy(
@@ -507,7 +537,8 @@ x402 Payment Options:
   --day <amount>           Daily spending limit in USD
   --txn <amount>           Per-transaction maximum in USD
   --auto <amount>          Auto-approve threshold in USD
-  --networks <ids>         Comma-separated chain IDs
+  --networks <ids>         Comma-separated chain IDs, or 'all' for every
+                            currently-enabled network. Omit to leave unchanged.
   --allow-domains <list>   Comma-separated allowed domains (empty to clear = allow any)
   --block-domains <list>   Comma-separated blocked domains (empty to clear = block none)
 
@@ -589,12 +620,25 @@ Examples:
                     return CommandResult.fail(f"Invalid value for --auto: {args[i + 1]}")
                 i += 2
             elif args[i] == "--networks" and i + 1 < len(args):
-                try:
-                    networks = [int(n.strip()) for n in args[i + 1].split(",")]
-                    policy_changes.append(("networks", networks))
-                    changes.append(f"networks: {args[i + 1]}")
-                except ValueError:
-                    return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
+                if args[i + 1].strip().lower() == "all":
+                    from ..networks import NETWORKS
+                    networks = [
+                        chain_id for chain_id in NETWORKS
+                        if self.core.settings_manager.is_network_enabled(chain_id)
+                    ]
+                    if not networks:
+                        return CommandResult.fail("--networks all: no networks are currently enabled")
+                else:
+                    try:
+                        networks = [int(n.strip()) for n in args[i + 1].split(",")]
+                    except ValueError:
+                        return CommandResult.fail(f"Invalid value for --networks: {args[i + 1]}")
+                    if not networks:
+                        return CommandResult.fail(
+                            "--networks requires at least one chain ID (or 'all')"
+                        )
+                policy_changes.append(("networks", networks))
+                changes.append(f"networks: {args[i + 1]}")
                 i += 2
             elif args[i] == "--allow-domains":
                 domains, i = _parse_domain_list(args, i)
@@ -785,14 +829,13 @@ Examples:
                 # choice offered here either (see policy create's comment),
                 # so a policy edited into its first Morpho rules starts
                 # trusting the same shipped curator create would have given it.
-                from ..networks import DEFAULT_NETWORK, get_morpho
-                config = get_morpho(DEFAULT_NETWORK)
+                from ..networks import all_default_curators
                 # Same defaults as policy create, so a first `--morpho on`
                 # here succeeds validation the same way `policy create
                 # --morpho` does, rather than failing for want of an
                 # exposure limit nobody was asked to set.
                 policy.defi_rules = DefiRules(
-                    morpho_curators=list(config.default_curators) if config else [],
+                    morpho_curators=all_default_curators(),
                     max_total_deployed_usd=500.0)
             for field_name, value in defi_changes:
                 setattr(policy.defi_rules, field_name, value)

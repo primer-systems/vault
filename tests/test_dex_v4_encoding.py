@@ -1,13 +1,12 @@
 """DexAdapterV4 calldata, run against the real implementation.
 
-This file exists because the v4 adapter shipped with a quoter call that appended
-an argument the contract does not take. It decoded anyway on pools whose
-currency0 is address(0) — the stray zero landed in the hookData offset slot and
-read a length of zero from currency0 — so it looked like it worked on the 62% of
-RHC v4 pools that are native-ETH pairs, and reverted on the rest. Nothing caught
-it, because nothing exercised it.
+The quoter call and the router call must both encode arguments in the exact
+shape the deployed contracts expect - an extra or misplaced argument can
+decode without error on some pools (notably native-ETH pairs, where a stray
+zero can land in a slot that already reads as zero) while reverting on
+others, so nothing short of checking the wire format catches it.
 
-So these tests assert the wire format itself, against the shapes taken from the
+These tests assert the wire format itself, against the shapes taken from the
 deployed, Blockscout-verified sources on chain 4663:
 
   V4Quoter        quoteExactInputSingle(((address,address,uint24,int24,address),
