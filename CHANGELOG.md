@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2
+
+CI-only fix; no functional or behavioral changes from 0.4.1.
+
+### Fixed
+- **`build.yml`'s release workflow was an invalid workflow file** -
+  `secrets.BLOCKSCOUT_PRO_API_KEY` referenced directly inside a step's
+  `if:` condition, which GitHub Actions' validator rejects
+  ("Unrecognized named-value: 'secrets'"). The whole file failed to parse,
+  so the Build Vault workflow never ran on any tagged release since the
+  step was added - 0.4.0 and 0.4.1 shipped no desktop binaries. Moved the
+  empty-key check into the Python step itself instead of `if:`.
+
 ## 0.4.1
 
 Lint-only fix; no functional or behavioral changes from 0.4.0.
